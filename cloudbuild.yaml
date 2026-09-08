@@ -1,0 +1,176 @@
+steps:
+  # ---------------------------------------------------------------------------
+  # Step 1: Run unit tests & contract tests before container building
+  # ---------------------------------------------------------------------------
+  - name: 'python:3.11-slim'
+    id: 'run-unit-tests'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir . ".[dev]"
+        PYTHONPATH=src pytest -v
+
+  # ---------------------------------------------------------------------------
+  # Step 2: Build MCP Server container image
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-mcp-image'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.mcp'
+      - '-t'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/mcp-server:$COMMIT_SHA'
+      - '-t'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/mcp-server:latest'
+      - '.'
+
+  # ---------------------------------------------------------------------------
+  # Step 3: Build Agent Service container image
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-agent-image'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.agent'
+      - '-t'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/agent-service:$COMMIT_SHA'
+      - '-t'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/agent-service:latest'
+      - '.'
+
+  # ---------------------------------------------------------------------------
+  # Step 4: Push images to Artifact Registry
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-mcp-image'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/mcp-server'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-agent-image'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/agent-service'
+
+  # ---------------------------------------------------------------------------
+  # Step 5: Deploy MCP Server to Cloud Run with Direct VPC Egress for Slurm
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-mcp-server'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+
+        # Optional Secret Manager secret for Slurm JWT Token
+        SECRET_FLAG=""
+        if gcloud secrets describe "$_SLURM_SECRET_NAME" --project="$PROJECT_ID" >/dev/null 2>&1; then
+          echo "Binding secret $_SLURM_SECRET_NAME to SLURM_JWT_TOKEN"
+          SECRET_FLAG="--set-secrets=SLURM_JWT_TOKEN=$_SLURM_SECRET_NAME:latest"
+        else
+          echo "Secret $_SLURM_SECRET_NAME not found, deploying without secret binding."
+        fi
+
+        # Direct VPC Egress flags if network specified
+        VPC_FLAGS=""
+        if [ "$_VPC_NETWORK" != "none" ] && [ -n "$_VPC_NETWORK" ]; then
+          VPC_FLAGS="--network=$_VPC_NETWORK --subnet=$_VPC_SUBNET --vpc-egress=private-ranges-only"
+        fi
+
+        gcloud run deploy "$_MCP_SERVICE_NAME" \
+          --image="$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/mcp-server:$COMMIT_SHA" \
+          --region="$_REGION" \
+          --platform=managed \
+          --no-allow-unauthenticated \
+          --no-cpu-throttling \
+          --timeout=1800 \
+          --set-env-vars="COMPUTE_RUNTIME=slurm,SLURM_REST_URL=$_SLURM_REST_URL,MCP_TRANSPORT=sse,PORT=8080" \
+          $VPC_FLAGS \
+          $SECRET_FLAG
+
+  # ---------------------------------------------------------------------------
+  # Step 6: Retrieve MCP Server URL
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'get-mcp-url'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        MCP_URL=$(gcloud run services describe "$_MCP_SERVICE_NAME" --region="$_REGION" --format='value(status.url)')
+        echo "Discovered MCP Server URL: $MCP_URL"
+        echo "$MCP_URL" > /workspace/mcp_url.txt
+
+  # ---------------------------------------------------------------------------
+  # Step 7: Deploy Agent Service to Cloud Run pointing to MCP Server URL
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-agent-service'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        MCP_URL=$(cat /workspace/mcp_url.txt)
+
+        gcloud run deploy "$_AGENT_SERVICE_NAME" \
+          --image="$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/agent-service:$COMMIT_SHA" \
+          --region="$_REGION" \
+          --platform=managed \
+          --allow-unauthenticated \
+          --no-cpu-throttling \
+          --timeout=1800 \
+          --set-env-vars="MCP_SERVER_URL=$MCP_URL,GOOGLE_GENAI_USE_VERTEXAI=TRUE,AGENTIC_COMPUTE_MODEL=$_MODEL,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$_REGION,PORT=8080"
+
+  # ---------------------------------------------------------------------------
+  # Step 8: Authorize Agent Service to invoke private MCP Server via IAM OIDC
+  # ---------------------------------------------------------------------------
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'authorize-service-to-service'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+
+        # Resolve the Agent service's runtime service account
+        AGENT_SA=$(gcloud run services describe "$_AGENT_SERVICE_NAME" --region="$_REGION" --format='value(spec.template.spec.serviceAccountName)')
+        if [ -z "$AGENT_SA" ]; then
+          PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+          AGENT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+        fi
+
+        echo "Granting roles/run.invoker on $_MCP_SERVICE_NAME to $AGENT_SA"
+        gcloud run services add-iam-policy-binding "$_MCP_SERVICE_NAME" \
+          --region="$_REGION" \
+          --member="serviceAccount:${AGENT_SA}" \
+          --role="roles/run.invoker"
+
+substitutions:
+  _REGION: 'us-central1'
+  _ARTIFACT_REPO: 'agentic-compute'
+  _MCP_SERVICE_NAME: 'agentic-compute-mcp'
+  _AGENT_SERVICE_NAME: 'agentic-compute-agent'
+  _VPC_NETWORK: 'hpc-slurm-net'
+  _VPC_SUBNET: 'hpc-slurm-primary-subnet'
+  _SLURM_REST_URL: 'http://10.0.0.4:6842/slurm/v0.0.41'
+  _SLURM_SECRET_NAME: 'slurm-jwt-token'
+  _MODEL: 'gemini-2.5-flash'
+
+images:
+  - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/mcp-server:$COMMIT_SHA'
+  - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/mcp-server:latest'
+  - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/agent-service:$COMMIT_SHA'
+  - '$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REPO/agent-service:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
