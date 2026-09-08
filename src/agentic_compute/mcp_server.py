@@ -54,6 +54,19 @@ _runtime: RuntimeAdapter = _create_runtime()
 
 
 @mcp.tool()
+def submit_job(name: str = "agentgrid-workload", cpu: int = 32) -> dict:
+    """Submit or initialize a new compute workload to the cluster.
+
+    Registers a new workload with the requested CPU allocation and returns the
+    initial runtime snapshot.
+    """
+    if hasattr(_runtime, "submit_job"):
+        res = _runtime.submit_job(name=name, cpu=cpu)
+        return {"status": "submitted", "job": res, "snapshot": _runtime.snapshot().model_dump()}
+    return {"status": "submitted", "snapshot": _runtime.snapshot().model_dump()}
+
+
+@mcp.tool()
 def get_runtime_snapshot() -> dict:
     """Observe the current compute runtime.
 

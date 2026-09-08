@@ -211,12 +211,23 @@ sequenceDiagram
 ### Interacting with the Cloud Run Agent
 
 * **Interactive Swagger UI**: Visit `https://<AGENT_SERVICE_URL>.a.run.app/docs` in your browser to inspect API schemas and trigger runs interactively.
-* **REST API**:
+* **Synchronous REST API**:
   ```bash
-  curl -X POST https://<AGENT_SERVICE_URL>.a.run.app/optimize     -H "Content-Type: application/json"     -d '{
+  curl -X POST https://<AGENT_SERVICE_URL>.a.run.app/optimize \
+    -H "Content-Type: application/json" \
+    -d '{
       "objective": "Run the compute workload autonomously. Minimize cost, respect deadline, and adapt to queue pressure."
     }'
   ```
+* **Real-Time Streaming API (Server-Sent Events)**:
+  ```bash
+  curl -N -X POST https://<AGENT_SERVICE_URL>.a.run.app/optimize/stream \
+    -H "Content-Type: application/json" \
+    -d '{
+      "objective": "Run the compute workload autonomously. Minimize cost, respect deadline, and adapt to queue pressure."
+    }'
+  ```
+  Streams real-time events (`tool_call`, `thinking`, `completed`) as the agent reasons and acts without client timeouts.
 
 ---
 

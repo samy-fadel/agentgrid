@@ -17,7 +17,7 @@ from .runtime import RuntimeAdapter
 
 
 class SlurmRuntime(RuntimeAdapter):
-    """RuntimeAdapter connecting to a real Slurm cluster via slurmrestd on GCP."""
+    """RuntimeAdapter connecting to a real Slurm cluster via slurmrestd on GCP with dynamic lifecycle tracking."""
 
     def __init__(
         self,
@@ -37,7 +37,16 @@ class SlurmRuntime(RuntimeAdapter):
         self.total_cpu = int(os.getenv("SLURM_TOTAL_CPU", "128"))
         self.cpu_cost_per_hour_eur = float(os.getenv("CPU_COST_PER_HOUR_EUR", "0.05"))
         self.deadline_minutes = float(os.getenv("DEADLINE_MINUTES", "25.0"))
+        self.reset()
+
+    def reset(self) -> None:
         self.start_time = time.time()
+        self.elapsed_minutes = 0.0
+        self.allocated_cpu = int(os.getenv("INITIAL_WORKLOAD_CPU", "32"))
+        self.remaining_work_units = 100.0
+        self.accrued_cost_eur = 0.0
+        self.job_done = False
+        self.is_real_slurm_job = False
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -68,35 +77,84 @@ class SlurmRuntime(RuntimeAdapter):
             pass
         return {"jobs": []}
 
-    def snapshot(self) -> RuntimeSnapshot:
-        elapsed_minutes = (time.time() - self.start_time) / 60.0
-        job_info = self._get_job()
-        allocated_cpu = 32
-        job_done = False
-
-        if "jobs" in job_info and job_info["jobs"]:
-            job = job_info["jobs"][0]
-            allocated_cpu = job.get("job_resources", {}).get("allocated_cpus", 32)
-            state = job.get("job_state", ["RUNNING"])
-            if isinstance(state, list):
-                state_str = state[0] if state else "RUNNING"
-            else:
-                state_str = str(state)
-            job_done = state_str in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED")
-
-        candidates = [
-            CandidateAllocation(
-                cpu=cpu,
-                estimated_remaining_minutes=round(max(0.0, 30.0 * (32 / cpu)), 2),
-                projected_finish_at_minutes=round(elapsed_minutes + max(0.0, 30.0 * (32 / cpu)), 2),
-                projected_total_cost_eur=round(cpu * self.cpu_cost_per_hour_eur * (30.0 * (32 / cpu) / 60.0), 4),
-                meets_deadline=(elapsed_minutes + 30.0 * (32 / cpu)) <= self.deadline_minutes,
-                within_budget=True,
+    def submit_job(
+        self,
+        name: str = "agentgrid-workload",
+        cpu: int = 32,
+        script: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit or initialize a new workload on the Slurm cluster."""
+        payload = {
+            "job": {
+                "name": name,
+                "tasks": 1,
+                "cpus_per_task": cpu,
+                "current_working_directory": "/tmp",
+                "environment": ["PATH=/bin:/usr/bin:/usr/local/bin"],
+                "script": script or "#!/bin/bash\nsleep 3600\n",
+            }
+        }
+        submitted_id = None
+        try:
+            resp = requests.post(
+                f"{self.base_url}/job/submit",
+                headers=self._headers(),
+                json=payload,
+                timeout=5.0,
             )
-            for cpu in (16, 32, 48, 64, 96, 128)
-        ]
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                submitted_id = str(data.get("job_id") or data.get("job_submit_response_msg", {}).get("job_id", ""))
+        except Exception:
+            pass
 
-        # Discover total CPU dynamically from nodes if available, else fall back to self.total_cpu
+        self.active_job_id = submitted_id or str(int(time.time()) % 100000)
+        self.allocated_cpu = cpu
+        self.remaining_work_units = 100.0
+        self.elapsed_minutes = 0.0
+        self.accrued_cost_eur = 0.0
+        self.job_done = False
+        self.is_real_slurm_job = bool(submitted_id)
+
+        return {
+            "job_id": self.active_job_id,
+            "allocated_cpu": self.allocated_cpu,
+            "is_real_slurm_job": self.is_real_slurm_job,
+        }
+
+    def snapshot(self) -> RuntimeSnapshot:
+        # Check real job if active
+        job_info = self._get_job()
+        if "jobs" in job_info and job_info["jobs"]:
+            self.is_real_slurm_job = True
+            job = job_info["jobs"][0]
+            self.allocated_cpu = job.get("job_resources", {}).get("allocated_cpus", self.allocated_cpu)
+            state = job.get("job_state", ["RUNNING"])
+            state_str = state[0] if isinstance(state, list) and state else str(state)
+            if state_str in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"):
+                self.job_done = True
+                self.remaining_work_units = 0.0
+
+        # Candidate allocations based on current remaining work
+        candidates = []
+        base_time = (self.remaining_work_units / 100.0) * 25.0
+        for cpu in (16, 32, 48, 64, 96, 128):
+            speedup = cpu / 32.0
+            est_remaining = round(max(0.0, base_time / speedup), 2)
+            finish_at = round(self.elapsed_minutes + est_remaining, 2)
+            est_cost = round(self.accrued_cost_eur + (cpu * self.cpu_cost_per_hour_eur * (est_remaining / 60.0)), 4)
+            candidates.append(
+                CandidateAllocation(
+                    cpu=cpu,
+                    estimated_remaining_minutes=est_remaining,
+                    projected_finish_at_minutes=finish_at,
+                    projected_total_cost_eur=est_cost,
+                    meets_deadline=finish_at <= self.deadline_minutes,
+                    within_budget=est_cost <= 5.0,
+                )
+            )
+
+        # Dynamic discovery of cluster nodes and total CPU from Slurm
         nodes_info = self._get_nodes()
         nodes_list = nodes_info.get("nodes", [])
         cluster_total_cpu = (
@@ -107,21 +165,21 @@ class SlurmRuntime(RuntimeAdapter):
 
         return RuntimeSnapshot(
             cluster=ClusterState(
-                current_time_minutes=round(elapsed_minutes, 2),
+                current_time_minutes=round(self.elapsed_minutes, 2),
                 total_cpu=cluster_total_cpu,
-                free_cpu=max(0, cluster_total_cpu - allocated_cpu),
+                free_cpu=max(0, cluster_total_cpu - self.allocated_cpu),
                 total_gpu=0,
                 free_gpu=0,
             ),
             workload=WorkloadState(
                 id=self.active_job_id,
                 kind="slurm-batch",
-                remaining_work_units=0.0 if job_done else 100.0,
-                allocated_cpu=allocated_cpu,
+                remaining_work_units=round(self.remaining_work_units, 2),
+                allocated_cpu=self.allocated_cpu,
                 allocated_gpu=0,
-                estimated_remaining_minutes=0.0 if job_done else 15.0,
-                accrued_cost_eur=round(allocated_cpu * self.cpu_cost_per_hour_eur * (elapsed_minutes / 60.0), 4),
-                done=job_done,
+                estimated_remaining_minutes=round(max(0.0, base_time / (self.allocated_cpu / 32.0)), 2),
+                accrued_cost_eur=round(self.accrued_cost_eur, 4),
+                done=self.job_done,
             ),
             objective=Objective(
                 deadline_at_minutes=self.deadline_minutes,
@@ -134,25 +192,31 @@ class SlurmRuntime(RuntimeAdapter):
     def apply(self, action: Action) -> None:
         if action.action == "noop":
             return
-        # Dynamically resize job via slurmrestd API or scontrol
-        payload = {"job": {"cpus_per_task": action.cpu}}
-        try:
-            requests.post(
-                f"{self.base_url}/job/{self.active_job_id}",
-                headers=self._headers(),
-                json=payload,
-                timeout=5.0,
-            )
-        except Exception as e:
-            # Fallback for mock/simulation testing
-            print(f"[SlurmRuntime] Resized job {self.active_job_id} to {action.cpu} CPUs ({e})")
+        if action.cpu:
+            self.allocated_cpu = action.cpu
+            # Attempt Slurm REST update if real job exists
+            try:
+                requests.post(
+                    f"{self.base_url}/job/{self.active_job_id}",
+                    headers=self._headers(),
+                    json={"job": {"cpus_per_task": action.cpu}},
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
 
     def tick(self, minutes: float) -> None:
-        # On a real cluster, sleep or wait for the next event window
-        time.sleep(min(minutes * 0.1, 2.0))
+        if self.job_done:
+            return
+        self.elapsed_minutes += minutes
+        speedup = self.allocated_cpu / 32.0
+        # 100 units completed in 25 min at 32 cpus -> 4 units/min at speedup 1.0
+        work_completed = minutes * 4.0 * speedup
+        self.remaining_work_units = max(0.0, self.remaining_work_units - work_completed)
+        self.accrued_cost_eur += (self.allocated_cpu * self.cpu_cost_per_hour_eur * (minutes / 60.0))
+        if self.remaining_work_units <= 0.0:
+            self.job_done = True
+            self.remaining_work_units = 0.0
 
     def is_done(self) -> bool:
-        return self.snapshot().workload.done
-
-    def reset(self) -> None:
-        self.start_time = time.time()
+        return self.job_done

@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import json
 import logging
 import os
 import time
@@ -8,6 +7,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -167,6 +167,101 @@ async def optimize(req: OptimizeRequest) -> OptimizeResponse:
                 "session_id": session_id,
             },
         )
+
+
+@app.post("/optimize/stream")
+@app.get("/optimize/stream")
+async def optimize_stream(
+    objective: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: str = "cloud-run-user",
+) -> StreamingResponse:
+    """Stream optimization progress events in real-time via Server-Sent Events (SSE)."""
+    async def event_generator():
+        start_time = time.time()
+        sid = session_id or f"session-{uuid.uuid4().hex[:8]}"
+        prompt = objective or (
+            "Run the compute workload autonomously. "
+            "Meet its deadline and budget while minimizing cost. "
+            "Continue observing and adapting until it finishes, then summarize the result."
+        )
+
+        try:
+            try:
+                await runner.session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=sid,
+                )
+            except Exception:
+                pass
+
+            user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt)],
+            )
+
+            # Send initial started event
+            yield f"data: {json.dumps({'event': 'started', 'session_id': sid, 'model': MODEL})}\n\n"
+
+            collected_texts: list[str] = []
+
+            async for event in runner.run_async(
+                user_id=user_id,
+                session_id=sid,
+                new_message=user_content,
+            ):
+                # Emit function calls as they occur
+                for fc in event.get_function_calls():
+                    payload = {
+                        "event": "tool_call",
+                        "tool": fc.name,
+                        "args": fc.args or {},
+                        "timestamp": round(time.time() - start_time, 2),
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                # Emit model text chunks
+                if event.message and event.message.parts:
+                    for part in event.message.parts:
+                        if getattr(part, "text", None):
+                            collected_texts.append(part.text)
+                            payload = {
+                                "event": "thinking",
+                                "text": part.text,
+                                "timestamp": round(time.time() - start_time, 2),
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
+
+            summary = "".join(collected_texts) if collected_texts else "Optimization run completed."
+            duration = round(time.time() - start_time, 2)
+            completion_payload = {
+                "event": "completed",
+                "status": "completed",
+                "session_id": sid,
+                "duration_seconds": duration,
+                "summary": summary,
+            }
+            yield f"data: {json.dumps(completion_payload)}\n\n"
+
+        except Exception as exc:
+            logger.exception("Error in optimize_stream: %s", exc)
+            err_payload = {
+                "event": "error",
+                "error": str(exc),
+                "duration_seconds": round(time.time() - start_time, 2),
+            }
+            yield f"data: {json.dumps(err_payload)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def main() -> None:

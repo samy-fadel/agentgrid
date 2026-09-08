@@ -22,3 +22,17 @@ def test_slurm_adapter_snapshot_and_apply(monkeypatch):
         reason="scale up on Slurm",
     )
     runtime.apply(action)
+    updated = runtime.snapshot()
+    assert updated.workload.allocated_cpu == 64
+
+    # Test tick progress burn-down
+    runtime.tick(5.0)
+    ticked = runtime.snapshot()
+    assert ticked.workload.remaining_work_units < 100.0
+    assert ticked.cluster.current_time_minutes == 5.0
+
+    # Test submit_job
+    job_res = runtime.submit_job(name="custom-workload", cpu=48)
+    assert job_res["allocated_cpu"] == 48
+    assert runtime.snapshot().workload.id == job_res["job_id"]
+    assert runtime.snapshot().workload.allocated_cpu == 48

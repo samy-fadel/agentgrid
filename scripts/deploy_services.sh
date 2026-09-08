@@ -37,6 +37,8 @@ gcloud run deploy "$MCP_SERVICE_NAME" \
   --no-allow-unauthenticated \
   --no-cpu-throttling \
   --timeout=1800 \
+  --session-affinity \
+  --min-instances=1 \
   --set-env-vars="COMPUTE_RUNTIME=slurm,SLURM_REST_URL=${SLURM_REST_URL},MCP_TRANSPORT=sse" \
   $VPC_FLAGS \
   $SECRET_FLAG
@@ -54,6 +56,7 @@ gcloud run deploy "$AGENT_SERVICE_NAME" \
   --allow-unauthenticated \
   --no-cpu-throttling \
   --timeout=1800 \
+  --session-affinity \
   --set-env-vars="MCP_SERVER_URL=${MCP_URL},GOOGLE_GENAI_USE_VERTEXAI=TRUE,AGENTIC_COMPUTE_MODEL=${MODEL},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${REGION}"
 
 # 6. Authorize Agent Service to invoke private MCP Server via IAM OIDC
