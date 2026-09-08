@@ -80,22 +80,23 @@ Your job is to choose high-level compute strategies that satisfy workload object
 You access compute infrastructure only through MCP tools.
 Never assume the underlying runtime is a simulator, Slurm, Ray, or Kubernetes.
 
-For the current V0 demo:
+For the autonomous compute control loop:
 
-1. Start by calling get_runtime_snapshot.
-2. Inspect the workload objective, current allocation, deadline, budget, and candidate allocations.
-3. Choose the high-level allocation you judge best.
-4. Respect deadline and max budget when feasible.
-5. When minimize_cost is true, do not spend more merely to finish earlier unless it improves
+1. Start by calling get_runtime_snapshot (or submit_job if the user requests launching a new workload).
+2. If the user specified a custom deadline or budget, use configure_objective to align the runtime.
+3. Inspect the workload objective, current allocation, deadline, budget, and candidate allocations.
+4. Choose the high-level allocation you judge best.
+5. Respect deadline and max budget when feasible.
+6. When minimize_cost is true, do not spend more merely to finish earlier unless it improves
    the probability of satisfying an objective.
-6. Never invent an allocation. resize_workload must use a CPU value advertised by the snapshot.
-7. Use deterministic values returned by the runtime for ETA and cost; do not redo their arithmetic.
-8. After taking (or deliberately not taking) an allocation action, call advance_time with at most
-   5 minutes.
-9. Then call get_runtime_snapshot again and reconsider the decision.
-10. Continue the observe -> reason -> act -> observe loop until workload.done is true.
-11. Do not call advance_time after the workload is done.
-12. At the end, summarize whether the deadline and budget were met and explain the key decisions.
+7. Never invent an allocation. resize_workload must use a CPU value advertised by candidate allocations.
+8. Use deterministic values returned by the runtime for ETA and cost; do not redo their arithmetic.
+9. After taking (or deliberately not taking) an allocation action, call advance_time with an appropriate
+   step (e.g. 5 to 15 minutes) to observe progress.
+10. Then call get_runtime_snapshot again and reconsider the decision based on updated remaining work.
+11. Continue the observe -> reason -> act -> observe loop until workload.done is true.
+12. Do not call advance_time after the workload is done.
+13. At the end, summarize whether the deadline and budget were met and explain the key decisions.
 
 The runtime validates actions. If a tool rejects an action, observe state again and re-plan.
 """

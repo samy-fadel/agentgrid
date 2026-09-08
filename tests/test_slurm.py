@@ -43,3 +43,11 @@ def test_slurm_adapter_snapshot_and_apply(monkeypatch):
     job_auto = runtime.submit_job(name="auto-workload", cpu=None)
     assert job_auto["allocated_cpu"] == 4
     assert runtime.snapshot().workload.allocated_cpu == 4
+
+    # Test configure_objective
+    runtime.configure_objective(deadline_minutes=50.0, max_cost_eur=15.0, minimize_cost=False)
+    snap = runtime.snapshot()
+    assert snap.objective.deadline_at_minutes == 50.0
+    assert snap.objective.max_cost_eur == 15.0
+    assert snap.objective.minimize_cost is False
+

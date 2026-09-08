@@ -11,6 +11,7 @@ from .models import (
     WorkloadState,
 )
 from .runtime import RuntimeAdapter
+from .slurm_adapter import generate_candidate_cpus
 
 
 @dataclass
@@ -52,6 +53,22 @@ class SimulatedRuntime(RuntimeAdapter):
             deadline_at_minutes=self.deadline_minutes_from_start,
             minimize_cost=True,
             max_cost_eur=self.max_cost_eur,
+        )
+
+    def configure_objective(
+        self,
+        deadline_minutes: float | None = None,
+        max_cost_eur: float | None = None,
+        minimize_cost: bool | None = None,
+    ) -> None:
+        """Dynamically configure workload objective constraints."""
+        deadline = deadline_minutes if deadline_minutes is not None else self.objective.deadline_at_minutes
+        budget = max_cost_eur if max_cost_eur is not None else self.objective.max_cost_eur
+        minimize = minimize_cost if minimize_cost is not None else self.objective.minimize_cost
+        self.objective = Objective(
+            deadline_at_minutes=deadline,
+            minimize_cost=minimize,
+            max_cost_eur=budget,
         )
 
     def submit_job(
@@ -100,11 +117,8 @@ class SimulatedRuntime(RuntimeAdapter):
 
     def snapshot(self) -> RuntimeSnapshot:
         allocated = 0 if self.is_done() else self.workload.allocated_cpu
-        candidates = [
-            self._candidate(cpu)
-            for cpu in (16, 32, 48, 64, 96, 128)
-            if cpu <= self.total_cpu
-        ]
+        candidate_steps = generate_candidate_cpus(self.total_cpu)
+        candidates = [self._candidate(cpu) for cpu in candidate_steps]
         return RuntimeSnapshot(
             cluster=ClusterState(
                 current_time_minutes=round(self.current_time_minutes, 3),

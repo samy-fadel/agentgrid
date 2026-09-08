@@ -5,6 +5,8 @@ import time
 from typing import Any
 import requests
 
+import re
+
 from .models import (
     Action,
     CandidateAllocation,
@@ -14,6 +16,24 @@ from .models import (
     WorkloadState,
 )
 from .runtime import RuntimeAdapter
+
+
+def generate_candidate_cpus(total_cpu: int) -> list[int]:
+    """Generate elastic candidate CPU allocations up to cluster capacity."""
+    env_override = os.getenv("CANDIDATE_CPUS")
+    if env_override:
+        try:
+            return sorted([int(x.strip()) for x in env_override.split(",") if x.strip()])
+        except Exception:
+            pass
+    standard_steps = [2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
+    candidates = [c for c in standard_steps if c <= total_cpu]
+    if not candidates:
+        return [max(1, total_cpu)]
+    if total_cpu not in candidates and total_cpu > candidates[0]:
+        candidates.append(total_cpu)
+        candidates.sort()
+    return candidates
 
 
 class SlurmRuntime(RuntimeAdapter):
@@ -33,20 +53,51 @@ class SlurmRuntime(RuntimeAdapter):
         ).rstrip("/")
         self.jwt_token = jwt_token or os.getenv("SLURM_JWT_TOKEN", "")
         self.user_name = user_name or os.getenv("SLURM_USER", "slurm")
-        self.active_job_id = job_id or os.getenv("SLURM_JOB_ID", "1")
         self.total_cpu = int(os.getenv("SLURM_TOTAL_CPU", "128"))
         self.cpu_cost_per_hour_eur = float(os.getenv("CPU_COST_PER_HOUR_EUR", "0.05"))
-        self.deadline_minutes = float(os.getenv("DEADLINE_MINUTES", "25.0"))
+        self.deadline_minutes = float(os.getenv("DEADLINE_MINUTES", "30.0"))
+        self.max_cost_eur = float(os.getenv("MAX_COST_EUR", "10.0"))
+        self.minimize_cost = os.getenv("MINIMIZE_COST", "true").lower() in ("true", "1", "yes")
+        self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or self._discover_active_job() or "1"
         self.reset()
 
     def reset(self) -> None:
         self.start_time = time.time()
         self.elapsed_minutes = 0.0
-        self.allocated_cpu = int(os.getenv("INITIAL_WORKLOAD_CPU", "32"))
+        self.allocated_cpu = int(os.getenv("INITIAL_WORKLOAD_CPU", "4"))
+        self.allocated_gpu = 0
         self.remaining_work_units = 100.0
         self.accrued_cost_eur = 0.0
         self.job_done = False
         self.is_real_slurm_job = False
+
+    def configure_objective(
+        self,
+        deadline_minutes: float | None = None,
+        max_cost_eur: float | None = None,
+        minimize_cost: bool | None = None,
+    ) -> None:
+        """Dynamically configure workload objective constraints."""
+        if deadline_minutes is not None:
+            self.deadline_minutes = float(deadline_minutes)
+        if max_cost_eur is not None:
+            self.max_cost_eur = float(max_cost_eur)
+        if minimize_cost is not None:
+            self.minimize_cost = bool(minimize_cost)
+
+    def _discover_active_job(self) -> str | None:
+        try:
+            resp = requests.get(f"{self.base_url}/jobs", headers=self._headers(), timeout=5.0)
+            if resp.status_code == 200:
+                jobs = resp.json().get("jobs", [])
+                for j in jobs:
+                    state = j.get("job_state", ["RUNNING"])
+                    state_str = state[0] if isinstance(state, list) and state else str(state)
+                    if state_str in ("RUNNING", "PENDING"):
+                        return str(j.get("job_id", ""))
+        except Exception:
+            pass
+        return None
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -148,12 +199,31 @@ class SlurmRuntime(RuntimeAdapter):
                 self.job_done = True
                 self.remaining_work_units = 0.0
 
-        # Candidate allocations based on current remaining work
+        # Dynamic discovery of cluster nodes, total CPU, and GPUs from Slurm
+        nodes_info = self._get_nodes()
+        nodes_list = nodes_info.get("nodes", [])
+        cluster_total_cpu = (
+            sum(n.get("cpus", 0) for n in nodes_list if isinstance(n, dict))
+            if nodes_list
+            else self.total_cpu
+        )
+
+        cluster_total_gpu = 0
+        for n in nodes_list:
+            if isinstance(n, dict):
+                gres = str(n.get("gres", "") or n.get("tres", ""))
+                if "gpu" in gres.lower():
+                    match = re.search(r'gpu(?::[^:]*)?:(\d+)', gres, re.IGNORECASE)
+                    if match:
+                        cluster_total_gpu += int(match.group(1))
+
+        # Dynamic candidate allocations scaled to cluster capacity
+        candidate_cpu_steps = generate_candidate_cpus(cluster_total_cpu)
         candidates = []
-        base_time = (self.remaining_work_units / 100.0) * 25.0
-        for cpu in (16, 32, 48, 64, 96, 128):
-            speedup = cpu / 32.0
-            est_remaining = round(max(0.0, base_time / speedup), 2)
+        base_time = (self.remaining_work_units / 100.0) * self.deadline_minutes
+        for cpu in candidate_cpu_steps:
+            speedup = cpu / max(1, self.allocated_cpu)
+            est_remaining = round(max(0.0, (self.remaining_work_units / 100.0) * (self.deadline_minutes * 0.8) / (cpu / 32.0)), 2)
             finish_at = round(self.elapsed_minutes + est_remaining, 2)
             est_cost = round(self.accrued_cost_eur + (cpu * self.cpu_cost_per_hour_eur * (est_remaining / 60.0)), 4)
             candidates.append(
@@ -163,26 +233,17 @@ class SlurmRuntime(RuntimeAdapter):
                     projected_finish_at_minutes=finish_at,
                     projected_total_cost_eur=est_cost,
                     meets_deadline=finish_at <= self.deadline_minutes,
-                    within_budget=est_cost <= 5.0,
+                    within_budget=est_cost <= self.max_cost_eur,
                 )
             )
-
-        # Dynamic discovery of cluster nodes and total CPU from Slurm
-        nodes_info = self._get_nodes()
-        nodes_list = nodes_info.get("nodes", [])
-        cluster_total_cpu = (
-            sum(n.get("cpus", 0) for n in nodes_list if isinstance(n, dict))
-            if nodes_list
-            else self.total_cpu
-        )
 
         return RuntimeSnapshot(
             cluster=ClusterState(
                 current_time_minutes=round(self.elapsed_minutes, 2),
                 total_cpu=cluster_total_cpu,
                 free_cpu=max(0, cluster_total_cpu - self.allocated_cpu),
-                total_gpu=0,
-                free_gpu=0,
+                total_gpu=cluster_total_gpu,
+                free_gpu=max(0, cluster_total_gpu - self.allocated_gpu),
             ),
             workload=WorkloadState(
                 id=self.active_job_id,
@@ -190,14 +251,14 @@ class SlurmRuntime(RuntimeAdapter):
                 remaining_work_units=round(self.remaining_work_units, 2),
                 allocated_cpu=self.allocated_cpu,
                 allocated_gpu=self.allocated_gpu,
-                estimated_remaining_minutes=round(max(0.0, base_time / (self.allocated_cpu / 32.0)), 2),
+                estimated_remaining_minutes=round(max(0.0, (self.remaining_work_units / 100.0) * (self.deadline_minutes * 0.8) / (self.allocated_cpu / 32.0)), 2),
                 accrued_cost_eur=round(self.accrued_cost_eur, 4),
                 done=self.job_done,
             ),
             objective=Objective(
                 deadline_at_minutes=self.deadline_minutes,
-                minimize_cost=True,
-                max_cost_eur=5.0,
+                minimize_cost=self.minimize_cost,
+                max_cost_eur=self.max_cost_eur,
             ),
             candidate_allocations=candidates,
         )

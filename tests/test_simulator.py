@@ -51,3 +51,12 @@ def test_resize_then_tick_changes_state():
     assert after.cluster.current_time_minutes > before.cluster.current_time_minutes
     assert after.workload.remaining_work_units < before.workload.remaining_work_units
     assert after.workload.accrued_cost_eur > before.workload.accrued_cost_eur
+
+
+def test_configure_objective_updates_snapshot():
+    runtime = SimulatedRuntime()
+    runtime.configure_objective(deadline_minutes=45.0, max_cost_eur=12.5, minimize_cost=False)
+    snap = runtime.snapshot()
+    assert snap.objective.deadline_at_minutes == 45.0
+    assert snap.objective.max_cost_eur == 12.5
+    assert snap.objective.minimize_cost is False

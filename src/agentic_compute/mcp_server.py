@@ -119,10 +119,32 @@ def advance_time(minutes: float = 5.0) -> dict:
 
     In a real runtime this tool will disappear or become a wait/observe operation.
     For the simulator, use small increments (normally 5 minutes), then observe again.
-    """
-    if minutes > 5.0:
-        raise ValueError("V0 simulator permits at most 5 minutes per control-loop step")
+    max_step = float(os.getenv("MAX_ADVANCE_MINUTES", "60.0"))
+    if minutes > max_step:
+        raise ValueError(f"Advance time step {minutes}m exceeds maximum permitted ({max_step}m)")
+    if minutes <= 0.0:
+        raise ValueError("Advance time minutes must be greater than 0")
     _runtime.tick(minutes)
+    return _runtime.snapshot().model_dump()
+
+
+@mcp.tool()
+def configure_objective(
+    deadline_minutes: float | None = None,
+    max_cost_eur: float | None = None,
+    minimize_cost: bool | None = None,
+) -> dict:
+    """Configure or update the business objective (deadline, budget, strategy).
+
+    Sets the targets against which candidate allocations and scheduling trade-offs
+    are computed.
+    """
+    if hasattr(_runtime, "configure_objective"):
+        _runtime.configure_objective(
+            deadline_minutes=deadline_minutes,
+            max_cost_eur=max_cost_eur,
+            minimize_cost=minimize_cost,
+        )
     return _runtime.snapshot().model_dump()
 
 
