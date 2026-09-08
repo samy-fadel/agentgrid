@@ -54,11 +54,20 @@ class SimulatedRuntime(RuntimeAdapter):
             max_cost_eur=self.max_cost_eur,
         )
 
-    def submit_job(self, name: str = "mc-002", cpu: int = 32) -> dict[str, Any]:
-        """Initialize or reset workload with custom name and cpu."""
-        self.workload = _SimWorkload(id=name, allocated_cpu=cpu)
+    def submit_job(
+        self,
+        name: str = "mc-002",
+        cpu: int | None = None,
+        gpu: int = 0,
+        partition: str | None = None,
+        memory_mb: int | None = None,
+        script: str | None = None,
+    ) -> dict[str, Any]:
+        """Initialize or reset workload with custom parameters."""
+        allocated_cpu = cpu if cpu is not None else 4
+        self.workload = _SimWorkload(id=name, allocated_cpu=allocated_cpu, allocated_gpu=gpu)
         self.current_time_minutes = 0.0
-        return {"id": name, "cpu": cpu}
+        return {"id": name, "cpu": allocated_cpu, "gpu": gpu, "partition": partition}
 
     def _speedup(self, cpu: int) -> float:
         p = self.parallel_fraction

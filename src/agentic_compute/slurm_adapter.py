@@ -80,20 +80,30 @@ class SlurmRuntime(RuntimeAdapter):
     def submit_job(
         self,
         name: str = "agentgrid-workload",
-        cpu: int = 32,
+        cpu: int | None = None,
+        gpu: int = 0,
+        partition: str | None = None,
+        memory_mb: int | None = None,
         script: str | None = None,
     ) -> dict[str, Any]:
-        """Submit or initialize a new workload on the Slurm cluster."""
-        payload = {
-            "job": {
-                "name": name,
-                "tasks": 1,
-                "cpus_per_task": cpu,
-                "current_working_directory": "/tmp",
-                "environment": ["PATH=/bin:/usr/bin:/usr/local/bin"],
-                "script": script or "#!/bin/bash\nsleep 3600\n",
-            }
+        """Submit or initialize a new workload on the Slurm cluster with elastic parameters."""
+        allocated_cpu = cpu if cpu is not None else int(os.getenv("INITIAL_WORKLOAD_CPU", "4"))
+        payload_job: dict[str, Any] = {
+            "name": name,
+            "tasks": 1,
+            "cpus_per_task": allocated_cpu,
+            "current_working_directory": "/tmp",
+            "environment": ["PATH=/bin:/usr/bin:/usr/local/bin"],
+            "script": script or "#!/bin/bash\nsleep 3600\n",
         }
+        if partition:
+            payload_job["partition"] = partition
+        if memory_mb:
+            payload_job["memory_per_node"] = memory_mb
+        if gpu > 0:
+            payload_job["tres_per_task"] = f"gres/gpu:{gpu}"
+
+        payload = {"job": payload_job}
         submitted_id = None
         try:
             resp = requests.post(
@@ -109,7 +119,8 @@ class SlurmRuntime(RuntimeAdapter):
             pass
 
         self.active_job_id = submitted_id or str(int(time.time()) % 100000)
-        self.allocated_cpu = cpu
+        self.allocated_cpu = allocated_cpu
+        self.allocated_gpu = gpu
         self.remaining_work_units = 100.0
         self.elapsed_minutes = 0.0
         self.accrued_cost_eur = 0.0
@@ -119,6 +130,8 @@ class SlurmRuntime(RuntimeAdapter):
         return {
             "job_id": self.active_job_id,
             "allocated_cpu": self.allocated_cpu,
+            "allocated_gpu": self.allocated_gpu,
+            "partition": partition,
             "is_real_slurm_job": self.is_real_slurm_job,
         }
 
@@ -176,7 +189,7 @@ class SlurmRuntime(RuntimeAdapter):
                 kind="slurm-batch",
                 remaining_work_units=round(self.remaining_work_units, 2),
                 allocated_cpu=self.allocated_cpu,
-                allocated_gpu=0,
+                allocated_gpu=self.allocated_gpu,
                 estimated_remaining_minutes=round(max(0.0, base_time / (self.allocated_cpu / 32.0)), 2),
                 accrued_cost_eur=round(self.accrued_cost_eur, 4),
                 done=self.job_done,
