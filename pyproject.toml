@@ -40,7 +40,7 @@ agentic-compute-mcp = "agentic_compute.mcp_server:main"
 packages = ["src/agentic_compute"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = [".", "src"]
 testpaths = ["tests"]
 
 [tool.ruff]

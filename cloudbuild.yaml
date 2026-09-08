@@ -10,7 +10,7 @@ steps:
       - |
         set -euo pipefail
         pip install --no-cache-dir . ".[dev]"
-        PYTHONPATH=src pytest -v
+        PYTHONPATH=".:src" pytest -v
 
   # ---------------------------------------------------------------------------
   # Step 2: Build MCP Server container image
