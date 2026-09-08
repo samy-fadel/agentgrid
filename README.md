@@ -12,8 +12,8 @@ This version is intentionally **Google-native**:
 - **Google ADK** = agent framework
 - **MCP** = boundary between the agent and compute runtimes
 - **Vertex AI** = recommended model backend
-- **Simulator** = first runtime implementation
-- **Slurm** = next runtime adapter
+- **Simulator** = built-in zero-dependency simulation engine (local / dev)
+- **Slurm** = production GCP HPC runtime adapter via slurmrestd
 
 ## Architecture
 
@@ -28,19 +28,19 @@ This version is intentionally **Google-native**:
                        |
                   McpToolset
                        |
-                      MCP
+              MCP (stdio or SSE)
                        |
               +--------+---------+
               | Compute MCP      |
               | Server           |
               +--------+---------+
                        |
-                RuntimeAdapter
+                 RuntimeAdapter
                        |
              +---------+---------+
              |                   |
-       SimulatedRuntime      SlurmAdapter
-             V0.2               next
+       SimulatedRuntime      SlurmRuntime
+        (Local / Dev)       (GCP / Prod)
 ```
 
 The agent never sees Slurm commands, Ray APIs, Kubernetes objects, or simulator internals.
@@ -76,10 +76,21 @@ They solve different problems.
 - runtime boundary
 - future Slurm/Ray/Kubernetes adapters
 
-The current ADK agent starts the Compute MCP server as a local subprocess over **stdio**.
-Later the same MCP server can be exposed remotely over Streamable HTTP.
+The system supports **dual transports**:
+- **Local development**: Launches the MCP server as a local subprocess over **stdio**.
+- **Production (Cloud Run)**: Connects remotely to the MCP service over **SSE (Server-Sent Events)** with Google IAM OIDC authentication.
 
-## What the V0.2 demo does
+## Runtimes: Simulator vs Real Slurm
+
+| Capability | `COMPUTE_RUNTIME=simulator` | `COMPUTE_RUNTIME=slurm` |
+| :--- | :--- | :--- |
+| **Purpose** | Fast local testing, CI/CD verification, zero setup | Live Slurm cluster on Google Cloud |
+| **Prerequisites** | None (pure Python discrete-event simulation) | GCP VPC with `slurmrestd` |
+| **Workload** | Synthetic Monte Carlo task (`mc-001`) | Real batch job ID (`SLURM_JOB_ID`) |
+| **Transport** | `stdio` (local subprocess) or `sse` | `sse` on Cloud Run via Direct VPC Egress |
+| **Actions** | Deterministic state progression | Real Slurm updates via REST API |
+
+## What the demo does
 
 The simulated cluster starts with:
 
@@ -135,8 +146,8 @@ Then edit `.env`:
 ```text
 GOOGLE_GENAI_USE_VERTEXAI=TRUE
 GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID
-GOOGLE_CLOUD_LOCATION=us-east1
-AGENTIC_COMPUTE_MODEL=gemini-3.5-flash
+GOOGLE_CLOUD_LOCATION=us-central1
+AGENTIC_COMPUTE_MODEL=gemini-2.5-flash
 ```
 
 ## Run the MCP server alone
@@ -259,22 +270,28 @@ In production on Google Cloud:
 
 ```bash
 chmod +x scripts/setup_ci_cd.sh
-GITHUB_OWNER="your-github-user" GITHUB_REPO="agentgrid" ./scripts/setup_ci_cd.sh
+./scripts/setup_ci_cd.sh
 ```
 
-2. Every push to `main` will automatically:
-   - Run tests (`pytest`)
+2. Every push to `main` on [github.com/samy-fadel/agentgrid](https://github.com/samy-fadel/agentgrid) will automatically:
+   - Run unit and integration tests (`pytest`)
    - Build container images for both services
-   - Push images to Artifact Registry
+   - Push images to Google Artifact Registry
    - Deploy the MCP Server to Cloud Run with Direct VPC Egress into your Slurm VPC
-   - Deploy the Agent to Cloud Run and configure IAM authorization to call the MCP service
+   - Deploy the Agent to Cloud Run and configure IAM service-to-service authorization
 
-### Triggering the Agent on Cloud Run
+### Using the Agent on Cloud Run
 
-Once deployed, invoke the agent via its HTTP API:
+#### Option 1: Interactive Web UI (Swagger UI)
+Visit the interactive Swagger UI directly in your browser:
+```text
+https://<YOUR_AGENT_SERVICE_URL>.a.run.app/docs
+```
+You can inspect schemas, test custom objectives, and trigger optimization runs with a single click.
 
+#### Option 2: HTTP API
 ```bash
-curl -X POST https://agentic-compute-agent-xyz-ew.a.run.app/optimize \
+curl -X POST https://<YOUR_AGENT_SERVICE_URL>.a.run.app/optimize \
   -H "Content-Type: application/json" \
   -d '{"objective": "Run the compute workload autonomously, minimize cost and respect deadline."}'
 ```
