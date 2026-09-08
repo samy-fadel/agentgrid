@@ -1,302 +1,271 @@
-# Agentic Compute
+# AgentGrid
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Google Cloud](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run%20%7C%20Vertex%20AI%20%7C%20Slurm-4285F4.svg)](https://cloud.google.com/)
 
 **An open-source autonomous control plane for heterogeneous compute infrastructure.**
 
-> Give the system an objective, not a resource request.
+> **"Give the system a business objective, not a resource request."**
 
-This version is intentionally **Google-native**:
+AgentGrid replaces static, manual resource provisioning with **autonomous, closed-loop AI agents** that dynamically observe, resize, and optimize compute workloads across Slurm clusters, Ray, and Cloud environments to meet deadlines at minimal cost.
 
-- **Gemini** = reasoning model
-- **Google ADK** = agent framework
-- **MCP** = boundary between the agent and compute runtimes
-- **Vertex AI** = recommended model backend
-- **Simulator** = built-in zero-dependency simulation engine (local / dev)
-- **Slurm** = production GCP HPC runtime adapter via slurmrestd
+---
 
-## Architecture
+## The Problem: The High Cost of Guessing Compute
 
-```text
-                 User objective
-                       |
-                       v
-              +------------------+
-              | Gemini via ADK   |
-              | Compute Agent    |
-              +--------+---------+
-                       |
-                  McpToolset
-                       |
-              MCP (stdio or SSE)
-                       |
-              +--------+---------+
-              | Compute MCP      |
-              | Server           |
-              +--------+---------+
-                       |
-                 RuntimeAdapter
-                       |
-             +---------+---------+
-             |                   |
-       SimulatedRuntime      SlurmRuntime
-        (Local / Dev)       (GCP / Prod)
+In modern AI training, Monte Carlo simulations, and HPC research, resource allocation is fundamentally broken:
+
+* **The Overprovisioning Tax**: Engineers routinely overestimate CPU, GPU, and memory requests (`--cpus-per-task`, `--mem`) to prevent job crashes, wasting up to 40% of cloud budgets.
+* **Deadlines vs. Costs**: Workloads have strict deadlines and financial budgets. Traditional schedulers (Slurm, Kubernetes) only execute static queues—they cannot reason about trade-offs between job completion time and resource expenditure.
+* **Dumb Autoscaling**: Conventional autoscalers react rigidly to raw metrics (e.g., `CPU > 80%`). They cannot predict workload convergence, evaluate candidate cost curves, or adapt strategy mid-run.
+
+---
+
+## The AgentGrid Solution: Self-Driving Compute
+
+Instead of babysitting clusters, operators declare high-level **intent**:
+
+```json
+{
+  "objective": "Run the genomic sequence analysis. Complete before 08:00 AM under $250, minimizing overall cost."
+}
 ```
 
-The agent never sees Slurm commands, Ray APIs, Kubernetes objects, or simulator internals.
-It sees a stable **compute semantic model**.
+AgentGrid continuously runs an **autonomous control loop** that negotiates allocations with the underlying cluster, balancing cost curves, deadlines, and queue dynamics until completion.
 
-## Core abstractions
+### The Autonomous Agentic Loop
 
-The runtime is represented with a small universal vocabulary:
+```mermaid
+flowchart TD
+    subgraph Loop ["Autonomous Closed-Loop Control"]
+        A["1. Observe State<br/>(Cluster capacity, queue, workload progress)"] --> B["2. Deterministic Forecast<br/>(ETAs & cost curves for candidate allocations)"]
+        B --> C["3. Agentic Reasoning (Gemini)<br/>(Trade off deadline vs. cost vs. headroom)"]
+        C --> D["4. Actuate via MCP<br/>(Resize resources, migrate queue, advance time)"]
+        D --> E["5. Verify & Adapt<br/>(Confirm runtime feedback, detect divergence)"]
+        E --> A
+    end
+```
 
-- `ClusterState`
-- `WorkloadState`
-- `Objective`
-- `CandidateAllocation`
-- `RuntimeSnapshot`
-- `Action`
+---
 
-That model is deliberately independent from Gemini, ADK, MCP and Slurm.
+## System Architecture
 
-## Why both ADK and MCP?
+AgentGrid enforces a strict boundary between **reasoning (AI)**, **tool protocol (MCP)**, and **infrastructure actuation (Runtimes)**. The agent never directly executes low-level Slurm commands or cloud APIs; it operates purely through standardized compute semantic abstractions.
 
-They solve different problems.
+```mermaid
+flowchart TB
+    subgraph Clients ["Interfaces & Entrypoints"]
+        UI["Swagger Web UI<br/>(/docs)"]
+        CLI["ADK CLI / Web<br/>(adk web .)"]
+        API["FastAPI Control Plane<br/>(POST /optimize)"]
+    end
 
-**ADK** manages the agent:
-- Gemini model
-- reasoning loop
-- tool use
-- sessions
-- evaluation/deployment path
+    subgraph AgentPlane ["Agentic Intelligence (Cloud Run)"]
+        Agent["Google ADK Agent<br/>(Gemini 2.5 Flash via Vertex AI)"]
+        Prompt["Strategy Engine<br/>• Budget & Deadline trade-offs<br/>• Elastic scaling policies<br/>• Closed-loop adaptation"]
+        Agent --- Prompt
+    end
 
-**MCP** decouples that agent from the runtime:
-- tool discovery
-- structured tool calls
-- runtime boundary
-- future Slurm/Ray/Kubernetes adapters
+    subgraph Protocol ["Universal Tool Boundary"]
+        MCP["Model Context Protocol (FastMCP)<br/>• get_runtime_snapshot()<br/>• resize_workload(id, cpu)<br/>• advance_time(minutes)<br/>• reset_runtime()"]
+    end
 
-The system supports **dual transports**:
-- **Local development**: Launches the MCP server as a local subprocess over **stdio**.
-- **Production (Cloud Run)**: Connects remotely to the MCP service over **SSE (Server-Sent Events)** with Google IAM OIDC authentication.
+    subgraph Infrastructure ["Heterogeneous Compute Backends"]
+        Sim["Simulated Engine<br/>(Zero-dependency local discrete event simulator)"]
+        Slurm["GCP Slurm HPC Cluster<br/>(Private VPC via Direct VPC Egress + Secret Manager)"]
+        Future["Extensible Grid<br/>(Ray, Kubernetes GKE, Cloud Batch)"]
+    end
 
-## Runtimes: Simulator vs Real Slurm
+    Clients --> API
+    API --> Agent
+    Agent -->|McpToolset over SSE or stdio| MCP
+    MCP --> Sim
+    MCP --> Slurm
+    MCP -.-> Future
+```
+
+---
+
+## Deterministic vs. Agentic Responsibilities
+
+AgentGrid is built on a core principle: **never ask an LLM to do arithmetic that deterministic software can compute with 100% precision.**
+
+| Responsibility | Deterministic Backend (MCP / Runtime) | Agentic Brain (Gemini via ADK) |
+| :--- | :---: | :---: |
+| **Cluster Metrics** | Measures live CPU/GPU utilization & queue depth | Interprets cluster health & bottlenecks |
+| **Candidate Projections** | Computes exact mathematical ETAs and cost curves | Evaluates which allocation meets business goals |
+| **Validation** | Enforces hard quota limits and safety constraints | Reasons over policy trade-offs (cost vs. speed) |
+| **Actuation** | Executes atomic API calls to Slurm / Simulator | Decides *when* and *how much* to scale |
+| **Outcome Reflection** | Reports status codes, execution duration, and state | Explains rationale and summarizes mission outcome |
+
+---
+
+## Supported Compute Runtimes
+
+AgentGrid features pluggable runtime adapters configured via environment variables:
 
 | Capability | `COMPUTE_RUNTIME=simulator` | `COMPUTE_RUNTIME=slurm` |
 | :--- | :--- | :--- |
-| **Purpose** | Fast local testing, CI/CD verification, zero setup | Live Slurm cluster on Google Cloud |
-| **Prerequisites** | None (pure Python discrete-event simulation) | GCP VPC with `slurmrestd` |
-| **Workload** | Synthetic Monte Carlo task (`mc-001`) | Real batch job ID (`SLURM_JOB_ID`) |
-| **Transport** | `stdio` (local subprocess) or `sse` | `sse` on Cloud Run via Direct VPC Egress |
-| **Actions** | Deterministic state progression | Real Slurm updates via REST API |
+| **Target Environment** | Local developer machines, CI/CD pipelines | Production GCP HPC Slurm cluster |
+| **Prerequisites** | None (pure Python discrete-event simulation) | GCP VPC with `slurmrestd` + JWT secret |
+| **Workload Scope** | Deterministic Monte Carlo simulation (`mc-001`) | Real cluster jobs (`SLURM_JOB_ID`) |
+| **Transport Protocol** | `stdio` (local subprocess) or `sse` | `sse` on Cloud Run via Direct VPC Egress |
+| **Actuation Mechanism** | State progression engine with linear scaling law | Direct `slurmrestd` REST API v0.0.41 |
 
-## What the demo does
+---
 
-The simulated cluster starts with:
+## Quickstart (Local Development)
 
-- 128 CPUs
-- one Monte-Carlo-style workload
-- 32 CPUs currently allocated
-- a deadline
-- a maximum cost
-- candidate allocations with deterministic runtime/cost predictions
-
-The MCP server exposes these tools:
-
-```text
-get_runtime_snapshot()
-resize_workload(workload_id, cpu)
-advance_time(minutes)
-reset_runtime()
-```
-
-The agent is instructed to:
-
-1. observe the runtime;
-2. reason about the workload objective;
-3. choose a high-level allocation;
-4. act through MCP;
-5. advance simulated time;
-6. observe again;
-7. adapt until the workload finishes.
-
-The **LLM makes the strategy decision**.
-The simulator only measures, predicts, validates and executes.
-
-## Setup with Google Cloud / Vertex AI
+### 1. Prerequisites & Installation
 
 Python 3.11+ is required.
 
 ```bash
-python -m venv .venv
+# Clone repository
+git clone https://github.com/samy-fadel/agentgrid.git
+cd agentgrid
+
+# Setup virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+
+# Configure environment
 cp .env.example .env
 ```
 
-Authenticate with Google Cloud:
+### 2. Configure Gemini / Vertex AI Authentication
 
 ```bash
 gcloud auth application-default login
 gcloud config set project YOUR_PROJECT_ID
 ```
 
-Then edit `.env`:
+Edit your `.env` file:
 
-```text
+```env
 GOOGLE_GENAI_USE_VERTEXAI=TRUE
 GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID
 GOOGLE_CLOUD_LOCATION=us-central1
 AGENTIC_COMPUTE_MODEL=gemini-2.5-flash
 ```
 
-## Run the MCP server alone
+### 3. Run the Agent Locally
 
-Useful for inspecting the runtime boundary:
-
-```bash
-agentic-compute-mcp
-```
-
-Or with the MCP development tooling:
-
-```bash
-mcp dev src/agentic_compute/mcp_server.py
-```
-
-## Run the ADK agent
-
-From the repository root:
+Launch the ADK graphical playground:
 
 ```bash
 adk web .
 ```
 
-Open the ADK web UI and select `compute_agent`.
+Open your browser at `http://localhost:8000`, select **`compute_agent`**, and instruct the agent:
 
-Ask:
+> *"Run the compute workload autonomously. Meet its deadline and budget while minimizing cost. Continue observing and adapting until it finishes, then summarize the result."*
 
-```text
-Run the simulated workload autonomously.
-Meet its deadline and budget while minimizing cost.
-Continue observing and adapting until it finishes, then summarize the result.
-```
-
-You can also use the ADK CLI:
+You can also run the agent directly from the command line:
 
 ```bash
 adk run compute_agent
 ```
 
-## The agent
+---
 
-`compute_agent/agent.py` is deliberately small.
+## Production Deployment on Google Cloud
 
-It contains:
-- Gemini model selection
-- system instruction
-- one `McpToolset`
+AgentGrid is packaged with automated CI/CD for Google Cloud using **Cloud Build**, **Artifact Registry**, and **Cloud Run** with **Direct VPC Egress** to connect directly to private Slurm clusters.
 
-It contains **no runtime-specific implementation**.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Engineer
+    participant GH as GitHub (agentgrid)
+    participant CB as Cloud Build Pipeline
+    participant AR as Artifact Registry
+    participant CR_Agent as Cloud Run (Agent Service)
+    participant CR_MCP as Cloud Run (MCP Server)
+    participant VPC as VPC (Slurm Cluster)
 
-That is the architectural test.
+    Dev->>GH: git push origin main
+    GH->>CB: Webhook trigger
+    CB->>CB: 1. Run unit & contract tests (pytest)
+    CB->>AR: 2. Build & push Docker images
+    CB->>CR_MCP: 3. Deploy MCP Server (Direct VPC Egress + Slurm JWT)
+    CB->>CR_Agent: 4. Deploy Agent Service (Auto-bind MCP URL)
+    CB->>CR_MCP: 5. Grant IAM roles/run.invoker to Agent Service
+    CR_Agent->>CR_MCP: Authenticated SSE tool calls (GCP OIDC)
+    CR_MCP->>VPC: Manage Slurm allocations via slurmrestd
+```
 
-## Project structure
+### Deploy via CI/CD
+
+1. **One-Time CI/CD Setup**:
+   ```bash
+   chmod +x scripts/setup_ci_cd.sh
+   ./scripts/setup_ci_cd.sh
+   ```
+
+2. **Triggering Deployments**:
+   Every push to `main` on [github.com/samy-fadel/agentgrid](https://github.com/samy-fadel/agentgrid) automatically runs tests, builds both container images, and deploys both services with end-to-end IAM authentication.
+
+### Interacting with the Cloud Run Agent
+
+* **Interactive Swagger UI**: Visit `https://<AGENT_SERVICE_URL>.a.run.app/docs` in your browser to inspect API schemas and trigger runs interactively.
+* **REST API**:
+  ```bash
+  curl -X POST https://<AGENT_SERVICE_URL>.a.run.app/optimize     -H "Content-Type: application/json"     -d '{
+      "objective": "Run the compute workload autonomously. Minimize cost, respect deadline, and adapt to queue pressure."
+    }'
+  ```
+
+---
+
+## Project Structure
 
 ```text
-├── cloudbuild.yaml           # CI/CD pipeline for Cloud Run deployment
-├── Dockerfile.agent          # Container for Cloud Run Agent service
-├── Dockerfile.mcp            # Container for Cloud Run MCP Server
-├── pyproject.toml            # Package configuration & dependencies
+├── cloudbuild.yaml           # Automated CI/CD pipeline for Cloud Run
+├── Dockerfile.agent          # Container definition for ADK Agent Service
+├── Dockerfile.mcp            # Container definition for FastMCP Server
+├── pyproject.toml            # Package metadata, dependencies, and entrypoints
 │
-├── compute_agent/            # ADK Agent Service
-│   ├── agent.py              # Google ADK root_agent (supports SSE & stdio)
-│   ├── app.py                # FastAPI HTTP entrypoint for Cloud Run
-│   └── auth.py               # GCP OIDC ID token helper for IAM auth
+├── compute_agent/            # Agent Service Layer
+│   ├── agent.py              # Google ADK root_agent (Gemini + McpToolset)
+│   ├── app.py                # FastAPI HTTP REST API & Swagger UI
+│   └── auth.py               # GCP OIDC token generator for IAM service-to-service
 │
-├── src/agentic_compute/      # Domain models & MCP Server
-│   ├── models.py             # Universal compute semantics
-│   ├── runtime.py            # RuntimeAdapter base interface
-│   ├── simulator.py          # Deterministic simulated backend
-│   ├── slurm_adapter.py      # Slurm REST adapter for GCP Slurm
-│   └── mcp_server.py         # MCP boundary (FastMCP over SSE & stdio)
+├── src/agentic_compute/      # Domain Logic & Compute Boundary
+│   ├── models.py             # Universal semantic abstractions (ClusterState, Workload)
+│   ├── runtime.py            # RuntimeAdapter abstract base interface
+│   ├── simulator.py          # Built-in deterministic discrete-event simulator
+│   ├── slurm_adapter.py      # Production adapter for Slurm REST API (v0.0.41)
+│   └── mcp_server.py         # FastMCP Server (dual SSE & stdio transports)
 │
 ├── scripts/
-│   └── setup_ci_cd.sh        # Automation script to set up GCP trigger & IAM
+│   ├── deploy_services.sh    # Cloud Run deployment & IAM binding script
+│   └── setup_ci_cd.sh        # Setup script for Artifact Registry, triggers, and IAM
 │
-└── tests/                    # Automated test suite
-    ├── test_agent_service.py # Tests for Cloud Run agent API
-    ├── test_mcp_contract.py  # Tests for MCP server and health probes
-    ├── test_simulator.py     # Tests for simulator runtime
-    └── test_slurm.py         # Tests for Slurm adapter
+└── tests/                    # Comprehensive test suite
+    ├── test_agent_service.py # API & endpoint contract tests
+    ├── test_mcp_contract.py  # FastMCP interface & probe tests
+    ├── test_simulator.py     # Simulator physics & deterministic progression tests
+    └── test_slurm.py         # Slurm REST adapter & node discovery tests
 ```
 
-## Deterministic vs agentic responsibilities
+---
 
-```text
-DETERMINISTIC                       AGENTIC
+## Roadmap
 
-measure cluster state               choose strategy
-predict candidate ETA               trade off objectives
-predict candidate cost              adapt after new observations
-validate requested action           decide when to resize
-apply action safely                 explain decision
-```
+- [x] Universal compute semantic models (`ClusterState`, `WorkloadState`, `CandidateAllocation`).
+- [x] FastMCP server supporting dual transports (`stdio` local, `sse` remote).
+- [x] Built-in discrete-event simulation runtime.
+- [x] Production Slurm REST API adapter (`slurmrestd` v0.0.41).
+- [x] Automated CI/CD with Google Cloud Build & Cloud Run Direct VPC Egress.
+- [ ] Multi-agent orchestration (Planner Agent + Cost Guardian Agent + Cluster Watchdog).
+- [ ] Kubernetes / GKE Ray cluster runtime adapter.
+- [ ] Spot / preemptible instance risk forecasting & dynamic migration.
 
-The project should never ask Gemini to do arithmetic that a deterministic function can do reliably.
-
-## Cloud Run & Slurm Architecture
-
-In production on Google Cloud:
-
-```text
-[ GitHub Repository ]
-         │ (git push to main)
-         ▼
-  [ Cloud Build ] ── Runs pytest ── Builds & Pushes Containers
-         │
-         ├─── Deploy ──► [ Cloud Run: Agent Service ]
-         │                      │
-         │                      ▼ (HTTPS + IAM OIDC)
-         └─── Deploy ──► [ Cloud Run: MCP Server ]
-                                │
-                                ▼ (Direct VPC Egress)
-                         [ Slurm Cluster (GCP VPC) ]
-```
-
-### Setting up CI/CD with Cloud Build
-
-1. Configure prerequisites and create the GitHub trigger:
-
-```bash
-chmod +x scripts/setup_ci_cd.sh
-./scripts/setup_ci_cd.sh
-```
-
-2. Every push to `main` on [github.com/samy-fadel/agentgrid](https://github.com/samy-fadel/agentgrid) will automatically:
-   - Run unit and integration tests (`pytest`)
-   - Build container images for both services
-   - Push images to Google Artifact Registry
-   - Deploy the MCP Server to Cloud Run with Direct VPC Egress into your Slurm VPC
-   - Deploy the Agent to Cloud Run and configure IAM service-to-service authorization
-
-### Using the Agent on Cloud Run
-
-#### Option 1: Interactive Web UI (Swagger UI)
-Visit the interactive Swagger UI directly in your browser:
-```text
-https://<YOUR_AGENT_SERVICE_URL>.a.run.app/docs
-```
-You can inspect schemas, test custom objectives, and trigger optimization runs with a single click.
-
-#### Option 2: HTTP API
-```bash
-curl -X POST https://<YOUR_AGENT_SERVICE_URL>.a.run.app/optimize \
-  -H "Content-Type: application/json" \
-  -d '{"objective": "Run the compute workload autonomously, minimize cost and respect deadline."}'
-```
-
+---
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) and [NOTICE](NOTICE) files for details.
