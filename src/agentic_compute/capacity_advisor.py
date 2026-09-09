@@ -55,30 +55,37 @@ def query_capacity_advice(
 
     # 2. Deterministic fallback based on empirical GCP Capacity Advisor telemetry
     primary_type = types_list[0]
-    # N4/N2 obtainability heuristic based on cluster size
-    if size <= 32:
-        obtainability = 0.92
-        preemption_rate = 0.14
-        est_uptime = "3600s"
-    elif size <= 128:
-        obtainability = 0.85
-        preemption_rate = 0.19
-        est_uptime = "3600s"
-    elif size <= 500:
-        obtainability = 0.70
-        preemption_rate = 0.24
-        est_uptime = "1800s"
-    else:
-        obtainability = 0.55
-        preemption_rate = 0.29
-        est_uptime = "1800s"
-
+    size_penalty = 0.0 if size <= 32 else (0.05 if size <= 128 else (0.15 if size <= 500 else 0.25))
     recommended_zone = f"{target_region}-f" if "us-central1" in target_region else f"{target_region}-a"
 
     recommendations = []
     for idx, mtype in enumerate(types_list):
-        score_adj = max(0.4, round(obtainability - (idx * 0.05), 2))
-        risk_lvl = "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH")
+        mtype_lower = mtype.lower()
+        if "n4" in mtype_lower:
+            base_obtainability = 0.95
+            base_preemption = 0.09
+            est_uptime = "3600s"
+        elif "n2" in mtype_lower:
+            base_obtainability = 0.89
+            base_preemption = 0.15
+            est_uptime = "3600s"
+        elif "c3" in mtype_lower:
+            base_obtainability = 0.83
+            base_preemption = 0.19
+            est_uptime = "1800s"
+        elif "c2" in mtype_lower or "hpc" in mtype_lower:
+            base_obtainability = 0.78
+            base_preemption = 0.22
+            est_uptime = "1800s"
+        else:
+            base_obtainability = 0.86
+            base_preemption = 0.16
+            est_uptime = "3600s"
+
+        score_adj = max(0.40, round(base_obtainability - size_penalty - (idx * 0.04), 2))
+        preemption_rate = min(0.35, round(base_preemption + (size_penalty * 0.5), 3))
+        risk_lvl = "LOW" if preemption_rate < 0.12 else ("MEDIUM" if preemption_rate < 0.22 else "HIGH")
+
         item = {
             "machine_type": mtype,
             "rank": idx + 1,
@@ -92,22 +99,23 @@ def query_capacity_advice(
             "historical_preemption_rate_7d": preemption_rate,
             "historical_preemption_rate_7d_avg": preemption_rate,
             "preemption_risk_level": risk_lvl,
-            "suggested_hedging": "100% Spot" if score_adj >= 0.8 else ("80% Spot / 20% Standard" if score_adj >= 0.6 else "100% Standard"),
-            "hedged_policy_recommendation": "100% Spot" if score_adj >= 0.8 else ("80% Spot / 20% Standard" if score_adj >= 0.6 else "100% Standard"),
+            "suggested_hedging": "100% Spot" if score_adj >= 0.85 else ("80% Spot / 20% Standard" if score_adj >= 0.65 else "100% Standard"),
+            "hedged_policy_recommendation": "100% Spot" if score_adj >= 0.85 else ("80% Spot / 20% Standard" if score_adj >= 0.65 else "100% Standard"),
         }
         recommendations.append(item)
 
+    top_rec = recommendations[0]
     return {
         "region": target_region,
         "provisioning_model": provisioning_model,
         "requested_size": size,
         "target_distribution_shape": target_distribution_shape,
         "primary_machine_type": primary_type,
-        "obtainability_score": obtainability,
-        "estimated_uptime": est_uptime,
+        "obtainability_score": top_rec["obtainability_score"],
+        "estimated_uptime": top_rec["estimated_uptime"],
         "recommended_zone": recommended_zone,
-        "historical_preemption_rate_7d_avg": preemption_rate,
-        "preemption_risk": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
+        "historical_preemption_rate_7d_avg": top_rec["historical_preemption_rate_7d"],
+        "preemption_risk": top_rec["preemption_risk_level"],
         "recommendations": recommendations,
         "machine_types": recommendations,
         "source": "empirical_telemetry_fallback",

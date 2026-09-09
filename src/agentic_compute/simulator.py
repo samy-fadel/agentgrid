@@ -23,6 +23,8 @@ class _SimWorkload:
     allocated_cpu: int = 32
     allocated_gpu: int = 0
     accrued_cost_eur: float = 0.0
+    machine_type: str = "n2-standard-32"
+    provisioning_mix: str = "100% Spot"
 
 
 class SimulatedRuntime(RuntimeAdapter):
@@ -106,12 +108,38 @@ class SimulatedRuntime(RuntimeAdapter):
     def _candidate(self, cpu: int) -> CandidateAllocation:
         eta = self._eta_minutes(cpu)
         finish = self.current_time_minutes + eta
-        projected_cost = self.workload.accrued_cost_eur + self._future_cost(cpu, eta)
         budget = self.objective.max_cost_eur
-        mtype = "n4-standard-32" if cpu >= 64 else ("n2-standard-32" if cpu >= 16 else "n2-standard-16")
-        rank = 1 if cpu >= 64 else 2
-        pmix = "100% Spot" if cpu <= 32 else ("80% Spot / 20% Standard" if cpu <= 128 else "70% Spot / 30% Standard")
-        obtainability = 0.92 if cpu <= 32 else (0.85 if cpu <= 64 else (0.75 if cpu <= 128 else 0.60))
+
+        # Dynamic Slack ratio S = (Deadline - CurrentTime) / ETA
+        slack_time = max(0.0, self.objective.deadline_at_minutes - self.current_time_minutes)
+        slack_ratio = (slack_time / eta) if eta > 0 else 99.0
+
+        if slack_ratio > 1.5:
+            pmix = "100% Spot"
+            cost_factor = 0.35
+        elif slack_ratio > 1.1:
+            pmix = "80% Spot / 20% Standard"
+            cost_factor = 0.48
+        else:
+            pmix = "100% Standard"
+            cost_factor = 1.0
+
+        if cpu >= 64:
+            mtype = f"n4-standard-{min(64, cpu)}"
+            rank = 1
+            obtainability = 0.92 if slack_ratio > 1.5 else 0.88
+        elif cpu >= 16:
+            mtype = f"n2-standard-{cpu}"
+            rank = 2
+            obtainability = 0.90 if slack_ratio > 1.5 else 0.85
+        else:
+            mtype = f"n2-standard-{max(4, cpu)}"
+            rank = 2
+            obtainability = 0.95 if slack_ratio > 1.5 else 0.90
+
+        future_cost = cpu * self.cpu_cost_per_hour_eur * cost_factor * (eta / 60.0)
+        projected_cost = self.workload.accrued_cost_eur + future_cost
+
         return CandidateAllocation(
             cpu=cpu,
             estimated_remaining_minutes=round(eta, 3),
@@ -148,6 +176,8 @@ class SimulatedRuntime(RuntimeAdapter):
                 ),
                 accrued_cost_eur=round(self.workload.accrued_cost_eur, 4),
                 done=self.is_done(),
+                machine_type=self.workload.machine_type,
+                provisioning_mix=self.workload.provisioning_mix,
             ),
             objective=self.objective,
             candidate_allocations=candidates,
@@ -174,10 +204,17 @@ class SimulatedRuntime(RuntimeAdapter):
             )
 
         self.workload.allocated_cpu = action.cpu
+        if action.machine_type:
+            self.workload.machine_type = action.machine_type
+        if action.provisioning_model:
+            self.workload.provisioning_mix = action.provisioning_model
+
         self.last_slurm_action = {
             "action": action.action,
             "job_id": self.workload.id,
             "requested_cpu": action.cpu,
+            "machine_type": self.workload.machine_type,
+            "provisioning_mix": self.workload.provisioning_mix,
             "status_code": 200,
             "simulated": True,
             "timestamp": time.time(),
@@ -193,6 +230,14 @@ class SimulatedRuntime(RuntimeAdapter):
         time_to_finish = self.workload.remaining_work_units / rate
         actual_minutes = min(minutes, time_to_finish)
 
+        # Active provisioning cost factor
+        if "80% Spot" in self.workload.provisioning_mix:
+            cost_factor = 0.48
+        elif "Spot" in self.workload.provisioning_mix or "SPOT" in self.workload.provisioning_mix:
+            cost_factor = 0.35
+        else:
+            cost_factor = 1.0
+
         self.workload.remaining_work_units = max(
             0.0,
             self.workload.remaining_work_units - rate * actual_minutes,
@@ -200,6 +245,7 @@ class SimulatedRuntime(RuntimeAdapter):
         self.workload.accrued_cost_eur += (
             self.workload.allocated_cpu
             * self.cpu_cost_per_hour_eur
+            * cost_factor
             * actual_minutes
             / 60.0
         )

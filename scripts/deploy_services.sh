@@ -48,16 +48,27 @@ MCP_URL=$(gcloud run services describe "$MCP_SERVICE_NAME" --region="$REGION" --
 echo "Discovered MCP Server URL: $MCP_URL"
 
 # 5. Deploy Agent Service
-echo "==> Deploying $AGENT_SERVICE_NAME..."
+AGENT_AUTH_FLAG="--no-allow-unauthenticated"
+if [ "${ALLOW_UNAUTHENTICATED:-false}" = "true" ]; then
+  AGENT_AUTH_FLAG="--allow-unauthenticated"
+fi
+
+AGENT_SECRET_FLAG=""
+if [ -n "${AGENTGRID_API_KEY_SECRET:-}" ] && [ "$AGENTGRID_API_KEY_SECRET" != "none" ]; then
+  AGENT_SECRET_FLAG="--set-secrets=AGENTGRID_API_KEY=${AGENTGRID_API_KEY_SECRET}:latest"
+fi
+
+echo "==> Deploying $AGENT_SERVICE_NAME (Auth: $AGENT_AUTH_FLAG)..."
 gcloud run deploy "$AGENT_SERVICE_NAME" \
   --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/agent-service:${COMMIT_SHA}" \
   --region="$REGION" \
   --platform=managed \
-  --allow-unauthenticated \
+  $AGENT_AUTH_FLAG \
   --no-cpu-throttling \
   --timeout=1800 \
   --session-affinity \
-  --set-env-vars="MCP_SERVER_URL=${MCP_URL},GOOGLE_GENAI_USE_VERTEXAI=TRUE,AGENTIC_COMPUTE_MODEL=${MODEL},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${REGION}"
+  --set-env-vars="MCP_SERVER_URL=${MCP_URL},GOOGLE_GENAI_USE_VERTEXAI=TRUE,AGENTIC_COMPUTE_MODEL=${MODEL},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${REGION}" \
+  $AGENT_SECRET_FLAG
 
 # 6. Authorize Agent Service to invoke private MCP Server via IAM OIDC
 AGENT_SA=$(gcloud run services describe "$AGENT_SERVICE_NAME" --region="$REGION" --format='value(spec.template.spec.serviceAccountName)' || true)

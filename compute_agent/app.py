@@ -125,9 +125,32 @@ def get_snapshot() -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+def verify_agent_auth(request: Request) -> None:
+    """Verify authorization token or API key if AGENTGRID_API_KEY is configured."""
+    expected_key = os.getenv("AGENTGRID_API_KEY")
+    if not expected_key:
+        return
+
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = request.headers.get("X-API-Key", "")
+
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif api_key_header:
+        token = api_key_header.strip()
+
+    if token != expected_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Valid X-API-Key or Bearer token required to operate the compute control plane.",
+        )
+
+
 @app.post("/api/reset")
-def reset_runtime_state() -> dict[str, Any]:
+def reset_runtime_state(request: Request) -> dict[str, Any]:
     """Reset the runtime and workload state."""
+    verify_agent_auth(request)
     mcp_server_url = os.getenv("MCP_SERVER_URL")
     if mcp_server_url:
         from urllib.parse import urlparse
@@ -218,8 +241,9 @@ def health() -> dict[str, str]:
 
 @app.post("/optimize", response_model=OptimizeResponse)
 @app.post("/run", response_model=OptimizeResponse)
-async def optimize(req: OptimizeRequest) -> OptimizeResponse:
+async def optimize(req: OptimizeRequest, request: Request) -> OptimizeResponse:
     """Execute the compute optimization loop with Gemini and MCP tools."""
+    verify_agent_auth(request)
     start_time = time.time()
     session_id = req.session_id or f"session-{uuid.uuid4().hex[:8]}"
 
@@ -263,9 +287,10 @@ async def optimize(req: OptimizeRequest) -> OptimizeResponse:
                     )
                 )
 
-            # Record model text responses
-            if event.message and event.message.parts:
-                for part in event.message.parts:
+            # Record model text responses per Google ADK event spec (event.content)
+            content = getattr(event, "content", None) or getattr(event, "message", None)
+            if content and hasattr(content, "parts") and content.parts:
+                for part in content.parts:
                     if getattr(part, "text", None):
                         collected_texts.append(part.text)
 
@@ -302,15 +327,36 @@ async def optimize(req: OptimizeRequest) -> OptimizeResponse:
 @app.post("/optimize/stream")
 @app.get("/optimize/stream")
 async def optimize_stream(
+    request: Request,
     objective: Optional[str] = None,
     session_id: Optional[str] = None,
     user_id: str = "cloud-run-user",
 ) -> StreamingResponse:
     """Stream optimization progress events in real-time via Server-Sent Events (SSE)."""
+    verify_agent_auth(request)
+
+    # Accept objective, session_id, and user_id from JSON body for POST requests
+    final_objective = objective
+    final_session_id = session_id
+    final_user_id = user_id
+
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                if body.get("objective"):
+                    final_objective = body["objective"]
+                if body.get("session_id"):
+                    final_session_id = body["session_id"]
+                if body.get("user_id"):
+                    final_user_id = body["user_id"]
+        except Exception:
+            pass
+
     async def event_generator():
         start_time = time.time()
-        sid = session_id or f"session-{uuid.uuid4().hex[:8]}"
-        prompt = objective or (
+        sid = final_session_id or f"session-{uuid.uuid4().hex[:8]}"
+        prompt = final_objective or (
             "Run the compute workload autonomously. "
             "Meet its deadline and budget while minimizing cost. "
             "Continue observing and adapting until it finishes, then summarize the result."
@@ -320,7 +366,7 @@ async def optimize_stream(
             try:
                 await runner.session_service.create_session(
                     app_name=runner.app_name,
-                    user_id=user_id,
+                    user_id=final_user_id,
                     session_id=sid,
                 )
             except Exception:
@@ -337,7 +383,7 @@ async def optimize_stream(
             collected_texts: list[str] = []
 
             async for event in runner.run_async(
-                user_id=user_id,
+                user_id=final_user_id,
                 session_id=sid,
                 new_message=user_content,
             ):
@@ -362,9 +408,10 @@ async def optimize_stream(
                         }
                         yield f"data: {json.dumps(payload)}\n\n"
 
-                # Emit model text chunks
-                if event.message and event.message.parts:
-                    for part in event.message.parts:
+                # Emit model text chunks per Google ADK event spec (event.content)
+                content = getattr(event, "content", None) or getattr(event, "message", None)
+                if content and hasattr(content, "parts") and content.parts:
+                    for part in content.parts:
                         if getattr(part, "text", None):
                             collected_texts.append(part.text)
                             payload = {
@@ -415,3 +462,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

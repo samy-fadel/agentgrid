@@ -155,17 +155,26 @@ def get_runtime_snapshot() -> dict:
 
 
 @mcp.tool()
-def resize_workload(workload_id: str, cpu: int) -> dict:
+def resize_workload(
+    workload_id: str,
+    cpu: int,
+    machine_type: str | None = None,
+    provisioning_model: str | None = None,
+    reason: str = "requested by compute agent through MCP",
+) -> dict:
     """Resize a workload to one of the CPU allocations advertised by the snapshot.
 
-    This is a high-level control-plane action. The runtime validates the request.
+    Allows scaling CPU cores, selecting prioritized machine types (e.g. N4 vs N2),
+    and applying hedged provisioning models (e.g., SPOT, STANDARD, or 80% Spot / 20% Standard).
     Always call get_runtime_snapshot first and choose an advertised candidate.
     """
     action = Action(
         action="resize_workload",
         workload_id=workload_id,
         cpu=cpu,
-        reason="requested by compute agent through MCP",
+        reason=reason,
+        machine_type=machine_type,
+        provisioning_model=provisioning_model,
     )
     try:
         _runtime.apply(action)
@@ -175,6 +184,8 @@ def resize_workload(workload_id: str, cpu: int) -> dict:
             "error": str(exc),
             "workload_id": workload_id,
             "cpu": cpu,
+            "machine_type": machine_type,
+            "provisioning_model": provisioning_model,
             "slurm_verification": getattr(_runtime, "last_slurm_action", None),
             "snapshot": _runtime.snapshot().model_dump(),
         }
@@ -182,6 +193,8 @@ def resize_workload(workload_id: str, cpu: int) -> dict:
         "status": "applied",
         "workload_id": workload_id,
         "cpu": cpu,
+        "machine_type": machine_type,
+        "provisioning_model": provisioning_model,
         "slurm_verification": getattr(_runtime, "last_slurm_action", None),
         "snapshot": _runtime.snapshot().model_dump(),
     }

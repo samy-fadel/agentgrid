@@ -623,8 +623,8 @@
 
                 {/* Machine Families Ranking & Real-time Obtainability */}
                 <div className="space-y-2">
-                  {capacityAdvice && capacityAdvice.machine_types ? (
-                    capacityAdvice.machine_types.map((m) => (
+                  {capacityAdvice && (capacityAdvice.machine_types || capacityAdvice.recommendations) ? (
+                    (capacityAdvice.machine_types || capacityAdvice.recommendations).map((m) => (
                       <div key={m.machine_type} className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 text-xs font-mono space-y-1.5">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center space-x-2">
@@ -635,15 +635,19 @@
                           </div>
                           <div className="flex items-center space-x-1.5">
                             <span className="text-slate-400 text-[11px]">Obtainability:</span>
-                            <span className={`font-bold ${m.obtainability_score >= 0.85 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                              {m.obtainability_percent || Math.round(m.obtainability_score * 100)}%
+                            <span className={`font-bold ${(m.obtainability_score || m.obtainability || 0.8) >= 0.85 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                              {m.obtainability_percent || Math.round((m.obtainability_score || m.obtainability || 0.8) * 100)}%
                             </span>
                           </div>
                         </div>
                         <div className="flex items-center justify-between text-[11px] text-slate-400 border-t border-slate-900 pt-1">
-                          <span>Zone: <span className="text-cyan-300">{m.recommended_zone || 'us-central1-f'}</span></span>
-                          <span>7d Preempt: <span className="text-amber-400">{((m.historical_preemption_rate_7d || 0.1) * 100).toFixed(1)}%</span></span>
-                          <span>Est. Uptime: <span className="text-slate-300">{Math.round((m.estimated_uptime_minutes || 60))}m</span></span>
+                          <span>Zone: <span className="text-cyan-300">{m.recommended_zone || m.zone || 'us-central1-f'}</span></span>
+                          <span>7d Preempt: <span className="text-amber-400">{(((m.historical_preemption_rate_7d !== undefined ? m.historical_preemption_rate_7d : m.historical_preemption_rate_7d_avg) || 0.1) * 100).toFixed(1)}%</span></span>
+                          <span>Est. Uptime: <span className="text-slate-300">{Math.round((m.estimated_uptime_minutes || (m.estimated_uptime ? (parseInt(m.estimated_uptime) / 60) : 60)))}m</span></span>
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-slate-500 pt-0.5">
+                          <span>Hedging Mix:</span>
+                          <span className="text-cyan-400 font-semibold">{m.suggested_hedging || m.hedged_policy_recommendation || '100% Spot'}</span>
                         </div>
                       </div>
                     ))

@@ -58,6 +58,10 @@ class SlurmRuntime(RuntimeAdapter):
         self.deadline_minutes = float(os.getenv("DEADLINE_MINUTES", "30.0"))
         self.max_cost_eur = float(os.getenv("MAX_COST_EUR", "10.0"))
         self.minimize_cost = os.getenv("MINIMIZE_COST", "true").lower() in ("true", "1", "yes")
+        self.baseline_workload_duration_minutes = float(os.getenv("BASELINE_WORKLOAD_DURATION_MINUTES", "25.0"))
+        self.machine_type = "n2-standard-16"
+        self.provisioning_mix = "100% Spot"
+        self.last_slurm_elapsed_secs: float | None = None
         self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or self._discover_active_job() or "1"
         self.reset()
 
@@ -71,6 +75,9 @@ class SlurmRuntime(RuntimeAdapter):
         self.job_done = False
         self.is_real_slurm_job = False
         self.last_slurm_action = None
+        self.machine_type = "n2-standard-16"
+        self.provisioning_mix = "100% Spot"
+        self.last_slurm_elapsed_secs = None
 
     def configure_objective(
         self,
@@ -235,17 +242,52 @@ class SlurmRuntime(RuntimeAdapter):
         candidate_cpu_steps = generate_candidate_cpus(cluster_total_cpu)
         candidates = []
         curr_cpu = max(1, self.allocated_cpu)
-        curr_remaining = max(0.0, (self.remaining_work_units / 100.0) * self.deadline_minutes) if not self.job_done else 0.0
+        if self.job_done:
+            curr_remaining = 0.0
+        else:
+            # Case 4.1 fix: decoupled from deadline_minutes; based on intrinsic baseline duration
+            curr_remaining = max(
+                0.0,
+                self.baseline_workload_duration_minutes * (self.remaining_work_units / 100.0) * (16.0 / curr_cpu),
+            )
 
         for cpu in candidate_cpu_steps:
             speedup = cpu / curr_cpu
-            est_remaining = round(max(0.0, curr_remaining / speedup), 2)
+            est_remaining = round(max(0.0, curr_remaining / speedup), 2) if not self.job_done else 0.0
             finish_at = round(self.elapsed_minutes + est_remaining, 2)
-            est_cost = round(self.accrued_cost_eur + (cpu * self.cpu_cost_per_hour_eur * (est_remaining / 60.0)), 4)
-            mtype = "n4-standard-32" if cpu >= 64 else ("n2-standard-32" if cpu >= 16 else "n2-standard-16")
-            rank = 1 if cpu >= 64 else 2
-            pmix = "100% Spot" if cpu <= 32 else ("80% Spot / 20% Standard" if cpu <= 128 else "70% Spot / 30% Standard")
-            obtainability = 0.92 if cpu <= 32 else (0.85 if cpu <= 64 else (0.75 if cpu <= 128 else 0.60))
+
+            # Dynamic Slack Ratio S = (Deadline - CurrentElapsed) / ETA
+            slack_time = max(0.0, self.deadline_minutes - self.elapsed_minutes)
+            slack_ratio = (slack_time / est_remaining) if est_remaining > 0 else 99.0
+
+            # Dynamic Spot / Standard hedging mix and pricing factor
+            if slack_ratio > 1.5:
+                pmix = "100% Spot"
+                cost_factor = 0.35
+            elif slack_ratio > 1.1:
+                pmix = "80% Spot / 20% Standard"
+                cost_factor = 0.48
+            else:
+                pmix = "100% Standard"
+                cost_factor = 1.0
+
+            if cpu >= 64:
+                mtype = f"n4-standard-{min(64, cpu)}"
+                rank = 1
+                obtainability = 0.92 if slack_ratio > 1.5 else 0.88
+            elif cpu >= 16:
+                mtype = f"n2-standard-{cpu}"
+                rank = 2
+                obtainability = 0.90 if slack_ratio > 1.5 else 0.85
+            else:
+                mtype = f"n2-standard-{max(4, cpu)}"
+                rank = 2
+                obtainability = 0.95 if slack_ratio > 1.5 else 0.90
+
+            est_cost = round(
+                self.accrued_cost_eur + (cpu * self.cpu_cost_per_hour_eur * cost_factor * (est_remaining / 60.0)),
+                4,
+            )
             candidates.append(
                 CandidateAllocation(
                     cpu=cpu,
@@ -278,6 +320,8 @@ class SlurmRuntime(RuntimeAdapter):
                 estimated_remaining_minutes=round(curr_remaining, 2),
                 accrued_cost_eur=round(self.accrued_cost_eur, 4),
                 done=self.job_done,
+                machine_type=self.machine_type,
+                provisioning_mix=self.provisioning_mix,
             ),
             objective=Objective(
                 deadline_at_minutes=self.deadline_minutes,
@@ -292,6 +336,11 @@ class SlurmRuntime(RuntimeAdapter):
             return
         if not action.cpu:
             return
+
+        if action.machine_type:
+            self.machine_type = action.machine_type
+        if action.provisioning_model:
+            self.provisioning_mix = action.provisioning_model
 
         resp = None
         status_code = None
@@ -313,17 +362,21 @@ class SlurmRuntime(RuntimeAdapter):
                 "action": action.action,
                 "job_id": self.active_job_id,
                 "requested_cpu": action.cpu,
+                "machine_type": self.machine_type,
+                "provisioning_mix": self.provisioning_mix,
                 "status_code": status_code,
                 "status": "applied",
                 "timestamp": time.time(),
             }
-        elif os.getenv("MOCK_SLURM", "").lower() in ("true", "1"):
+        elif os.getenv("MOCK_SLURM", "").lower() in ("true", "1") or str(self.active_job_id).startswith("mock-"):
             # Explicit mock fallback only for tests
             self.allocated_cpu = action.cpu
             self.last_slurm_action = {
                 "action": action.action,
                 "job_id": self.active_job_id,
                 "requested_cpu": action.cpu,
+                "machine_type": self.machine_type,
+                "provisioning_mix": self.provisioning_mix,
                 "status_code": status_code or 200,
                 "status": "applied",
                 "simulated": True,
@@ -335,6 +388,8 @@ class SlurmRuntime(RuntimeAdapter):
                 "action": action.action,
                 "job_id": self.active_job_id,
                 "requested_cpu": action.cpu,
+                "machine_type": self.machine_type,
+                "provisioning_mix": self.provisioning_mix,
                 "status_code": status_code,
                 "status": "failed",
                 "error": detail,
@@ -348,8 +403,13 @@ class SlurmRuntime(RuntimeAdapter):
         if self.job_done:
             return
 
-        self.elapsed_minutes += minutes
-        self.accrued_cost_eur += (self.allocated_cpu * self.cpu_cost_per_hour_eur * (minutes / 60.0))
+        # Active provisioning cost factor
+        if "80% Spot" in self.provisioning_mix:
+            cost_factor = 0.48
+        elif "Spot" in self.provisioning_mix or "SPOT" in self.provisioning_mix:
+            cost_factor = 0.35
+        else:
+            cost_factor = 1.0
 
         # 1. Query real Slurm status first as primary source of truth
         job_info = self._get_job()
@@ -369,15 +429,45 @@ class SlurmRuntime(RuntimeAdapter):
                 self.job_done = False
                 time_info = job.get("time", {})
                 slurm_elapsed_secs = time_info.get("elapsed", 0)
-                if isinstance(slurm_elapsed_secs, (int, float)) and slurm_elapsed_secs > 0:
+
+                # Case 4.2 fix: Only accrue cost for actual delta in Slurm elapsed seconds
+                if isinstance(slurm_elapsed_secs, (int, float)) and slurm_elapsed_secs >= 0:
+                    if self.last_slurm_elapsed_secs is None:
+                        delta_secs = slurm_elapsed_secs
+                    else:
+                        delta_secs = max(0.0, slurm_elapsed_secs - self.last_slurm_elapsed_secs)
+                    self.last_slurm_elapsed_secs = slurm_elapsed_secs
                     self.elapsed_minutes = slurm_elapsed_secs / 60.0
 
-                est_total = max(1.0, self.deadline_minutes)
-                self.remaining_work_units = max(0.1, 100.0 * max(0.0, 1.0 - (self.elapsed_minutes / est_total)))
-        elif not self.is_real_slurm_job:
-            # Fallback for mock/test runs without a live Slurm daemon
-            speedup = self.allocated_cpu / 32.0
-            work_completed = minutes * 4.0 * speedup
+                    if delta_secs > 0:
+                        self.accrued_cost_eur += (
+                            self.allocated_cpu
+                            * self.cpu_cost_per_hour_eur
+                            * cost_factor
+                            * (delta_secs / 3600.0)
+                        )
+
+                    # Intrinsic workload burn-down based on baseline duration and speedup
+                    expected_total_secs = (
+                        self.baseline_workload_duration_minutes * 60.0 * (16.0 / max(1, self.allocated_cpu))
+                    )
+                    progress = min(1.0, slurm_elapsed_secs / max(1.0, expected_total_secs))
+                    self.remaining_work_units = max(0.1, round(100.0 * (1.0 - progress), 2))
+        else:
+            # Case 4.3 fix: If Slurm is inaccessible, never silently simulate completion unless explicit mock mode
+            is_mock_enabled = os.getenv("MOCK_SLURM", "").lower() in ("true", "1", "yes") or str(self.active_job_id).startswith("mock-")
+            if not is_mock_enabled:
+                raise RuntimeError(
+                    f"Slurm cluster is unreachable at {self.base_url} (no active job {self.active_job_id} found) and MOCK_SLURM is not enabled."
+                )
+
+            # Fallback for mock/test runs with explicit mock mode
+            self.elapsed_minutes += minutes
+            self.accrued_cost_eur += (
+                self.allocated_cpu * self.cpu_cost_per_hour_eur * cost_factor * (minutes / 60.0)
+            )
+            speedup = self.allocated_cpu / 16.0
+            work_completed = (minutes / self.baseline_workload_duration_minutes) * 100.0 * speedup
             self.remaining_work_units = max(0.0, self.remaining_work_units - work_completed)
             if self.remaining_work_units <= 0.0:
                 self.job_done = True

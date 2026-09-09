@@ -4,6 +4,7 @@ from agentic_compute.slurm_adapter import SlurmRuntime
 
 
 def test_slurm_adapter_snapshot_and_apply(monkeypatch):
+    monkeypatch.setenv("MOCK_SLURM", "true")
     # Mock requests.get and requests.post to ensure instant offline test execution
     monkeypatch.setattr(
         "requests.get",
@@ -140,5 +141,60 @@ def test_slurm_adapter_truthful_job_lifecycle(monkeypatch):
 
     assert runtime.is_done() is True
     assert runtime.snapshot().workload.remaining_work_units == 0.0
+
+
+def test_slurm_deadline_change_does_not_alter_workload_eta():
+    runtime = SlurmRuntime()
+    snap1 = runtime.snapshot()
+    initial_eta = snap1.workload.estimated_remaining_minutes
+
+    # Double the deadline
+    runtime.configure_objective(deadline_minutes=snap1.objective.deadline_at_minutes * 2.0)
+    snap2 = runtime.snapshot()
+
+    # Workload ETA must be invariant to user SLA deadline changes
+    assert snap2.workload.estimated_remaining_minutes == initial_eta
+    assert snap2.objective.deadline_at_minutes == snap1.objective.deadline_at_minutes * 2.0
+
+
+def test_slurm_duplicate_elapsed_time_does_not_double_cost(monkeypatch):
+    # Two successive observations of the same Slurm elapsed time (600s)
+    job_response = {
+        "jobs": [
+            {
+                "job_id": 1001,
+                "job_state": ["RUNNING"],
+                "job_resources": {"allocated_cpus": 16},
+                "time": {"elapsed": 600},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: job_response})(),
+    )
+    runtime = SlurmRuntime(job_id="1001")
+    runtime.tick(5.0)
+    cost_first_obs = runtime.accrued_cost_eur
+    assert cost_first_obs > 0.0
+
+    # Second observation with the exact same elapsed time (600s)
+    runtime.tick(5.0)
+    cost_second_obs = runtime.accrued_cost_eur
+
+    # Cost must not double or accrue when Slurm elapsed time has not advanced
+    assert cost_second_obs == cost_first_obs
+
+
+def test_slurm_unreachable_without_mock_raises_error(monkeypatch):
+    # Slurm cluster is down/unreachable and MOCK_SLURM is not enabled
+    monkeypatch.delenv("MOCK_SLURM", raising=False)
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 503, "text": "Service Unavailable", "json": lambda self: {}})(),
+    )
+    runtime = SlurmRuntime(job_id="real-cluster-job")
+    with pytest.raises(RuntimeError, match="Slurm cluster is unreachable"):
+        runtime.tick(5.0)
 
 

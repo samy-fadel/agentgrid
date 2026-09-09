@@ -22,6 +22,8 @@ class WorkloadState(BaseModel):
     estimated_remaining_minutes: float = Field(ge=0)
     accrued_cost_eur: float = Field(ge=0)
     done: bool = False
+    machine_type: str | None = None
+    provisioning_mix: str | None = None
 
 
 class Objective(BaseModel):
@@ -55,9 +57,12 @@ class Action(BaseModel):
     workload_id: str
     cpu: int | None = Field(default=None, gt=0)
     reason: str = Field(min_length=1, max_length=1000)
+    machine_type: str | None = None
+    provisioning_model: str | None = None
 
     @model_validator(mode="after")
     def validate_cpu_for_resize(self) -> "Action":
         if self.action == "resize_workload" and self.cpu is None:
             raise ValueError("cpu is required for resize_workload")
         return self
+
