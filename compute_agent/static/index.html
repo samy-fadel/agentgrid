@@ -262,13 +262,18 @@
         }
       };
 
-      const cluster = snapshot ? snapshot.cluster : { total_cpu: 128, free_cpu: 96, current_time_minutes: 0, total_gpu: 0 };
-      const workload = snapshot ? snapshot.workload : { id: "1", remaining_work_units: 100, allocated_cpu: 4, accrued_cost_eur: 0, done: false };
-      const candidates = snapshot ? snapshot.candidate_allocations : [];
+      const fmt = (val, digits = 1, fallback = "0.0") => {
+        if (val === null || val === undefined || isNaN(Number(val))) return fallback;
+        return Number(val).toFixed(digits);
+      };
+
+      const cluster = (snapshot && snapshot.cluster) ? snapshot.cluster : { total_cpu: 128, free_cpu: 96, current_time_minutes: 0, total_gpu: 0 };
+      const workload = (snapshot && snapshot.workload) ? snapshot.workload : { id: "1", remaining_work_units: 100, allocated_cpu: 4, accrued_cost_eur: 0, estimated_remaining_minutes: 25.0, done: false };
+      const candidates = (snapshot && snapshot.candidate_allocations) ? snapshot.candidate_allocations : [];
 
       const progressPct = Math.max(0, Math.min(100, 100 - (workload.remaining_work_units || 0)));
-      const budgetPct = snapshot && snapshot.objective.max_cost_eur
-        ? Math.min(100, (workload.accrued_cost_eur / snapshot.objective.max_cost_eur) * 100)
+      const budgetPct = snapshot && snapshot.objective && snapshot.objective.max_cost_eur
+        ? Math.min(100, ((workload.accrued_cost_eur || 0) / snapshot.objective.max_cost_eur) * 100)
         : 10;
 
       return (
@@ -349,8 +354,8 @@
                 </span>
               </div>
               <div className="flex items-baseline space-x-2">
-                <span className="text-3xl font-bold tracking-tight text-white font-mono">{progressPct.toFixed(0)}%</span>
-                <span className="text-xs text-slate-400">({workload.remaining_work_units.toFixed(1)} units left)</span>
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">{fmt(progressPct, 0, "0")}%</span>
+                <span className="text-xs text-slate-400">({fmt(workload.remaining_work_units, 1)} units left)</span>
               </div>
               <div className="w-full bg-slate-800 h-1.5 rounded-full mt-3 overflow-hidden">
                 <div
@@ -363,10 +368,10 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
               <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
                 <span>Accrued Cost</span>
-                <span className="text-xs text-slate-400">Max: €{snapshot ? snapshot.objective.max_cost_eur : budget}</span>
+                <span className="text-xs text-slate-400">Max: €{snapshot && snapshot.objective ? snapshot.objective.max_cost_eur : budget}</span>
               </div>
               <div className="flex items-baseline space-x-2">
-                <span className="text-3xl font-bold tracking-tight text-white font-mono">€{workload.accrued_cost_eur.toFixed(3)}</span>
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">€{fmt(workload.accrued_cost_eur, 3, "0.000")}</span>
                 <span className="text-xs text-slate-400 font-mono">EUR</span>
               </div>
               <div className="w-full bg-slate-800 h-1.5 rounded-full mt-3 overflow-hidden">
@@ -380,15 +385,15 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
               <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
                 <span>Cluster Clock</span>
-                <span className="text-xs text-slate-400">Deadline: {snapshot ? snapshot.objective.deadline_at_minutes : deadline}m</span>
+                <span className="text-xs text-slate-400">Deadline: {snapshot && snapshot.objective ? snapshot.objective.deadline_at_minutes : deadline}m</span>
               </div>
               <div className="flex items-baseline space-x-2">
-                <span className="text-3xl font-bold tracking-tight text-white font-mono">{cluster.current_time_minutes.toFixed(1)}</span>
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">{fmt(cluster.current_time_minutes, 1)}</span>
                 <span className="text-xs text-slate-400">min elapsed</span>
               </div>
               <div className="mt-2 text-xs text-slate-400 flex items-center space-x-1">
                 <span>Est. Remaining: </span>
-                <span className="text-cyan-400 font-mono font-medium">{workload.estimated_remaining_minutes.toFixed(1)}m</span>
+                <span className="text-cyan-400 font-mono font-medium">{fmt(workload.estimated_remaining_minutes, 1)}m</span>
               </div>
             </div>
           </div>
@@ -471,7 +476,7 @@
                   <div className="space-y-1">
                     <div className="flex justify-between text-xs">
                       <span className="text-slate-400">Max Budget:</span>
-                      <span className="text-cyan-400 font-mono font-medium">€{budget.toFixed(1)}</span>
+                      <span className="text-cyan-400 font-mono font-medium">€{fmt(budget, 1)}</span>
                     </div>
                     <input
                       type="range"
@@ -544,7 +549,11 @@
                   {slurmVerification && (
                     <div className="flex justify-between border-t border-slate-900 pt-1.5">
                       <span className="text-slate-400">Last Slurm REST Receipt:</span>
-                      <span className="text-emerald-400">HTTP {slurmVerification.status_code || 200} OK</span>
+                      <span className={slurmVerification.status === 'failed' ? "text-rose-400" : "text-emerald-400"}>
+                        {slurmVerification.status === 'failed'
+                          ? `HTTP ${slurmVerification.status_code || 500} FAILED`
+                          : `HTTP ${slurmVerification.status_code || 200} OK`}
+                      </span>
                     </div>
                   )}
                 </div>
@@ -680,9 +689,9 @@
                               {isCurrent && <span className="h-1.5 w-1.5 rounded-full bg-cyan-400"></span>}
                               <span>{c.cpu} CPUs</span>
                             </td>
-                            <td className="py-2.5">{c.estimated_remaining_minutes.toFixed(1)}m</td>
-                            <td className="py-2.5">{c.projected_finish_at_minutes.toFixed(1)}m</td>
-                            <td className="py-2.5">€{c.projected_total_cost_eur.toFixed(3)}</td>
+                            <td className="py-2.5">{fmt(c.estimated_remaining_minutes, 1)}m</td>
+                            <td className="py-2.5">{fmt(c.projected_finish_at_minutes, 1)}m</td>
+                            <td className="py-2.5">€{fmt(c.projected_total_cost_eur, 3, "0.000")}</td>
                             <td className="py-2.5">
                               {c.meets_deadline ? (
                                 <span className="text-emerald-400">✓ Meets</span>
