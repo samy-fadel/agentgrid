@@ -99,15 +99,22 @@ def submit_job(
     If CPU is omitted, the cluster selects an optimal baseline allocation.
     """
     if hasattr(_runtime, "submit_job"):
-        res = _runtime.submit_job(
-            name=name,
-            cpu=cpu,
-            gpu=gpu,
-            partition=partition,
-            memory_mb=memory_mb,
-            script=script,
-        )
-        return {"status": "submitted", "job": res, "snapshot": _runtime.snapshot().model_dump()}
+        try:
+            res = _runtime.submit_job(
+                name=name,
+                cpu=cpu,
+                gpu=gpu,
+                partition=partition,
+                memory_mb=memory_mb,
+                script=script,
+            )
+            return {"status": "submitted", "job": res, "snapshot": _runtime.snapshot().model_dump()}
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": str(exc),
+                "snapshot": _runtime.snapshot().model_dump(),
+            }
     return {"status": "submitted", "snapshot": _runtime.snapshot().model_dump()}
 
 
@@ -135,7 +142,17 @@ def resize_workload(workload_id: str, cpu: int) -> dict:
         cpu=cpu,
         reason="requested by compute agent through MCP",
     )
-    _runtime.apply(action)
+    try:
+        _runtime.apply(action)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "workload_id": workload_id,
+            "cpu": cpu,
+            "slurm_verification": getattr(_runtime, "last_slurm_action", None),
+            "snapshot": _runtime.snapshot().model_dump(),
+        }
     return {
         "status": "applied",
         "workload_id": workload_id,

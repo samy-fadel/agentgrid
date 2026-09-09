@@ -31,6 +31,11 @@ def test_mcp_server_tools_workflow():
     assert reset_snap["cluster"]["current_time_minutes"] == 0.0
     assert reset_snap["workload"]["allocated_cpu"] == 32
 
+    # Test error handling when invalid CPU is requested
+    error_res = resize_workload("mc-001", 999)
+    assert error_res["status"] == "error"
+    assert "error" in error_res
+
 
 def test_mcp_health_endpoint():
     from starlette.testclient import TestClient
