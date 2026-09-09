@@ -129,10 +129,13 @@
 
       const logsEndRef = useRef(null);
 
+      // Support direct connection when testing locally or on cloudtop
+      const API_BASE = window.location.origin.includes("run.app") ? "" : "https://agentic-compute-agent-340107663828.us-central1.run.app";
+
       // Fetch snapshot from API
       const fetchSnapshot = async () => {
         try {
-          const res = await fetch("/api/snapshot");
+          const res = await fetch(`${API_BASE}/api/snapshot`);
           if (res.ok) {
             const data = await res.json();
             if (data.snapshot) {
@@ -166,7 +169,7 @@
 
       const handleReset = async () => {
         try {
-          const res = await fetch("/api/reset", { method: "POST" });
+          const res = await fetch(`${API_BASE}/api/reset`, { method: "POST" });
           if (res.ok) {
             const data = await res.json();
             setSnapshot(data.snapshot);
@@ -197,7 +200,7 @@
         }
 
         try {
-          const response = await fetch("/optimize/stream", {
+          const response = await fetch(`${API_BASE}/optimize/stream`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ objective: finalPrompt }),
