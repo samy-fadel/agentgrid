@@ -42,6 +42,37 @@ async def health(request):
     )
 
 
+@mcp.custom_route("/snapshot", methods=["GET"])
+async def snapshot_route(request):
+    """Snapshot endpoint for web dashboard and monitoring."""
+    from starlette.responses import JSONResponse
+
+    runtime_type = os.getenv("COMPUTE_RUNTIME", "simulator").lower()
+    return JSONResponse(
+        {
+            "runtime": runtime_type,
+            "snapshot": _runtime.snapshot().model_dump(),
+            "slurm_verification": getattr(_runtime, "last_slurm_action", None),
+        }
+    )
+
+
+@mcp.custom_route("/reset", methods=["POST"])
+async def reset_route(request):
+    """Reset runtime endpoint."""
+    from starlette.responses import JSONResponse
+
+    _runtime.reset()
+    runtime_type = os.getenv("COMPUTE_RUNTIME", "simulator").lower()
+    return JSONResponse(
+        {
+            "status": "reset",
+            "runtime": runtime_type,
+            "snapshot": _runtime.snapshot().model_dump(),
+        }
+    )
+
+
 
 def _create_runtime() -> RuntimeAdapter:
     runtime_type = os.getenv("COMPUTE_RUNTIME", "simulator").lower()
@@ -109,6 +140,7 @@ def resize_workload(workload_id: str, cpu: int) -> dict:
         "status": "applied",
         "workload_id": workload_id,
         "cpu": cpu,
+        "slurm_verification": getattr(_runtime, "last_slurm_action", None),
         "snapshot": _runtime.snapshot().model_dump(),
     }
 

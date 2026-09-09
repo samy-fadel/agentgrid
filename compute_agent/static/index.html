@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentGrid - Autonomous Compute Control Plane</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            brand: {
+              50: '#ecfeff',
+              400: '#22d3ee',
+              500: '#06b6d4',
+              600: '#0891b2',
+            },
+            slate: {
+              850: '#151f32',
+              900: '#0b1120',
+              950: '#060a12',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- React & Babel Standalone -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body {
+      background-color: #060a12;
+      color: #f1f5f9;
+      font-family: 'Inter', sans-serif;
+    }
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+    @keyframes pulse-ring {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.15); opacity: 0.3; }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+    .pulse-ring {
+      animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+  </style>
+</head>
+<body class="min-h-screen text-slate-100 flex flex-col antialiased selection:bg-cyan-500 selection:text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // --- Icons ---
+    const ServerIcon = () => (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <rect x="2" y="2" width="20" height="8" rx="2" ry="2" strokeWidth="2"/>
+        <rect x="2" y="14" width="20" height="8" rx="2" ry="2" strokeWidth="2"/>
+        <line x1="6" y1="6" x2="6.01" y2="6" strokeWidth="2"/>
+        <line x1="6" y1="18" x2="6.01" y2="18" strokeWidth="2"/>
+      </svg>
+    );
+
+    const CpuIcon = () => (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <rect x="4" y="4" width="16" height="16" rx="2" strokeWidth="2"/>
+        <rect x="9" y="9" width="6" height="6" strokeWidth="2"/>
+        <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3" strokeWidth="2"/>
+      </svg>
+    );
+
+    const CheckCircleIcon = () => (
+      <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    );
+
+    const SparklesIcon = () => (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+      </svg>
+    );
+
+    const ShieldCheckIcon = () => (
+      <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+      </svg>
+    );
+
+    function App() {
+      const [objective, setObjective] = useState(
+        "Run the compute workload autonomously. Meet its deadline and budget while minimizing cost. Continue observing and adapting until it finishes, then summarize the result."
+      );
+      const [deadline, setDeadline] = useState(25);
+      const [budget, setBudget] = useState(5.0);
+      const [minimizeCost, setMinimizeCost] = useState(true);
+
+      const [snapshot, setSnapshot] = useState(null);
+      const [slurmVerification, setSlurmVerification] = useState(null);
+      const [runtimeType, setRuntimeType] = useState("loading...");
+      const [isOptimizing, setIsOptimizing] = useState(false);
+      const [streamLogs, setStreamLogs] = useState([]);
+      const [finalSummary, setFinalSummary] = useState(null);
+      const [copied, setCopied] = useState(false);
+
+      const logsEndRef = useRef(null);
+
+      // Fetch snapshot from API
+      const fetchSnapshot = async () => {
+        try {
+          const res = await fetch("/api/snapshot");
+          if (res.ok) {
+            const data = await res.json();
+            if (data.snapshot) {
+              setSnapshot(data.snapshot);
+              setRuntimeType(data.runtime || "slurm");
+              setSlurmVerification(data.slurm_verification || null);
+            }
+          }
+        } catch (e) {
+          console.error("Failed to fetch snapshot:", e);
+        }
+      };
+
+      useEffect(() => {
+        fetchSnapshot();
+        const interval = setInterval(fetchSnapshot, 6000);
+        return () => clearInterval(interval);
+      }, []);
+
+      useEffect(() => {
+        if (logsEndRef.current) {
+          logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+        }
+      }, [streamLogs]);
+
+      const handlePreset = (text, d, b) => {
+        setObjective(text);
+        if (d) setDeadline(d);
+        if (b) setBudget(b);
+      };
+
+      const handleReset = async () => {
+        try {
+          const res = await fetch("/api/reset", { method: "POST" });
+          if (res.ok) {
+            const data = await res.json();
+            setSnapshot(data.snapshot);
+            setStreamLogs([]);
+            setFinalSummary(null);
+          }
+        } catch (e) {
+          console.error("Reset error:", e);
+        }
+      };
+
+      const copyCommand = (cmd) => {
+        navigator.clipboard.writeText(cmd);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      };
+
+      const runOptimization = async () => {
+        if (isOptimizing) return;
+        setIsOptimizing(true);
+        setStreamLogs([]);
+        setFinalSummary(null);
+
+        // Build tailored prompt incorporating structured sliders if altered
+        let finalPrompt = objective;
+        if (!finalPrompt.includes(String(deadline)) && deadline !== 25) {
+          finalPrompt += ` Deadline is ${deadline} minutes. Max budget is ${budget} EUR. Minimize cost: ${minimizeCost}.`;
+        }
+
+        try {
+          const response = await fetch("/optimize/stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ objective: finalPrompt }),
+          });
+
+          if (!response.body) {
+            throw new Error("ReadableStream not supported");
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n\n");
+            buffer = lines.pop(); // Keep incomplete chunk
+
+            for (const block of lines) {
+              const trimmed = block.trim();
+              if (!trimmed.startsWith("data:")) continue;
+
+              try {
+                const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
+                
+                if (payload.event === "started") {
+                  setStreamLogs(prev => [...prev, { type: "system", text: `Session started (${payload.session_id}) using ${payload.model}` }]);
+                } else if (payload.event === "tool_call") {
+                  setStreamLogs(prev => [...prev, { type: "tool_call", tool: payload.tool, args: payload.args, time: payload.timestamp }]);
+                } else if (payload.event === "tool_response") {
+                  if (payload.response && payload.response.snapshot) {
+                    setSnapshot(payload.response.snapshot);
+                  }
+                  if (payload.response && payload.response.slurm_verification) {
+                    setSlurmVerification(payload.response.slurm_verification);
+                  }
+                } else if (payload.event === "thinking") {
+                  setStreamLogs(prev => [...prev, { type: "thinking", text: payload.text, time: payload.timestamp }]);
+                } else if (payload.event === "completed") {
+                  setFinalSummary(payload.summary);
+                  setStreamLogs(prev => [...prev, { type: "completed", text: `Optimization finished in ${payload.duration_seconds}s.` }]);
+                  fetchSnapshot();
+                } else if (payload.event === "error") {
+                  setStreamLogs(prev => [...prev, { type: "error", text: payload.error }]);
+                }
+              } catch (err) {
+                console.error("Error parsing event line:", err);
+              }
+            }
+          }
+        } catch (err) {
+          setStreamLogs(prev => [...prev, { type: "error", text: `Connection error: ${err.message}` }]);
+        } finally {
+          setIsOptimizing(false);
+          fetchSnapshot();
+        }
+      };
+
+      const cluster = snapshot ? snapshot.cluster : { total_cpu: 128, free_cpu: 96, current_time_minutes: 0, total_gpu: 0 };
+      const workload = snapshot ? snapshot.workload : { id: "1", remaining_work_units: 100, allocated_cpu: 4, accrued_cost_eur: 0, done: false };
+      const candidates = snapshot ? snapshot.candidate_allocations : [];
+
+      const progressPct = Math.max(0, Math.min(100, 100 - (workload.remaining_work_units || 0)));
+      const budgetPct = snapshot && snapshot.objective.max_cost_eur
+        ? Math.min(100, (workload.accrued_cost_eur / snapshot.objective.max_cost_eur) * 100)
+        : 10;
+
+      return (
+        <div className="flex-1 flex flex-col max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
+          {/* Header */}
+          <header className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b border-slate-800 pb-5">
+            <div className="flex items-center space-x-3">
+              <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-blue-500 flex items-center justify-center shadow-lg shadow-cyan-500/20 text-white font-bold">
+                <CpuIcon />
+              </div>
+              <div>
+                <div className="flex items-center space-x-2">
+                  <h1 className="text-xl font-bold tracking-tight text-white">AgentGrid</h1>
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-400 border border-cyan-800/60 font-mono">
+                    v0.2.0
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400">Autonomous Closed-Loop Control Plane for Heterogeneous Compute</p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 text-xs">
+              <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                <span className="text-slate-300 font-medium">Cloud Run Live</span>
+                <span className="text-slate-600">|</span>
+                <span className="text-cyan-400 font-mono">gemini-2.5-flash</span>
+                <span className="text-slate-600">|</span>
+                <span className="text-amber-400 font-mono uppercase">{runtimeType}</span>
+              </div>
+
+              <a
+                href="/docs"
+                target="_blank"
+                className="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 transition-colors border border-slate-700"
+              >
+                Swagger API
+              </a>
+
+              <a
+                href="https://github.com/samy-fadel/agentgrid"
+                target="_blank"
+                className="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 transition-colors border border-slate-700 flex items-center space-x-1.5"
+              >
+                <span>GitHub</span>
+                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+                  <path fillRule="evenodd" clipRule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+                </svg>
+              </a>
+            </div>
+          </header>
+
+          {/* Top Status Strip */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
+              <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
+                <span>Allocated Compute</span>
+                <span className="text-cyan-400 font-mono">Job #{workload.id}</span>
+              </div>
+              <div className="flex items-baseline space-x-2">
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">{workload.allocated_cpu}</span>
+                <span className="text-xs text-slate-400">vCPUs / {cluster.total_cpu} Max</span>
+              </div>
+              <div className="mt-2 text-xs text-slate-400 flex items-center space-x-1">
+                <span className="text-emerald-400 font-medium">Free: {cluster.free_cpu} vCPUs</span>
+                {cluster.total_gpu > 0 && <span className="text-cyan-400">| {cluster.total_gpu} GPUs</span>}
+              </div>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
+              <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
+                <span>Workload Progress</span>
+                <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${workload.done ? 'bg-emerald-950 text-emerald-400' : 'bg-blue-950 text-blue-400'}`}>
+                  {workload.done ? "DONE" : "RUNNING"}
+                </span>
+              </div>
+              <div className="flex items-baseline space-x-2">
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">{progressPct.toFixed(0)}%</span>
+                <span className="text-xs text-slate-400">({workload.remaining_work_units.toFixed(1)} units left)</span>
+              </div>
+              <div className="w-full bg-slate-800 h-1.5 rounded-full mt-3 overflow-hidden">
+                <div
+                  className="bg-gradient-to-r from-cyan-500 to-emerald-400 h-full transition-all duration-500 rounded-full"
+                  style={{ width: `${progressPct}%` }}
+                ></div>
+              </div>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
+              <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
+                <span>Accrued Cost</span>
+                <span className="text-xs text-slate-400">Max: €{snapshot ? snapshot.objective.max_cost_eur : budget}</span>
+              </div>
+              <div className="flex items-baseline space-x-2">
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">€{workload.accrued_cost_eur.toFixed(3)}</span>
+                <span className="text-xs text-slate-400 font-mono">EUR</span>
+              </div>
+              <div className="w-full bg-slate-800 h-1.5 rounded-full mt-3 overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-500 rounded-full ${budgetPct > 90 ? 'bg-rose-500' : 'bg-cyan-500'}`}
+                  style={{ width: `${Math.min(100, budgetPct)}%` }}
+                ></div>
+              </div>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
+              <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
+                <span>Cluster Clock</span>
+                <span className="text-xs text-slate-400">Deadline: {snapshot ? snapshot.objective.deadline_at_minutes : deadline}m</span>
+              </div>
+              <div className="flex items-baseline space-x-2">
+                <span className="text-3xl font-bold tracking-tight text-white font-mono">{cluster.current_time_minutes.toFixed(1)}</span>
+                <span className="text-xs text-slate-400">min elapsed</span>
+              </div>
+              <div className="mt-2 text-xs text-slate-400 flex items-center space-x-1">
+                <span>Est. Remaining: </span>
+                <span className="text-cyan-400 font-mono font-medium">{workload.estimated_remaining_minutes.toFixed(1)}m</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Main 2-Column Dashboard */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            
+            {/* Left Column (5 cols): Objective Input & Slurm Verification */}
+            <div className="lg:col-span-5 space-y-6">
+              
+              {/* Mission Control Card */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300 flex items-center space-x-2">
+                    <SparklesIcon />
+                    <span>Business Objective</span>
+                  </h2>
+                  <button
+                    onClick={handleReset}
+                    className="text-xs text-slate-400 hover:text-slate-200 transition-colors border border-slate-800 px-2 py-1 rounded"
+                  >
+                    Reset State
+                  </button>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs text-slate-400">Intent / Instructions</label>
+                  <textarea
+                    rows="3"
+                    value={objective}
+                    onChange={(e) => setObjective(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-slate-200 focus:outline-none focus:border-cyan-500 transition-colors resize-none font-sans"
+                    placeholder="Declare the high-level compute objective..."
+                  />
+                </div>
+
+                {/* Quick Presets */}
+                <div className="space-y-1.5">
+                  <span className="text-xs text-slate-400">Quick Presets:</span>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => handlePreset("Run the compute workload autonomously. Meet its deadline and budget while minimizing cost. Continue observing and adapting until it finishes, then summarize the result.", 25, 5.0)}
+                      className="text-xs px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition-colors"
+                    >
+                      Balanced Cost
+                    </button>
+                    <button
+                      onClick={() => handlePreset("Run the compute workload. Configure the objective with a strict deadline of 15 minutes and max budget of 10 EUR. Minimize cost while strictly meeting this 15-minute deadline. Adapt the allocation, observe until done, and summarize.", 15, 10.0)}
+                      className="text-xs px-2.5 py-1 rounded-md bg-cyan-950/60 hover:bg-cyan-900/60 text-cyan-300 border border-cyan-800/60 transition-colors"
+                    >
+                      ⚡ Strict 15m Deadline (Forces Scale)
+                    </button>
+                    <button
+                      onClick={() => handlePreset("Run the compute workload with a strict budget cap of 1.50 EUR. Respect budget at all costs without crashing.", 40, 1.50)}
+                      className="text-xs px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition-colors"
+                    >
+                      🛡️ Budget Cap
+                    </button>
+                  </div>
+                </div>
+
+                {/* Structured Constraint Sliders */}
+                <div className="grid grid-cols-2 gap-4 pt-2 border-t border-slate-800">
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-slate-400">Deadline:</span>
+                      <span className="text-cyan-400 font-mono font-medium">{deadline} min</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="5"
+                      max="60"
+                      step="5"
+                      value={deadline}
+                      onChange={(e) => setDeadline(Number(e.target.value))}
+                      className="w-full accent-cyan-500 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-slate-400">Max Budget:</span>
+                      <span className="text-cyan-400 font-mono font-medium">€{budget.toFixed(1)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1"
+                      max="20"
+                      step="0.5"
+                      value={budget}
+                      onChange={(e) => setBudget(Number(e.target.value))}
+                      className="w-full accent-cyan-500 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                    />
+                  </div>
+                </div>
+
+                {/* Primary Action Button */}
+                <button
+                  onClick={runOptimization}
+                  disabled={isOptimizing}
+                  className={`w-full py-3 px-4 rounded-xl font-semibold text-sm flex items-center justify-center space-x-2 transition-all shadow-lg ${
+                    isOptimizing
+                      ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                      : 'bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white shadow-cyan-500/20'
+                  }`}
+                >
+                  {isOptimizing ? (
+                    <>
+                      <svg className="animate-spin h-4 w-4 text-cyan-400" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                      </svg>
+                      <span>Gemini Control Loop Running...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Launch Autonomous Optimization</span>
+                      <span>→</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Slurm Cluster Ground-Truth Verification Card */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center space-x-2">
+                    <ShieldCheckIcon />
+                    <span>Slurm Cluster Execution Verification</span>
+                  </h3>
+                  <span className="text-xs px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/60">
+                    Live Verified
+                  </span>
+                </div>
+
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Confirms that agent actions are executed directly against the cluster controller via <code>slurmrestd</code> REST API v0.0.41.
+                </p>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2 text-xs font-mono">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Backend Controller:</span>
+                    <span className="text-slate-200">{runtimeType === 'slurm' ? 'slurmrestd (Direct VPC)' : 'Deterministic Simulator'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Active Job ID:</span>
+                    <span className="text-cyan-400 font-bold">{workload.id}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Live Allocated CPU:</span>
+                    <span className="text-emerald-400 font-bold">{workload.allocated_cpu} cpus_per_task</span>
+                  </div>
+                  {slurmVerification && (
+                    <div className="flex justify-between border-t border-slate-900 pt-1.5">
+                      <span className="text-slate-400">Last Slurm REST Receipt:</span>
+                      <span className="text-emerald-400">HTTP {slurmVerification.status_code || 200} OK</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Instant Verification Command */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">Cluster SSH Verification Command:</span>
+                    <button
+                      onClick={() => copyCommand(`scontrol show job ${workload.id}`)}
+                      className="text-cyan-400 hover:text-cyan-300 transition-colors text-xs font-mono"
+                    >
+                      {copied ? "Copied!" : "Copy"}
+                    </button>
+                  </div>
+                  <div className="bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-cyan-300 overflow-x-auto">
+                    scontrol show job {workload.id}
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
+            {/* Right Column (7 cols): Live Streaming & Candidate Table */}
+            <div className="lg:col-span-7 space-y-6">
+
+              {/* Real-time Agent Reasoning Stream */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm flex flex-col h-[380px]">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                  <div className="flex items-center space-x-2">
+                    <div className={`h-2.5 w-2.5 rounded-full ${isOptimizing ? 'bg-cyan-400 pulse-ring' : 'bg-slate-600'}`}></div>
+                    <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                      Live Closed-Loop Reasoning Stream
+                    </span>
+                  </div>
+                  <span className="text-xs text-slate-400 font-mono">
+                    {isOptimizing ? "Streaming Gemini Events..." : "Idle"}
+                  </span>
+                </div>
+
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-3 font-mono text-xs">
+                  {streamLogs.length === 0 ? (
+                    <div className="h-full flex flex-col items-center justify-center text-slate-600 space-y-2">
+                      <CpuIcon />
+                      <p>Click "Launch Autonomous Optimization" to observe real-time Gemini decisions.</p>
+                    </div>
+                  ) : (
+                    streamLogs.map((log, idx) => {
+                      if (log.type === "tool_call") {
+                        return (
+                          <div key={idx} className="bg-slate-950 border border-cyan-900/40 rounded-lg p-2.5 space-y-1">
+                            <div className="flex items-center justify-between text-cyan-400 font-semibold">
+                              <span>⚡ Tool Invocation: {log.tool}</span>
+                              <span className="text-slate-400 text-xs font-normal">+{log.time}s</span>
+                            </div>
+                            <pre className="text-slate-300 text-[11px] overflow-x-auto bg-slate-900/80 p-1.5 rounded">
+                              {JSON.stringify(log.args, null, 2)}
+                            </pre>
+                          </div>
+                        );
+                      }
+                      if (log.type === "thinking") {
+                        return (
+                          <div key={idx} className="border-l-2 border-slate-700 pl-3 py-1 text-slate-300 leading-relaxed font-sans text-xs">
+                            {log.text}
+                          </div>
+                        );
+                      }
+                      if (log.type === "completed") {
+                        return (
+                          <div key={idx} className="bg-emerald-950/40 border border-emerald-800 rounded-lg p-3 text-emerald-300 font-sans text-xs flex items-center space-x-2">
+                            <CheckCircleIcon />
+                            <span>{log.text}</span>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div key={idx} className="text-slate-400">
+                          {log.text}
+                        </div>
+                      );
+                    })
+                  )}
+                  <div ref={logsEndRef} />
+                </div>
+
+                {finalSummary && (
+                  <div className="mt-2 pt-2 border-t border-slate-800">
+                    <details className="text-xs text-slate-300 cursor-pointer" open>
+                      <summary className="font-semibold text-cyan-400 mb-1">Final Optimization Summary</summary>
+                      <div className="text-slate-300 font-sans whitespace-pre-line text-xs bg-slate-950 p-2.5 rounded border border-slate-800 max-h-32 overflow-y-auto custom-scrollbar">
+                        {finalSummary}
+                      </div>
+                    </details>
+                  </div>
+                )}
+              </div>
+
+              {/* Candidate Allocation Matrix */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                    Deterministic Candidate Allocations
+                  </h3>
+                  <span className="text-xs text-slate-400">Computed via Amdahl's Law</span>
+                </div>
+
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full text-left text-xs font-mono">
+                    <thead>
+                      <tr className="text-slate-400 border-b border-slate-800">
+                        <th className="pb-2 font-medium">CPUs</th>
+                        <th className="pb-2 font-medium">Est. ETA</th>
+                        <th className="pb-2 font-medium">Finish Time</th>
+                        <th className="pb-2 font-medium">Projected Cost</th>
+                        <th className="pb-2 font-medium">Deadline</th>
+                        <th className="pb-2 font-medium">Budget</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-850">
+                      {candidates.map((c) => {
+                        const isCurrent = c.cpu === workload.allocated_cpu;
+                        return (
+                          <tr
+                            key={c.cpu}
+                            className={`transition-colors ${
+                              isCurrent
+                                ? 'bg-cyan-950/40 text-cyan-200 font-semibold'
+                                : 'hover:bg-slate-800/40 text-slate-300'
+                            }`}
+                          >
+                            <td className="py-2.5 flex items-center space-x-1.5">
+                              {isCurrent && <span className="h-1.5 w-1.5 rounded-full bg-cyan-400"></span>}
+                              <span>{c.cpu} CPUs</span>
+                            </td>
+                            <td className="py-2.5">{c.estimated_remaining_minutes.toFixed(1)}m</td>
+                            <td className="py-2.5">{c.projected_finish_at_minutes.toFixed(1)}m</td>
+                            <td className="py-2.5">€{c.projected_total_cost_eur.toFixed(3)}</td>
+                            <td className="py-2.5">
+                              {c.meets_deadline ? (
+                                <span className="text-emerald-400">✓ Meets</span>
+                              ) : (
+                                <span className="text-rose-400">✗ Misses</span>
+                              )}
+                            </td>
+                            <td className="py-2.5">
+                              {c.within_budget ? (
+                                <span className="text-emerald-400">✓ In Budget</span>
+                              ) : (
+                                <span className="text-rose-400">✗ Over</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

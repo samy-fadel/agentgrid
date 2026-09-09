@@ -3,10 +3,14 @@ from agentic_compute.models import Action
 
 
 def test_slurm_adapter_snapshot_and_apply(monkeypatch):
-    # Mock requests.get to ensure instant offline test execution
+    # Mock requests.get and requests.post to ensure instant offline test execution
     monkeypatch.setattr(
         "requests.get",
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 404, "json": lambda self: {}})(),
+    )
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "json": lambda self: {}})(),
     )
     runtime = SlurmRuntime()
     snapshot = runtime.snapshot()
@@ -24,6 +28,8 @@ def test_slurm_adapter_snapshot_and_apply(monkeypatch):
     runtime.apply(action)
     updated = runtime.snapshot()
     assert updated.workload.allocated_cpu == 64
+    assert runtime.last_slurm_action is not None
+    assert runtime.last_slurm_action["requested_cpu"] == 64
 
     # Test tick progress burn-down
     runtime.tick(5.0)

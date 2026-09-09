@@ -36,3 +36,19 @@ def test_optimize_stream_endpoint_structure():
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers.get("content-type", "")
 
+
+def test_agent_ui_endpoint():
+    client = TestClient(app)
+    resp = client.get("/ui")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers.get("content-type", "")
+    assert "AgentGrid" in resp.text
+
+
+def test_agent_api_snapshot_endpoint():
+    client = TestClient(app)
+    resp = client.get("/api/snapshot")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "snapshot" in data
+

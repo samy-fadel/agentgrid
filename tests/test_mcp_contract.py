@@ -44,3 +44,21 @@ def test_mcp_health_endpoint():
     assert data["service"] == "agentic-compute-mcp"
 
 
+def test_mcp_snapshot_and_reset_endpoints():
+    from starlette.testclient import TestClient
+    from agentic_compute.mcp_server import app
+
+    client = TestClient(app)
+    snap_resp = client.get("/snapshot")
+    assert snap_resp.status_code == 200
+    snap_data = snap_resp.json()
+    assert "snapshot" in snap_data
+    assert "runtime" in snap_data
+
+    reset_resp = client.post("/reset")
+    assert reset_resp.status_code == 200
+    reset_data = reset_resp.json()
+    assert reset_data["status"] == "reset"
+    assert "snapshot" in reset_data
+
+

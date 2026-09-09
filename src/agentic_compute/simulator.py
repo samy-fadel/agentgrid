@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 from .models import (
     Action,
@@ -54,6 +55,7 @@ class SimulatedRuntime(RuntimeAdapter):
             minimize_cost=True,
             max_cost_eur=self.max_cost_eur,
         )
+        self.last_slurm_action = None
 
     def configure_objective(
         self,
@@ -164,6 +166,14 @@ class SimulatedRuntime(RuntimeAdapter):
             )
 
         self.workload.allocated_cpu = action.cpu
+        self.last_slurm_action = {
+            "action": action.action,
+            "job_id": self.workload.id,
+            "requested_cpu": action.cpu,
+            "status_code": 200,
+            "simulated": True,
+            "timestamp": time.time(),
+        }
 
     def tick(self, minutes: float) -> None:
         if minutes <= 0:

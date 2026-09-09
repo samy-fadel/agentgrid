@@ -5,12 +5,16 @@ import time
 import uuid
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+import requests
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from pydantic import BaseModel, Field
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+INDEX_HTML_PATH = os.path.join(STATIC_DIR, "index.html")
 
 from .agent import MODEL, root_agent
 
@@ -65,9 +69,19 @@ class OptimizeResponse(BaseModel):
     mcp_server_url: Optional[str] = None
 
 
-@app.get("/")
-def get_service_info() -> dict[str, Any]:
-    """Service status and configuration info."""
+@app.get("/", response_model=None)
+@app.get("/ui", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard_or_info(request: Request):
+    """Serve the interactive AgentGrid UI for browsers, or API metadata for JSON clients."""
+    accept = request.headers.get("accept", "")
+    # If path is explicitly /ui or /dashboard, or if browser navigation requesting HTML
+    if request.url.path in ("/ui", "/dashboard") or ("text/html" in accept and "application/json" not in accept):
+        if os.path.exists(INDEX_HTML_PATH):
+            with open(INDEX_HTML_PATH, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        return HTMLResponse("<h1>AgentGrid Dashboard</h1>")
+
     return {
         "service": "agentic-compute-agent",
         "agent_name": root_agent.name,
@@ -75,6 +89,74 @@ def get_service_info() -> dict[str, Any]:
         "mcp_server_url": os.getenv("MCP_SERVER_URL", "local-stdio"),
         "status": "ready",
     }
+
+
+@app.get("/api/snapshot")
+def get_snapshot() -> dict[str, Any]:
+    """Fetch current compute cluster and workload snapshot from MCP runtime."""
+    mcp_server_url = os.getenv("MCP_SERVER_URL")
+    if mcp_server_url:
+        from urllib.parse import urlparse
+        from .auth import get_gcp_id_token
+
+        parsed = urlparse(mcp_server_url)
+        base_audience = f"{parsed.scheme}://{parsed.netloc}"
+        headers: dict[str, str] = {}
+        token = get_gcp_id_token(base_audience)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            resp = requests.get(f"{base_audience}/snapshot", headers=headers, timeout=5.0)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as exc:
+            logger.warning("Failed to fetch snapshot from remote MCP: %s", exc)
+
+    # Local development fallback
+    try:
+        from agentic_compute.mcp_server import _runtime
+        return {
+            "runtime": os.getenv("COMPUTE_RUNTIME", "simulator").lower(),
+            "snapshot": _runtime.snapshot().model_dump(),
+            "slurm_verification": getattr(_runtime, "last_slurm_action", None),
+        }
+    except Exception as exc:
+        logger.error("Error accessing local runtime: %s", exc)
+        return {"error": str(exc)}
+
+
+@app.post("/api/reset")
+def reset_runtime_state() -> dict[str, Any]:
+    """Reset the runtime and workload state."""
+    mcp_server_url = os.getenv("MCP_SERVER_URL")
+    if mcp_server_url:
+        from urllib.parse import urlparse
+        from .auth import get_gcp_id_token
+
+        parsed = urlparse(mcp_server_url)
+        base_audience = f"{parsed.scheme}://{parsed.netloc}"
+        headers: dict[str, str] = {}
+        token = get_gcp_id_token(base_audience)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            resp = requests.post(f"{base_audience}/reset", headers=headers, timeout=5.0)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as exc:
+            logger.warning("Failed to reset remote MCP runtime: %s", exc)
+
+    try:
+        from agentic_compute.mcp_server import _runtime
+        _runtime.reset()
+        return {
+            "status": "reset",
+            "runtime": os.getenv("COMPUTE_RUNTIME", "simulator").lower(),
+            "snapshot": _runtime.snapshot().model_dump(),
+        }
+    except Exception as exc:
+        logger.error("Error resetting local runtime: %s", exc)
+        return {"error": str(exc)}
 
 
 @app.get("/health")
@@ -220,6 +302,17 @@ async def optimize_stream(
                         "timestamp": round(time.time() - start_time, 2),
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
+
+                # Emit function responses (tool output/snapshots) if present
+                if hasattr(event, "get_function_responses"):
+                    for fr in event.get_function_responses():
+                        payload = {
+                            "event": "tool_response",
+                            "tool": fr.name,
+                            "response": fr.response or {},
+                            "timestamp": round(time.time() - start_time, 2),
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
 
                 # Emit model text chunks
                 if event.message and event.message.parts:

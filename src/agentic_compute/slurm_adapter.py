@@ -70,6 +70,7 @@ class SlurmRuntime(RuntimeAdapter):
         self.accrued_cost_eur = 0.0
         self.job_done = False
         self.is_real_slurm_job = False
+        self.last_slurm_action = None
 
     def configure_objective(
         self,
@@ -269,15 +270,28 @@ class SlurmRuntime(RuntimeAdapter):
         if action.cpu:
             self.allocated_cpu = action.cpu
             # Attempt Slurm REST update if real job exists
+            status_code = 200
+            error_msg = None
             try:
-                requests.post(
+                resp = requests.post(
                     f"{self.base_url}/job/{self.active_job_id}",
                     headers=self._headers(),
                     json={"job": {"cpus_per_task": action.cpu}},
                     timeout=5.0,
                 )
-            except Exception:
-                pass
+                status_code = resp.status_code
+            except Exception as e:
+                status_code = None
+                error_msg = str(e)
+
+            self.last_slurm_action = {
+                "action": action.action,
+                "job_id": self.active_job_id,
+                "requested_cpu": action.cpu,
+                "status_code": status_code,
+                "error": error_msg,
+                "timestamp": time.time(),
+            }
 
     def tick(self, minutes: float) -> None:
         if self.job_done:

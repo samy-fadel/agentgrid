@@ -56,9 +56,10 @@ AgentGrid enforces a strict boundary between **reasoning (AI)**, **tool protocol
 ```mermaid
 flowchart TB
     subgraph Clients ["Interfaces & Entrypoints"]
-        UI["Swagger Web UI<br/>(/docs)"]
+        Dashboard["AgentGrid Web UI Dashboard<br/>(/ or /ui)"]
+        UI["Swagger API UI<br/>(/docs)"]
         CLI["ADK CLI / Web<br/>(adk web .)"]
-        API["FastAPI Control Plane<br/>(POST /optimize)"]
+        API["FastAPI Control Plane<br/>(POST /optimize, /optimize/stream)"]
     end
 
     subgraph AgentPlane ["Agentic Intelligence (Cloud Run)"]
@@ -210,6 +211,26 @@ sequenceDiagram
 
 ### Interacting with the Cloud Run Agent
 
+* **Interactive Web Dashboard UI**:
+  Visit `https://<AGENT_SERVICE_URL>.a.run.app/` or `/ui` in your browser.
+  * Real-time streaming feed of Gemini's thinking and tool invocations via Server-Sent Events.
+  * Interactive sliders for Deadline (mins), Budget (€), and Cost Minimization policy.
+  * Live candidate allocation matrix with Amdahl's Law speedup curves and cost forecasts.
+  * Live Slurm Ground-Truth verification card showing active job status, verified allocated CPUs, and cluster verification commands.
+
+* **Slurm Execution Ground-Truth Verification**:
+  To confirm that the agent's instructions actually executed on the cluster controller:
+  ```bash
+  # 1. Inspect the live job on the Slurm login node
+  scontrol show job <JOB_ID> | grep -E "NumCPUs|JobState|CPUs/Task"
+
+  # 2. Or check active job queue parameters
+  squeue -j <JOB_ID> -o "%.8i %.9P %.8j %.8u %.2t %.10M %.6D %C"
+
+  # 3. Or query the agent snapshot API
+  curl -s https://<AGENT_SERVICE_URL>.a.run.app/api/snapshot | jq .
+  ```
+
 * **Interactive Swagger UI**: Visit `https://<AGENT_SERVICE_URL>.a.run.app/docs` in your browser to inspect API schemas and trigger runs interactively.
 * **Synchronous REST API**:
   ```bash
@@ -241,8 +262,10 @@ sequenceDiagram
 │
 ├── compute_agent/            # Agent Service Layer
 │   ├── agent.py              # Google ADK root_agent (Gemini + McpToolset)
-│   ├── app.py                # FastAPI HTTP REST API & Swagger UI
-│   └── auth.py               # GCP OIDC token generator for IAM service-to-service
+│   ├── app.py                # FastAPI HTTP REST API, SSE streaming & Web UI
+│   ├── auth.py               # GCP OIDC token generator for IAM service-to-service
+│   └── static/
+│       └── index.html        # Modern interactive AgentGrid Web Dashboard
 │
 ├── src/agentic_compute/      # Domain Logic & Compute Boundary
 │   ├── models.py             # Universal semantic abstractions (ClusterState, Workload)
