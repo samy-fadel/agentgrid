@@ -151,6 +151,7 @@ def advance_time(minutes: float = 5.0) -> dict:
 
     In a real runtime this tool will disappear or become a wait/observe operation.
     For the simulator, use small increments (normally 5 minutes), then observe again.
+    """
     max_step = float(os.getenv("MAX_ADVANCE_MINUTES", "60.0"))
     if minutes > max_step:
         raise ValueError(f"Advance time step {minutes}m exceeds maximum permitted ({max_step}m)")
