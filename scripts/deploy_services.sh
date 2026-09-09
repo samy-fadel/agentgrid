@@ -29,8 +29,10 @@ if [ -n "${VPC_NETWORK:-}" ] && [ "$VPC_NETWORK" != "none" ]; then
 fi
 
 # 3. Deploy MCP Server
-echo "==> Deploying $MCP_SERVICE_NAME..."
+MCP_MIN_INSTANCES="${MCP_MIN_INSTANCES:-0}"
+echo "==> Deploying $MCP_SERVICE_NAME (min-instances: $MCP_MIN_INSTANCES)..."
 gcloud run deploy "$MCP_SERVICE_NAME" \
+  --project="$PROJECT_ID" \
   --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/mcp-server:${COMMIT_SHA}" \
   --region="$REGION" \
   --platform=managed \
@@ -38,13 +40,13 @@ gcloud run deploy "$MCP_SERVICE_NAME" \
   --no-cpu-throttling \
   --timeout=1800 \
   --session-affinity \
-  --min-instances=1 \
+  --min-instances="$MCP_MIN_INSTANCES" \
   --set-env-vars="COMPUTE_RUNTIME=slurm,SLURM_REST_URL=${SLURM_REST_URL},MCP_TRANSPORT=sse" \
   $VPC_FLAGS \
   $SECRET_FLAG
 
 # 4. Discover MCP Server URL
-MCP_URL=$(gcloud run services describe "$MCP_SERVICE_NAME" --region="$REGION" --format='value(status.url)')
+MCP_URL=$(gcloud run services describe "$MCP_SERVICE_NAME" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')
 echo "Discovered MCP Server URL: $MCP_URL"
 
 # 5. Deploy Agent Service
@@ -60,6 +62,7 @@ fi
 
 echo "==> Deploying $AGENT_SERVICE_NAME (Auth: $AGENT_AUTH_FLAG)..."
 gcloud run deploy "$AGENT_SERVICE_NAME" \
+  --project="$PROJECT_ID" \
   --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/agent-service:${COMMIT_SHA}" \
   --region="$REGION" \
   --platform=managed \
@@ -71,7 +74,7 @@ gcloud run deploy "$AGENT_SERVICE_NAME" \
   $AGENT_SECRET_FLAG
 
 # 6. Authorize Agent Service to invoke private MCP Server via IAM OIDC
-AGENT_SA=$(gcloud run services describe "$AGENT_SERVICE_NAME" --region="$REGION" --format='value(spec.template.spec.serviceAccountName)' || true)
+AGENT_SA=$(gcloud run services describe "$AGENT_SERVICE_NAME" --project="$PROJECT_ID" --region="$REGION" --format='value(spec.template.spec.serviceAccountName)' || true)
 if [ -z "$AGENT_SA" ]; then
   if [ -n "${PROJECT_NUMBER:-}" ]; then
     AGENT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
@@ -83,12 +86,13 @@ fi
 
 echo "Granting roles/run.invoker on $MCP_SERVICE_NAME to $AGENT_SA..."
 gcloud run services add-iam-policy-binding "$MCP_SERVICE_NAME" \
+  --project="$PROJECT_ID" \
   --region="$REGION" \
   --member="serviceAccount:${AGENT_SA}" \
   --role="roles/run.invoker"
 
 echo "=============================================================================="
 echo "==> Successfully deployed both services to Cloud Run!"
-echo "Agent Service: $(gcloud run services describe "$AGENT_SERVICE_NAME" --region="$REGION" --format='value(status.url)')"
+echo "Agent Service: $(gcloud run services describe "$AGENT_SERVICE_NAME" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
 echo "MCP Service:   $MCP_URL (private IAM)"
 echo "=============================================================================="
