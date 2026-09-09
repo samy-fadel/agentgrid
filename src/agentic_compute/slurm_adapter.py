@@ -242,6 +242,10 @@ class SlurmRuntime(RuntimeAdapter):
             est_remaining = round(max(0.0, curr_remaining / speedup), 2)
             finish_at = round(self.elapsed_minutes + est_remaining, 2)
             est_cost = round(self.accrued_cost_eur + (cpu * self.cpu_cost_per_hour_eur * (est_remaining / 60.0)), 4)
+            mtype = "n4-standard-32" if cpu >= 64 else ("n2-standard-32" if cpu >= 16 else "n2-standard-16")
+            rank = 1 if cpu >= 64 else 2
+            pmix = "100% Spot" if cpu <= 32 else ("80% Spot / 20% Standard" if cpu <= 128 else "70% Spot / 30% Standard")
+            obtainability = 0.92 if cpu <= 32 else (0.85 if cpu <= 64 else (0.75 if cpu <= 128 else 0.60))
             candidates.append(
                 CandidateAllocation(
                     cpu=cpu,
@@ -250,6 +254,10 @@ class SlurmRuntime(RuntimeAdapter):
                     projected_total_cost_eur=est_cost,
                     meets_deadline=finish_at <= self.deadline_minutes,
                     within_budget=est_cost <= self.max_cost_eur,
+                    machine_type=mtype,
+                    rank=rank,
+                    provisioning_mix=pmix,
+                    obtainability_score=obtainability,
                 )
             )
 

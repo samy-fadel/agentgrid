@@ -108,6 +108,10 @@ class SimulatedRuntime(RuntimeAdapter):
         finish = self.current_time_minutes + eta
         projected_cost = self.workload.accrued_cost_eur + self._future_cost(cpu, eta)
         budget = self.objective.max_cost_eur
+        mtype = "n4-standard-32" if cpu >= 64 else ("n2-standard-32" if cpu >= 16 else "n2-standard-16")
+        rank = 1 if cpu >= 64 else 2
+        pmix = "100% Spot" if cpu <= 32 else ("80% Spot / 20% Standard" if cpu <= 128 else "70% Spot / 30% Standard")
+        obtainability = 0.92 if cpu <= 32 else (0.85 if cpu <= 64 else (0.75 if cpu <= 128 else 0.60))
         return CandidateAllocation(
             cpu=cpu,
             estimated_remaining_minutes=round(eta, 3),
@@ -115,6 +119,10 @@ class SimulatedRuntime(RuntimeAdapter):
             projected_total_cost_eur=round(projected_cost, 4),
             meets_deadline=finish <= self.objective.deadline_at_minutes,
             within_budget=(budget is None or projected_cost <= budget),
+            machine_type=mtype,
+            rank=rank,
+            provisioning_mix=pmix,
+            obtainability_score=obtainability,
         )
 
     def snapshot(self) -> RuntimeSnapshot:

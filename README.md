@@ -72,7 +72,7 @@ flowchart TB
     end
 
     subgraph Protocol ["Universal Tool Boundary"]
-        MCP["Model Context Protocol (FastMCP)<br/>• get_runtime_snapshot()<br/>• resize_workload(id, cpu)<br/>• advance_time(minutes)<br/>• reset_runtime()"]
+        MCP["Model Context Protocol (FastMCP)<br/>• get_runtime_snapshot()<br/>• get_capacity_advice()<br/>• resize_workload(id, cpu)<br/>• advance_time(minutes)<br/>• reset_runtime()"]
     end
 
     subgraph Infrastructure ["Heterogeneous Compute Backends"]
@@ -102,6 +102,33 @@ AgentGrid is built on a core principle: **never ask an LLM to do arithmetic that
 | **Validation** | Enforces hard quota limits and safety constraints | Reasons over policy trade-offs (cost vs. speed) |
 | **Actuation** | Executes atomic API calls to Slurm / Simulator | Decides *when* and *how much* to scale |
 | **Outcome Reflection** | Reports status codes, execution duration, and state | Explains rationale and summarizes mission outcome |
+
+---
+
+## Enterprise Spot Optimization & Hedged Provisioning
+
+AgentGrid integrates directly with **Google Cloud Compute Engine Capacity Advisor** (`advice.capacity` & `advice.capacityHistory` REST APIs) to resolve the core dilemma in enterprise HPC: **Spot VM cost savings vs. preemption risk and strict SLA guarantees**.
+
+### 1. Real-Time Spot Obtainability & Preemption Intelligence
+Before committing scaling decisions, the agent calls `get_capacity_advice()` to inspect:
+- **Obtainability Score** (0.0 to 1.0): Probability of acquiring requested Spot VM pools in the target region.
+- **Recommended Zone**: Automatically routes allocations to the zone with highest availability (e.g. `us-central1-f`).
+- **7-Day Historical Preemption Rate**: Trailing probability of interruption to accurately quantify SLA exposure.
+
+### 2. Multi-Machine Family Ranking (Flex MIG Strategy)
+Workloads can declare prioritized machine families with automated fallback:
+1. **Rank 1 (Modern High-Perf)**: `n4-standard-32` (Latest architecture, optimal price/performance).
+2. **Rank 2 (Resilient Fallback)**: `n2-standard-32` (Broad regional pool for dependable capacity).
+3. **Rank 3 (Granular Fallback)**: `n2-standard-16` (Smaller shape to bypass large vCPU allocation bottlenecks).
+
+### 3. Dynamic Hedged Provisioning Policy
+The Gemini 2.5 Flash agent computes the **Deadline Slack Ratio** $S$:
+
+$$S = \frac{\text{Deadline} - \text{Elapsed Time}}{\text{Estimated Remaining Time (ETA)}}$$
+
+* **High Slack ($S > 1.5$)**: 100% Spot VM allocation to maximize financial savings.
+* **Tight Slack ($1.1 < S \le 1.5$)**: Hedged allocation (e.g., 80% Spot / 20% Standard baseline) to buffer against preemption storms.
+* **Critical Slack ($S \le 1.1$) or Preemption Spike**: Immediate fallback to 100% Standard On-Demand capacity to prevent SLA breach.
 
 ---
 

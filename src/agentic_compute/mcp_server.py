@@ -8,6 +8,7 @@ from .models import Action
 from .runtime import RuntimeAdapter
 from .simulator import SimulatedRuntime
 from .slurm_adapter import SlurmRuntime
+from .capacity_advisor import query_capacity_advice
 
 
 from mcp.server.transport_security import TransportSecuritySettings
@@ -72,6 +73,30 @@ async def reset_route(request):
         }
     )
 
+
+@mcp.custom_route("/capacity-advice", methods=["GET"])
+async def capacity_advice_route(request):
+    """Capacity advice endpoint for dashboard and external monitoring."""
+    from starlette.responses import JSONResponse
+
+    params = request.query_params
+    machine_types = params.get("machine_types", "n4-standard-32,n2-standard-32,n2-standard-16")
+    try:
+        size = int(params.get("size", 10))
+    except (ValueError, TypeError):
+        size = 10
+    region = params.get("region") or None
+    provisioning_model = params.get("provisioning_model", "SPOT")
+    target_distribution_shape = params.get("target_distribution_shape", "ANY")
+
+    advice = query_capacity_advice(
+        machine_types=machine_types,
+        size=size,
+        region=region,
+        provisioning_model=provisioning_model,
+        target_distribution_shape=target_distribution_shape,
+    )
+    return JSONResponse(advice)
 
 
 def _create_runtime() -> RuntimeAdapter:
@@ -203,6 +228,29 @@ def reset_runtime() -> dict:
     """Reset the demo runtime to its initial state."""
     _runtime.reset()
     return _runtime.snapshot().model_dump()
+
+
+@mcp.tool()
+def get_capacity_advice(
+    machine_types: str = "n4-standard-32,n2-standard-32,n2-standard-16",
+    size: int = 10,
+    region: str | None = None,
+    provisioning_model: str = "SPOT",
+    target_distribution_shape: str = "ANY",
+) -> dict:
+    """Get real-time Spot capacity advice, obtainability scores, and preemption risk from Google Cloud.
+
+    Queries GCP Compute Engine Capacity Advisor (advice.capacity & advice.capacityHistory)
+    to assess the likelihood of successfully provisioning Spot VMs, recommended zones,
+    and historical preemption rates. Use this tool before making scaling decisions.
+    """
+    return query_capacity_advice(
+        machine_types=machine_types,
+        size=size,
+        region=region,
+        provisioning_model=provisioning_model,
+        target_distribution_shape=target_distribution_shape,
+    )
 
 
 # Expose ASGI application for Uvicorn / Cloud Run

@@ -91,12 +91,18 @@ For the autonomous compute control loop:
    the probability of satisfying an objective.
 7. Never invent an allocation. resize_workload must use a CPU value advertised by candidate allocations.
 8. Use deterministic values returned by the runtime for ETA and cost; do not redo their arithmetic.
-9. After taking (or deliberately not taking) an allocation action, call advance_time with an appropriate
-   step (e.g. 5 to 15 minutes) to observe progress.
-10. Then call get_runtime_snapshot again and reconsider the decision based on updated remaining work.
-11. Continue the observe -> reason -> act -> observe loop until workload.done is true.
-12. Do not call advance_time after the workload is done.
-13. At the end, summarize whether the deadline and budget were met and explain the key decisions.
+9. When evaluating scaling options or candidate allocations, call get_capacity_advice to inspect real-time Spot obtainability scores and preemption history.
+10. Apply the Hedged Provisioning Strategy based on deadline slack ratio S = (Deadline - Elapsed) / Estimated_Remaining:
+    - High Slack (S > 1.5): Recommend 100% Spot allocations to maximize cost savings.
+    - Tight Slack (1.1 < S <= 1.5): Recommend Hedged allocations (e.g., 80% Spot / 20% Standard baseline) to buffer against preemption.
+    - Critical Slack (S <= 1.1) or high preemption rate (> 25%): Prioritize Standard On-Demand capacity to prevent SLA breach.
+    - When machine rankings are available (e.g. Flex MIG N4 vs N2), prefer higher-ranked modern machine types when obtainability is high.
+11. After taking (or deliberately not taking) an allocation action, call advance_time with an appropriate
+    step (e.g. 5 to 15 minutes) to observe progress.
+12. Then call get_runtime_snapshot again and reconsider the decision based on updated remaining work.
+13. Continue the observe -> reason -> act -> observe loop until workload.done is true.
+14. Do not call advance_time after the workload is done.
+15. At the end, summarize whether the deadline and budget were met and explain the key decisions (including Spot vs Standard trade-offs).
 
 The runtime validates actions. If a tool rejects an action, observe state again and re-plan.
 """

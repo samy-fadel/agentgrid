@@ -159,6 +159,54 @@ def reset_runtime_state() -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+@app.get("/api/capacity-advice")
+def get_capacity_advice_endpoint(
+    machine_types: str = "n4-standard-32,n2-standard-32,n2-standard-16",
+    size: int = 10,
+    region: Optional[str] = None,
+    provisioning_model: str = "SPOT",
+    target_distribution_shape: str = "ANY",
+) -> dict[str, Any]:
+    """Expose real-time GCP Spot Capacity Advisor to the UI and external callers."""
+    mcp_server_url = os.getenv("MCP_SERVER_URL")
+    if mcp_server_url:
+        from urllib.parse import urlparse
+        from .auth import get_gcp_id_token
+
+        parsed = urlparse(mcp_server_url)
+        base_audience = f"{parsed.scheme}://{parsed.netloc}"
+        headers: dict[str, str] = {}
+        token = get_gcp_id_token(base_audience)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            resp = requests.get(
+                f"{base_audience}/capacity-advice",
+                headers=headers,
+                params={
+                    "machine_types": machine_types,
+                    "size": size,
+                    "region": region or "",
+                    "provisioning_model": provisioning_model,
+                    "target_distribution_shape": target_distribution_shape,
+                },
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as exc:
+            logger.warning("Failed to fetch capacity advice from remote MCP: %s", exc)
+
+    from agentic_compute.capacity_advisor import query_capacity_advice
+    return query_capacity_advice(
+        machine_types=machine_types,
+        size=size,
+        region=region,
+        provisioning_model=provisioning_model,
+        target_distribution_shape=target_distribution_shape,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Cloud Run health check probe."""

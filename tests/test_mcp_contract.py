@@ -1,4 +1,10 @@
-from agentic_compute.mcp_server import advance_time, get_runtime_snapshot, reset_runtime, resize_workload
+from agentic_compute.mcp_server import (
+    advance_time,
+    get_capacity_advice,
+    get_runtime_snapshot,
+    reset_runtime,
+    resize_workload,
+)
 from agentic_compute.models import RuntimeSnapshot
 from agentic_compute.simulator import SimulatedRuntime
 
@@ -12,6 +18,30 @@ def test_snapshot_serializes_as_universal_contract():
     assert rebuilt.workload.id == "mc-001"
     assert rebuilt.objective.minimize_cost is True
     assert rebuilt.candidate_allocations
+
+
+def test_candidate_allocation_enriched_fields():
+    runtime = SimulatedRuntime()
+    snapshot = runtime.snapshot()
+    candidate = snapshot.candidate_allocations[0]
+    assert hasattr(candidate, "machine_type")
+    assert hasattr(candidate, "rank")
+    assert hasattr(candidate, "provisioning_mix")
+    assert hasattr(candidate, "obtainability_score")
+    assert candidate.obtainability_score is not None
+    assert candidate.machine_type is not None
+
+
+def test_get_capacity_advice_tool():
+    advice = get_capacity_advice(machine_types="n4-standard-32,n2-standard-32", size=10)
+    assert "region" in advice
+    assert "machine_types" in advice
+    assert len(advice["machine_types"]) >= 2
+    top = advice["machine_types"][0]
+    assert "machine_type" in top
+    assert "rank" in top
+    assert "obtainability_score" in top
+    assert "historical_preemption_rate_7d" in top
 
 
 def test_mcp_server_tools_workflow():
@@ -65,5 +95,11 @@ def test_mcp_snapshot_and_reset_endpoints():
     reset_data = reset_resp.json()
     assert reset_data["status"] == "reset"
     assert "snapshot" in reset_data
+
+    cap_resp = client.get("/capacity-advice?size=10")
+    assert cap_resp.status_code == 200
+    cap_data = cap_resp.json()
+    assert "machine_types" in cap_data
+
 
 

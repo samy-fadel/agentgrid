@@ -37,6 +37,10 @@ class CandidateAllocation(BaseModel):
     projected_total_cost_eur: float = Field(ge=0)
     meets_deadline: bool
     within_budget: bool
+    machine_type: str | None = None
+    rank: int = 1
+    provisioning_mix: str | None = None
+    obtainability_score: float | None = None
 
 
 class RuntimeSnapshot(BaseModel):

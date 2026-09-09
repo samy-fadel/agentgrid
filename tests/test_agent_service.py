@@ -52,3 +52,11 @@ def test_agent_api_snapshot_endpoint():
     data = resp.json()
     assert "snapshot" in data
 
+
+def test_agent_api_capacity_advice_endpoint():
+    client = TestClient(app)
+    resp = client.get("/api/capacity-advice?size=10")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "machine_types" in data
+
