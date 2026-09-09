@@ -79,17 +79,23 @@ def query_capacity_advice(
     for idx, mtype in enumerate(types_list):
         score_adj = max(0.4, round(obtainability - (idx * 0.05), 2))
         risk_lvl = "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH")
-        recommendations.append(
-            {
-                "machine_type": mtype,
-                "rank": idx + 1,
-                "zone": recommended_zone,
-                "obtainability": score_adj,
-                "estimated_uptime": est_uptime,
-                "preemption_risk_level": risk_lvl,
-                "suggested_hedging": "100% Spot" if score_adj >= 0.8 else ("80% Spot / 20% Standard" if score_adj >= 0.6 else "100% Standard"),
-            }
-        )
+        item = {
+            "machine_type": mtype,
+            "rank": idx + 1,
+            "zone": recommended_zone,
+            "recommended_zone": recommended_zone,
+            "obtainability": score_adj,
+            "obtainability_score": score_adj,
+            "obtainability_percent": int(score_adj * 100),
+            "estimated_uptime": est_uptime,
+            "estimated_uptime_minutes": 60.0 if "3600" in est_uptime else 30.0,
+            "historical_preemption_rate_7d": preemption_rate,
+            "historical_preemption_rate_7d_avg": preemption_rate,
+            "preemption_risk_level": risk_lvl,
+            "suggested_hedging": "100% Spot" if score_adj >= 0.8 else ("80% Spot / 20% Standard" if score_adj >= 0.6 else "100% Standard"),
+            "hedged_policy_recommendation": "100% Spot" if score_adj >= 0.8 else ("80% Spot / 20% Standard" if score_adj >= 0.6 else "100% Standard"),
+        }
+        recommendations.append(item)
 
     return {
         "region": target_region,
@@ -103,6 +109,7 @@ def query_capacity_advice(
         "historical_preemption_rate_7d_avg": preemption_rate,
         "preemption_risk": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
         "recommendations": recommendations,
+        "machine_types": recommendations,
         "source": "empirical_telemetry_fallback",
     }
 
@@ -193,17 +200,23 @@ def _call_gcp_advice_api(
 
         parsed_recs = []
         for i, mtype in enumerate(machine_types):
-            parsed_recs.append(
-                {
-                    "machine_type": mtype,
-                    "rank": i + 1,
-                    "zone": recommended_zone,
-                    "obtainability": obtainability,
-                    "estimated_uptime": estimated_uptime,
-                    "preemption_risk_level": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
-                    "suggested_hedging": "100% Spot" if obtainability >= 0.8 else ("80% Spot / 20% Standard" if obtainability >= 0.6 else "100% Standard"),
-                }
-            )
+            item = {
+                "machine_type": mtype,
+                "rank": i + 1,
+                "zone": recommended_zone,
+                "recommended_zone": recommended_zone,
+                "obtainability": obtainability,
+                "obtainability_score": obtainability,
+                "obtainability_percent": int(obtainability * 100),
+                "estimated_uptime": estimated_uptime,
+                "estimated_uptime_minutes": 60.0 if "3600" in estimated_uptime else 30.0,
+                "historical_preemption_rate_7d": preemption_rate,
+                "historical_preemption_rate_7d_avg": preemption_rate,
+                "preemption_risk_level": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
+                "suggested_hedging": "100% Spot" if obtainability >= 0.8 else ("80% Spot / 20% Standard" if obtainability >= 0.6 else "100% Standard"),
+                "hedged_policy_recommendation": "100% Spot" if obtainability >= 0.8 else ("80% Spot / 20% Standard" if obtainability >= 0.6 else "100% Standard"),
+            }
+            parsed_recs.append(item)
 
         return {
             "region": region,
@@ -217,6 +230,7 @@ def _call_gcp_advice_api(
             "historical_preemption_rate_7d_avg": preemption_rate,
             "preemption_risk": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
             "recommendations": parsed_recs,
+            "machine_types": parsed_recs,
             "source": "google_compute_engine_capacity_advisor_api",
         }
     except Exception:
