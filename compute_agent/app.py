@@ -147,28 +147,6 @@ def get_snapshot() -> dict[str, Any]:
         return {"error": str(exc)}
 
 
-def verify_agent_auth(request: Request) -> None:
-    """Verify authorization token or API key if AGENTGRID_API_KEY is configured."""
-    expected_key = os.getenv("AGENTGRID_API_KEY")
-    if not expected_key:
-        return
-
-    auth_header = request.headers.get("Authorization", "")
-    api_key_header = request.headers.get("X-API-Key", "")
-
-    token = ""
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:].strip()
-    elif api_key_header:
-        token = api_key_header.strip()
-
-    if token != expected_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized: Valid X-API-Key or Bearer token required to operate the compute control plane.",
-        )
-
-
 @app.post("/api/reset")
 def reset_runtime_state(request: Request) -> dict[str, Any]:
     """Reset the runtime and workload state."""

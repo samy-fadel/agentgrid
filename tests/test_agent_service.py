@@ -77,6 +77,7 @@ def test_optimize_stream_endpoint_json_body():
 def test_agent_api_key_protection(monkeypatch):
     import compute_agent.app as agent_app
     monkeypatch.setattr(agent_app, "AGENTGRID_API_KEY", "secret-agent-key-123")
+    monkeypatch.setenv("AGENTGRID_API_KEY", "secret-agent-key-123")
     client = TestClient(app)
 
     # 1. Mutating endpoint rejected without key
