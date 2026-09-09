@@ -62,7 +62,7 @@ class SlurmRuntime(RuntimeAdapter):
         self.machine_type = "n2-standard-16"
         self.provisioning_mix = "100% Spot"
         self.last_slurm_elapsed_secs: float | None = None
-        self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or self._discover_active_job() or "1"
+        self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or "1"
         self.reset()
 
     def reset(self) -> None:
@@ -95,7 +95,7 @@ class SlurmRuntime(RuntimeAdapter):
 
     def _discover_active_job(self) -> str | None:
         try:
-            resp = requests.get(f"{self.base_url}/jobs", headers=self._headers(), timeout=5.0)
+            resp = requests.get(f"{self.base_url}/jobs", headers=self._headers(), timeout=2.0)
             if resp.status_code == 200:
                 jobs = resp.json().get("jobs", [])
                 for j in jobs:
@@ -116,7 +116,7 @@ class SlurmRuntime(RuntimeAdapter):
 
     def _get_nodes(self) -> dict[str, Any]:
         try:
-            resp = requests.get(f"{self.base_url}/nodes", headers=self._headers(), timeout=5.0)
+            resp = requests.get(f"{self.base_url}/nodes", headers=self._headers(), timeout=2.0)
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
@@ -124,11 +124,15 @@ class SlurmRuntime(RuntimeAdapter):
         return {"nodes": []}
 
     def _get_job(self) -> dict[str, Any]:
+        if not self.active_job_id or self.active_job_id == "1":
+            discovered = self._discover_active_job()
+            if discovered:
+                self.active_job_id = discovered
         try:
             resp = requests.get(
                 f"{self.base_url}/job/{self.active_job_id}",
                 headers=self._headers(),
-                timeout=5.0,
+                timeout=2.0,
             )
             if resp.status_code == 200:
                 return resp.json()

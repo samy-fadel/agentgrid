@@ -48,9 +48,9 @@ MCP_URL=$(gcloud run services describe "$MCP_SERVICE_NAME" --region="$REGION" --
 echo "Discovered MCP Server URL: $MCP_URL"
 
 # 5. Deploy Agent Service
-AGENT_AUTH_FLAG="--no-allow-unauthenticated"
-if [ "${ALLOW_UNAUTHENTICATED:-false}" = "true" ]; then
-  AGENT_AUTH_FLAG="--allow-unauthenticated"
+AGENT_AUTH_FLAG="--allow-unauthenticated"
+if [ "${REQUIRE_IAM_AUTH:-false}" = "true" ] || [ "${ALLOW_UNAUTHENTICATED:-true}" = "false" ]; then
+  AGENT_AUTH_FLAG="--no-allow-unauthenticated"
 fi
 
 AGENT_SECRET_FLAG=""
