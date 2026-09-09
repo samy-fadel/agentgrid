@@ -21,6 +21,28 @@ from .agent import MODEL, root_agent
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("agentic_compute.agent_service")
 
+AGENTGRID_API_KEY: Optional[str] = os.getenv("AGENTGRID_API_KEY")
+
+
+def verify_agent_auth(request: Request) -> None:
+    """Verify incoming request credentials if AGENTGRID_API_KEY is configured."""
+    key = globals().get("AGENTGRID_API_KEY") or os.getenv("AGENTGRID_API_KEY")
+    if not key:
+        return
+    auth_header = request.headers.get("Authorization", "")
+    key_header = request.headers.get("X-API-Key", "")
+    expected = key.strip()
+
+    if key_header == expected:
+        return
+    if auth_header.startswith("Bearer ") and auth_header[7:].strip() == expected:
+        return
+
+    raise HTTPException(
+        status_code=401,
+        detail="Unauthorized: invalid or missing AgentGrid authentication token or API key",
+    )
+
 app = FastAPI(
     title="Agentic Compute Control Plane - Agent Service",
     description="Cloud Run service running the Google ADK Agent that controls heterogeneous compute infrastructure via MCP.",
