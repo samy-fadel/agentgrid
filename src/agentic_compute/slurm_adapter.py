@@ -70,7 +70,31 @@ class SlurmRuntime(RuntimeAdapter):
         self.minimize_cost = os.getenv("MINIMIZE_COST", "true").lower() in ("true", "1", "yes")
         self.baseline_workload_duration_minutes = float(os.getenv("BASELINE_WORKLOAD_DURATION_MINUTES", "25.0"))
         self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or "1"
+        self.verification_timeout_seconds = float(
+            os.getenv("SLURM_VERIFICATION_TIMEOUT_SECS", "60.0")
+        )
         self.reset()
+
+    def _check_verification_timeout(self) -> None:
+        """Enforce explicit deadline on pending Slurm verification."""
+        if (
+            self.verification_status == "pending_verification"
+            and self.pending_verification_start_time is not None
+            and (time.time() - self.pending_verification_start_time) > self.verification_timeout_seconds
+        ):
+            self.verification_status = "failed"
+            self.verification_detail = (
+                f"Verification timed out after {self.verification_timeout_seconds:.1f}s "
+                f"waiting for authoritative Slurm telemetry"
+            )
+            if self.last_slurm_action and self.last_slurm_action.get("status") == "pending_verification":
+                self.last_slurm_action["status"] = "failed"
+                self.last_slurm_action["verification_status"] = "failed"
+                self.last_slurm_action["error"] = self.verification_detail
+            self.requested_cpu = None
+            self.requested_machine_type = None
+            self.requested_provisioning_mix = None
+            self.pending_verification_start_time = None
 
     def _validate_cluster_capabilities(
         self,
@@ -103,6 +127,10 @@ class SlurmRuntime(RuntimeAdapter):
             detail = "Unsupported configuration on Slurm cluster: " + "; ".join(reason_parts)
             self.verification_status = "unsupported"
             self.verification_detail = detail
+            self.requested_cpu = None
+            self.requested_machine_type = None
+            self.requested_provisioning_mix = None
+            self.pending_verification_start_time = None
             self.last_slurm_action = {
                 "action": action_name,
                 "job_id": self.active_job_id,
@@ -143,6 +171,7 @@ class SlurmRuntime(RuntimeAdapter):
         self.verification_detail: str | None = "Awaiting initial Slurm telemetry"
         self.cost_basis: str = "unverified"
         self.last_slurm_elapsed_secs: float | None = None
+        self.pending_verification_start_time: float | None = None
 
     def configure_objective(
         self,
@@ -282,6 +311,10 @@ class SlurmRuntime(RuntimeAdapter):
                 if os.getenv("MOCK_SLURM", "").lower() in ("true", "1"):
                     submitted_id = f"mock-{int(time.time()) % 100000}"
                 else:
+                    self.requested_cpu = None
+                    self.requested_machine_type = None
+                    self.requested_provisioning_mix = None
+                    self.pending_verification_start_time = None
                     raise RuntimeError(
                         f"Slurm submission rejected (HTTP {resp.status_code}): {resp.text}"
                     )
@@ -289,9 +322,17 @@ class SlurmRuntime(RuntimeAdapter):
             if os.getenv("MOCK_SLURM", "").lower() in ("true", "1"):
                 submitted_id = f"mock-{int(time.time()) % 100000}"
             else:
+                self.requested_cpu = None
+                self.requested_machine_type = None
+                self.requested_provisioning_mix = None
+                self.pending_verification_start_time = None
                 raise RuntimeError(f"Could not connect to Slurm cluster at {self.base_url}: {exc}") from exc
 
         if not submitted_id:
+            self.requested_cpu = None
+            self.requested_machine_type = None
+            self.requested_provisioning_mix = None
+            self.pending_verification_start_time = None
             raise RuntimeError(f"Slurm did not return a valid job_id from {self.base_url}/job/submit")
 
         self.active_job_id = submitted_id
@@ -307,6 +348,7 @@ class SlurmRuntime(RuntimeAdapter):
         self.observed_machine_type = None
         self.observed_provisioning_mix = None
         self.verification_status = "pending_verification"
+        self.pending_verification_start_time = time.time()
         self.verification_detail = (
             f"Job {submitted_id} submitted to partition '{target_partition}'; pending verification from Slurm telemetry"
         )
@@ -331,7 +373,7 @@ class SlurmRuntime(RuntimeAdapter):
             "observed_provisioning_mix": None,
             "status": "pending_verification",
             "verification_status": "pending_verification",
-            "timestamp": time.time(),
+            "timestamp": self.pending_verification_start_time,
         }
 
         return {
@@ -359,16 +401,27 @@ class SlurmRuntime(RuntimeAdapter):
 
     def _sync_job_state(self, job: dict[str, Any]) -> None:
         """Synchronize local runtime state with authoritative Slurm job telemetry."""
-        # 1. Update allocated CPU from Slurm job resources if present
-        res = job.get("job_resources", {})
-        if isinstance(res, dict) and res.get("allocated_cpus") is not None:
-            self.allocated_cpu = int(res["allocated_cpus"])
-            self.observed_cpu = int(res["allocated_cpus"])
-        elif "cpus_per_task" in job and job.get("cpus_per_task") is not None:
-            self.allocated_cpu = int(job["cpus_per_task"])
-            self.observed_cpu = int(job["cpus_per_task"])
+        # Enforce timeout deadline if currently pending verification
+        self._check_verification_timeout()
 
-        # Check partition to independently observe machine_type and provisioning
+        # 1. Update allocated CPU from Slurm job resources if genuinely allocated (> 0).
+        # Never treat cpus_per_task or stale local values as proof of actual allocated resources.
+        res = job.get("job_resources")
+        has_genuine_allocation = False
+        if isinstance(res, dict) and res.get("allocated_cpus") is not None:
+            try:
+                cpus_val = int(res["allocated_cpus"])
+                if cpus_val > 0:
+                    self.allocated_cpu = cpus_val
+                    self.observed_cpu = cpus_val
+                    has_genuine_allocation = True
+            except (ValueError, TypeError):
+                pass
+
+        if not has_genuine_allocation:
+            self.observed_cpu = None
+
+        # 2. Check partition to independently observe machine_type and provisioning
         job_part = job.get("partition")
         observed_machine_type = None
         observed_provisioning = None
@@ -376,72 +429,98 @@ class SlurmRuntime(RuntimeAdapter):
             observed_machine_type = SUPPORTED_SLURM_PARTITIONS[job_part]["machine_type"]
             observed_provisioning = SUPPORTED_SLURM_PARTITIONS[job_part]["provisioning"]
 
-        # Strictly record independent observations - NEVER overwrite with requested values!
-        self.machine_type = observed_machine_type
-        self.observed_machine_type = observed_machine_type
-        self.provisioning_mix = observed_provisioning
-        self.observed_provisioning_mix = observed_provisioning
+        if has_genuine_allocation and observed_machine_type:
+            self.machine_type = observed_machine_type
+            self.observed_machine_type = observed_machine_type
+            self.provisioning_mix = observed_provisioning
+            self.observed_provisioning_mix = observed_provisioning
+        elif has_genuine_allocation:
+            self.observed_machine_type = None
+            self.observed_provisioning_mix = None
+        else:
+            self.observed_machine_type = None
+            self.observed_provisioning_mix = None
 
-        # Independent verification check against every requested property
-        has_pending_request = (
-            self.verification_status == "pending_verification"
-            or self.requested_cpu is not None
-            or self.requested_machine_type is not None
-            or self.requested_provisioning_mix is not None
-        )
+        # 3. Independent verification check against every requested property
+        if self.verification_status == "pending_verification":
+            if not has_genuine_allocation:
+                # Allocation is not yet genuinely observed from Slurm controller
+                self.verification_detail = (
+                    f"Job {job.get('job_id', self.active_job_id)} has no allocated resources yet; "
+                    f"awaiting node allocation from Slurm controller"
+                )
+                self.cost_basis = "unverified"
+            else:
+                self.cost_basis = "observed_allocation"
+                mismatches = []
+                if self.requested_cpu is not None and self.allocated_cpu != self.requested_cpu:
+                    mismatches.append(
+                        f"CPU mismatch (requested {self.requested_cpu}, observed {self.allocated_cpu})"
+                    )
+                if (
+                    self.requested_machine_type is not None
+                    and self.machine_type != self.requested_machine_type
+                ):
+                    mismatches.append(
+                        f"machine type mismatch (requested '{self.requested_machine_type}', "
+                        f"observed '{self.machine_type}' from partition '{job_part}')"
+                    )
+                if (
+                    self.requested_provisioning_mix is not None
+                    and self.provisioning_mix != self.requested_provisioning_mix
+                ):
+                    mismatches.append(
+                        f"provisioning mix mismatch (requested '{self.requested_provisioning_mix}', "
+                        f"observed '{self.provisioning_mix}')"
+                    )
 
-        if has_pending_request:
-            mismatches = []
-            if self.requested_cpu is not None and self.allocated_cpu != self.requested_cpu:
-                mismatches.append(
-                    f"CPU mismatch (requested {self.requested_cpu}, observed {self.allocated_cpu})"
-                )
-            if self.requested_machine_type is not None and self.machine_type != self.requested_machine_type:
-                mismatches.append(
-                    f"machine type mismatch (requested '{self.requested_machine_type}', "
-                    f"observed '{self.machine_type}' from partition '{job_part}')"
-                )
-            if (
-                self.requested_provisioning_mix is not None
-                and self.provisioning_mix != self.requested_provisioning_mix
-            ):
-                mismatches.append(
-                    f"provisioning mix mismatch (requested '{self.requested_provisioning_mix}', "
-                    f"observed '{self.provisioning_mix}')"
-                )
-
-            if not mismatches:
+                if not mismatches:
+                    self.verification_status = "verified"
+                    self.verification_detail = (
+                        f"Observed authoritative allocation from Slurm controller: "
+                        f"{self.allocated_cpu} CPUs, {self.machine_type}, {self.provisioning_mix} (partition: {job_part})"
+                    )
+                    if self.last_slurm_action and self.last_slurm_action.get("status") == "pending_verification":
+                        self.last_slurm_action["status"] = "applied"
+                        self.last_slurm_action["verification_status"] = "verified"
+                        self.last_slurm_action["observed_cpu"] = self.allocated_cpu
+                        self.last_slurm_action["observed_machine_type"] = self.machine_type
+                        self.last_slurm_action["observed_provisioning_mix"] = self.provisioning_mix
+                    self.requested_cpu = None
+                    self.requested_machine_type = None
+                    self.requested_provisioning_mix = None
+                    self.pending_verification_start_time = None
+                else:
+                    self.verification_status = "mismatch"
+                    detail = "Allocation mismatch: " + "; ".join(mismatches)
+                    self.verification_detail = detail
+                    if self.last_slurm_action and self.last_slurm_action.get("status") == "pending_verification":
+                        self.last_slurm_action["status"] = "mismatch"
+                        self.last_slurm_action["verification_status"] = "mismatch"
+                        self.last_slurm_action["observed_cpu"] = self.allocated_cpu
+                        self.last_slurm_action["observed_machine_type"] = self.machine_type
+                        self.last_slurm_action["observed_provisioning_mix"] = self.provisioning_mix
+                        self.last_slurm_action["error"] = detail
+                    self.requested_cpu = None
+                    self.requested_machine_type = None
+                    self.requested_provisioning_mix = None
+                    self.pending_verification_start_time = None
+        elif self.verification_status in ("failed", "unsupported", "mismatch"):
+            # A rejected, unsupported, or mismatched command cannot become "applied"
+            if has_genuine_allocation:
+                self.cost_basis = "observed_allocation"
+        elif self.verification_status in ("unverified", "verified"):
+            if has_genuine_allocation and observed_machine_type:
                 self.verification_status = "verified"
                 self.verification_detail = (
                     f"Observed authoritative allocation from Slurm controller: "
                     f"{self.allocated_cpu} CPUs, {self.machine_type}, {self.provisioning_mix} (partition: {job_part})"
                 )
                 self.cost_basis = "observed_allocation"
-                if self.last_slurm_action:
-                    self.last_slurm_action["status"] = "applied"
-                    self.last_slurm_action["verification_status"] = "verified"
-                    self.last_slurm_action["observed_cpu"] = self.allocated_cpu
-                    self.last_slurm_action["observed_machine_type"] = self.machine_type
-                    self.last_slurm_action["observed_provisioning_mix"] = self.provisioning_mix
             else:
-                self.verification_status = "mismatch"
-                detail = "Allocation mismatch: " + "; ".join(mismatches)
-                self.verification_detail = detail
-                self.cost_basis = "observed_allocation"
-                if self.last_slurm_action:
-                    self.last_slurm_action["status"] = "mismatch"
-                    self.last_slurm_action["verification_status"] = "mismatch"
-                    self.last_slurm_action["observed_cpu"] = self.allocated_cpu
-                    self.last_slurm_action["observed_machine_type"] = self.machine_type
-                    self.last_slurm_action["observed_provisioning_mix"] = self.provisioning_mix
-                    self.last_slurm_action["error"] = detail
-        else:
-            self.verification_status = "verified"
-            self.verification_detail = (
-                f"Observed authoritative allocation from Slurm controller: "
-                f"{self.allocated_cpu} CPUs, {self.machine_type}, {self.provisioning_mix} (partition: {job_part})"
-            )
-            self.cost_basis = "observed_allocation"
+                self.verification_status = "unverified"
+                self.verification_detail = "Awaiting authoritative Slurm allocation telemetry"
+                self.cost_basis = "unverified"
 
         # 2. Synchronize elapsed time and accrue cost for delta elapsed seconds
         time_info = job.get("time", {})
@@ -488,6 +567,7 @@ class SlurmRuntime(RuntimeAdapter):
             self.remaining_work_units = max(0.1, round(100.0 * (1.0 - progress), 2))
 
     def snapshot(self) -> RuntimeSnapshot:
+        self._check_verification_timeout()
         # Check real job if active
         job_info = self._get_job()
         if "jobs" in job_info and job_info["jobs"]:
@@ -644,6 +724,10 @@ class SlurmRuntime(RuntimeAdapter):
             )
             self.verification_status = "unsupported"
             self.verification_detail = detail
+            self.requested_cpu = None
+            self.requested_machine_type = None
+            self.requested_provisioning_mix = None
+            self.pending_verification_start_time = None
             self.last_slurm_action = {
                 "action": action.action,
                 "job_id": self.active_job_id,
@@ -665,6 +749,7 @@ class SlurmRuntime(RuntimeAdapter):
         self.requested_machine_type = target_machine_type
         self.requested_provisioning_mix = target_provisioning_mix
         self.verification_status = "pending_verification"
+        self.pending_verification_start_time = time.time()
         self.verification_detail = (
             f"Resize requested ({target_cpu} CPUs, {target_machine_type}, {target_provisioning_mix}); "
             f"awaiting Slurm controller confirmation"
@@ -713,7 +798,7 @@ class SlurmRuntime(RuntimeAdapter):
                 "status_code": status_code,
                 "status": "pending_verification",
                 "verification_status": "pending_verification",
-                "timestamp": time.time(),
+                "timestamp": self.pending_verification_start_time,
             }
         elif os.getenv("MOCK_SLURM", "").lower() in ("true", "1") or str(self.active_job_id).startswith("mock-"):
             self.last_slurm_action = {
@@ -729,12 +814,16 @@ class SlurmRuntime(RuntimeAdapter):
                 "status": "pending_verification",
                 "verification_status": "pending_verification",
                 "simulated": True,
-                "timestamp": time.time(),
+                "timestamp": self.pending_verification_start_time,
             }
         else:
             detail = resp.text if resp is not None else error_msg
             self.verification_status = "failed"
             self.verification_detail = f"Slurm rejected CPU resize to {target_cpu}: {detail}"
+            self.requested_cpu = None
+            self.requested_machine_type = None
+            self.requested_provisioning_mix = None
+            self.pending_verification_start_time = None
             self.last_slurm_action = {
                 "action": action.action,
                 "job_id": self.active_job_id,
@@ -755,6 +844,7 @@ class SlurmRuntime(RuntimeAdapter):
             )
 
     def tick(self, minutes: float) -> None:
+        self._check_verification_timeout()
         if self.job_done:
             return
 

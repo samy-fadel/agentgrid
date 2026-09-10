@@ -663,5 +663,121 @@ def test_slurm_submit_job_remains_pending_verification_until_observed(monkeypatc
     assert runtime.last_slurm_action["status"] == "applied"
 
 
+def test_slurm_pending_job_without_allocated_resources_remains_unverified(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+    runtime = SlurmRuntime(job_id="908")
+    runtime.job_status = "PENDING"
+
+    action = Action(
+        action="resize_workload",
+        workload_id="908",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="request 60 cpus",
+    )
+    runtime.apply(action)
+    assert runtime.verification_status == "pending_verification"
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+
+    # Case 1: Slurm returns a pending job with only cpus_per_task: 60, but NO job_resources or allocated_cpus
+    runtime._sync_job_state({
+        "job_id": 908,
+        "job_state": ["PENDING"],
+        "cpus_per_task": 60,
+        "partition": "compute",
+    })
+    # Must NOT be marked verified or applied because no actual resources were allocated
+    assert runtime.verification_status == "pending_verification"
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+    assert runtime.observed_cpu is None
+
+    # Case 2: Telemetry with empty/missing allocation information must not mark unverified runtime as verified
+    runtime_unverified = SlurmRuntime(job_id="909")
+    runtime_unverified._sync_job_state({
+        "job_id": 909,
+        "job_state": ["PENDING"],
+    })
+    assert runtime_unverified.verification_status == "unverified"
+    assert runtime_unverified.cost_basis == "unverified"
+    assert runtime_unverified.observed_cpu is None
+
+
+def test_slurm_rejected_action_remains_failed_and_never_becomes_applied(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 500, "text": "Slurm controller database down", "json": lambda self: {}})(),
+    )
+    runtime = SlurmRuntime(job_id="910")
+    runtime.job_status = "PENDING"
+
+    action = Action(
+        action="resize_workload",
+        workload_id="910",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="request 60 cpus on c2",
+    )
+    with pytest.raises(RuntimeError, match="Slurm rejected CPU resize"):
+        runtime.apply(action)
+
+    assert runtime.verification_status == "failed"
+    assert runtime.last_slurm_action["status"] == "failed"
+    assert runtime.last_slurm_action["verification_status"] == "failed"
+
+    # Subsequent telemetry arrives showing 60 CPUs and compute partition
+    runtime._sync_job_state({
+        "job_id": 910,
+        "job_state": ["RUNNING"],
+        "job_resources": {"allocated_cpus": 60},
+        "partition": "compute",
+    })
+
+    # The cluster telemetry should update observed state, but the rejected action must REMAIN failed!
+    assert runtime.observed_cpu == 60
+    assert runtime.observed_machine_type == "c2-standard-60"
+    assert runtime.last_slurm_action["status"] == "failed"
+    assert runtime.last_slurm_action["verification_status"] == "failed"
+    assert runtime.verification_status == "failed"
+
+
+def test_slurm_verification_timeout_transitions_to_failed(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+    runtime = SlurmRuntime(job_id="911")
+    runtime.verification_timeout_seconds = 10.0
+    runtime.job_status = "PENDING"
+
+    action = Action(
+        action="resize_workload",
+        workload_id="911",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="request 60 cpus",
+    )
+    runtime.apply(action)
+    assert runtime.verification_status == "pending_verification"
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+
+    # Simulate exceeding timeout deadline
+    assert runtime.pending_verification_start_time is not None
+    runtime.pending_verification_start_time -= 15.0  # 15 seconds elapsed, > 10.0s timeout
+
+    # Trigger verification check via snapshot or tick or sync
+    snap = runtime.snapshot()
+    assert runtime.verification_status == "failed"
+    assert runtime.last_slurm_action["status"] == "failed"
+    assert runtime.last_slurm_action["verification_status"] == "failed"
+    assert "timed out" in runtime.verification_detail.lower()
+    assert snap.workload.verification_status == "failed"
+
+
 
 
