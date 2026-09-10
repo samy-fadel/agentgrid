@@ -22,6 +22,8 @@ class WorkloadState(BaseModel):
     estimated_remaining_minutes: float = Field(ge=0)
     accrued_cost_eur: float = Field(ge=0)
     done: bool = False
+    status: str = "RUNNING"
+    failed: bool = False
     machine_type: str | None = None
     provisioning_mix: str | None = None
 

@@ -370,8 +370,14 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
               <div className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
                 <span>Workload Progress</span>
-                <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${workload.done ? 'bg-emerald-950 text-emerald-400' : 'bg-blue-950 text-blue-400'}`}>
-                  {workload.done ? "DONE" : "RUNNING"}
+                <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${
+                  workload.failed || (workload.status && ['FAILED', 'TIMEOUT', 'CANCELLED', 'BOOT_FAIL', 'NODE_FAIL', 'DEADLINE'].includes(workload.status))
+                    ? 'bg-rose-950 text-rose-400 border border-rose-800/60'
+                    : workload.done
+                    ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/60'
+                    : 'bg-blue-950 text-blue-400 border border-blue-800/60'
+                }`}>
+                  {workload.status || (workload.done ? "COMPLETED" : "RUNNING")}
                 </span>
               </div>
               <div className="flex items-baseline space-x-2">
@@ -564,6 +570,12 @@
                     <span className="text-cyan-400 font-bold">{workload.id}</span>
                   </div>
                   <div className="flex justify-between">
+                    <span className="text-slate-400">Job Status:</span>
+                    <span className={workload.failed ? "text-rose-400 font-bold" : (workload.done ? "text-emerald-400 font-bold" : "text-blue-400 font-bold")}>
+                      {workload.status || (workload.done ? "COMPLETED" : "RUNNING")}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
                     <span className="text-slate-400">Live Allocated CPU:</span>
                     <span className="text-emerald-400 font-bold">{workload.allocated_cpu} cpus_per_task</span>
                   </div>
@@ -607,13 +619,30 @@
                       GCP Spot Advisor & Flex MIG
                     </h3>
                   </div>
-                  <button
-                    onClick={fetchCapacityAdvice}
-                    disabled={loadingCapacity}
-                    className="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700 transition-colors flex items-center space-x-1"
-                  >
-                    {loadingCapacity ? <span>Fetching...</span> : <span>Live Advisor API</span>}
-                  </button>
+                  <div className="flex items-center space-x-2">
+                    {capacityAdvice && (
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-medium ${
+                        capacityAdvice.status === 'unavailable'
+                          ? 'bg-rose-950/80 text-rose-400 border border-rose-800/60'
+                          : capacityAdvice.is_simulated || capacityAdvice.status === 'simulated'
+                          ? 'bg-amber-950/80 text-amber-400 border border-amber-800/60'
+                          : 'bg-emerald-950/80 text-emerald-400 border border-emerald-800/60'
+                      }`}>
+                        {capacityAdvice.status === 'unavailable'
+                          ? '✗ Unavailable'
+                          : capacityAdvice.is_simulated || capacityAdvice.status === 'simulated'
+                          ? '⚠️ Demo (Simulated)'
+                          : '● Live GCP Telemetry'}
+                      </span>
+                    )}
+                    <button
+                      onClick={fetchCapacityAdvice}
+                      disabled={loadingCapacity}
+                      className="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700 transition-colors flex items-center space-x-1"
+                    >
+                      {loadingCapacity ? <span>Fetching...</span> : <span>Refresh</span>}
+                    </button>
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between text-xs text-slate-400 font-mono">
@@ -623,7 +652,12 @@
 
                 {/* Machine Families Ranking & Real-time Obtainability */}
                 <div className="space-y-2">
-                  {capacityAdvice && (capacityAdvice.machine_types || capacityAdvice.recommendations) ? (
+                  {capacityAdvice && capacityAdvice.status === 'unavailable' ? (
+                    <div className="bg-slate-950 border border-rose-900/40 rounded-lg p-3 text-xs font-mono text-center space-y-1">
+                      <div className="text-rose-400 font-semibold">GCP Capacity Advisor Indisponible</div>
+                      <div className="text-slate-400 text-[11px]">{capacityAdvice.error || 'Connexion API GCP non disponible en mode hors-ligne.'}</div>
+                    </div>
+                  ) : capacityAdvice && (capacityAdvice.machine_types && capacityAdvice.machine_types.length > 0 || capacityAdvice.recommendations && capacityAdvice.recommendations.length > 0) ? (
                     (capacityAdvice.machine_types || capacityAdvice.recommendations).map((m) => (
                       <div key={m.machine_type} className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 text-xs font-mono space-y-1.5">
                         <div className="flex items-center justify-between">

@@ -176,6 +176,8 @@ class SimulatedRuntime(RuntimeAdapter):
                 ),
                 accrued_cost_eur=round(self.workload.accrued_cost_eur, 4),
                 done=self.is_done(),
+                status="COMPLETED" if self.is_done() else "RUNNING",
+                failed=False,
                 machine_type=self.workload.machine_type,
                 provisioning_mix=self.workload.provisioning_mix,
             ),

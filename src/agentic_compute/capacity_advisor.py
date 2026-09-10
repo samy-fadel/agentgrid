@@ -19,10 +19,12 @@ def query_capacity_advice(
     region: str | None = None,
     provisioning_model: str = "SPOT",
     target_distribution_shape: str = "ANY",
+    demo_mode: bool | None = None,
 ) -> dict[str, Any]:
     """Query GCP Compute Engine Capacity Advisor API for Spot obtainability and preemption rates.
 
-    Falls back to deterministic empirical GCP models when running offline or in tests.
+    Distinguishes live telemetry, demo simulated data, and unavailable states.
+    Synthetic values are strictly reserved for demo mode.
     """
     if isinstance(machine_types, str):
         types_list = [t.strip() for t in machine_types.split(",") if t.strip()]
@@ -53,7 +55,38 @@ def query_capacity_advice(
     if live_result:
         return live_result
 
-    # 2. Deterministic fallback based on empirical GCP Capacity Advisor telemetry
+    # 2. Check if demo mode is enabled or permitted
+    if demo_mode is not None:
+        is_demo = bool(demo_mode)
+    else:
+        is_demo = (
+            os.getenv("DEMO_MODE", "").lower() in ("true", "1", "yes")
+            or os.getenv("COMPUTE_RUNTIME", "simulator").lower() == "simulator"
+        )
+
+    # 3. If not in demo mode and live API is unavailable, return explicit unavailable state
+    if not is_demo:
+        return {
+            "region": target_region,
+            "provisioning_model": provisioning_model,
+            "requested_size": size,
+            "target_distribution_shape": target_distribution_shape,
+            "primary_machine_type": types_list[0],
+            "obtainability_score": None,
+            "estimated_uptime": None,
+            "recommended_zone": None,
+            "historical_preemption_rate_7d_avg": None,
+            "preemption_risk": "UNKNOWN",
+            "recommendations": [],
+            "machine_types": [],
+            "source": "unavailable",
+            "status": "unavailable",
+            "is_simulated": False,
+            "data_note": "Données télémétriques GCP Capacity Advisor indisponibles",
+            "error": "GCP Compute Engine Capacity Advisor API is currently unavailable or unreachable",
+        }
+
+    # 4. Synthetic values strictly reserved for demo mode
     primary_type = types_list[0]
     size_penalty = 0.0 if size <= 32 else (0.05 if size <= 128 else (0.15 if size <= 500 else 0.25))
     recommended_zone = f"{target_region}-f" if "us-central1" in target_region else f"{target_region}-a"
@@ -118,7 +151,10 @@ def query_capacity_advice(
         "preemption_risk": top_rec["preemption_risk_level"],
         "recommendations": recommendations,
         "machine_types": recommendations,
-        "source": "empirical_telemetry_fallback",
+        "source": "simulated_demo_data",
+        "status": "simulated",
+        "is_simulated": True,
+        "data_note": "Données simulées (mode démo)",
     }
 
 
@@ -150,96 +186,117 @@ def _call_gcp_advice_api(
             "Content-Type": "application/json",
         }
 
-        # 1. Query advice.capacity
         url_cap = f"https://compute.googleapis.com/compute/beta/projects/{project_id}/regions/{region}/advice/capacity"
-        payload_cap = {
-            "distributionPolicy": {"targetShape": target_distribution_shape.upper()},
-            "instanceFlexibilityPolicy": {
-                "instanceSelections": {
-                    f"selection-{i+1}": {"machineTypes": [mtype], "rank": i + 1}
-                    for i, mtype in enumerate(machine_types)
-                }
-            },
-            "instanceProperties": {
-                "scheduling": {"provisioningModel": provisioning_model.upper()}
-            },
-            "size": size,
-        }
-
-        resp_cap = requests.post(url_cap, headers=headers, json=payload_cap, timeout=6.0)
-        if resp_cap.status_code != 200:
-            return None
-
-        data_cap = resp_cap.json()
-        recs = data_cap.get("recommendations", [])
-        if not recs:
-            return None
-
-        primary_rec = recs[0]
-        scores = primary_rec.get("scores", {})
-        obtainability = float(scores.get("obtainability", 0.8))
-        estimated_uptime = str(scores.get("estimatedUptime", "3600s"))
-
-        shards = primary_rec.get("shards", [])
-        first_shard = shards[0] if shards else {}
-        zone_url = first_shard.get("zone", "")
-        zone_match = re.search(r'/zones/([^/]+)', zone_url)
-        recommended_zone = zone_match.group(1) if zone_match else f"{region}-a"
-
-        # 2. Query advice.capacityHistory for preemption rate
-        preemption_rate = 0.18
-        try:
-            url_hist = f"https://compute.googleapis.com/compute/beta/projects/{project_id}/regions/{region}/advice/capacityHistory"
-            payload_hist = {
-                "instanceProperties": {
-                    "machineType": machine_types[0],
-                    "scheduling": {"provisioningModel": provisioning_model.upper()},
-                },
-                "types": ["PREEMPTION"],
-            }
-            resp_hist = requests.post(url_hist, headers=headers, json=payload_hist, timeout=4.0)
-            if resp_hist.status_code == 200:
-                hist_data = resp_hist.json().get("preemptionHistory", [])
-                if hist_data:
-                    recent = hist_data[-7:]
-                    preemption_rate = round(sum(item.get("preemptionRate", 0.2) for item in recent) / len(recent), 3)
-        except Exception:
-            pass
+        url_hist = f"https://compute.googleapis.com/compute/beta/projects/{project_id}/regions/{region}/advice/capacityHistory"
 
         parsed_recs = []
         for i, mtype in enumerate(machine_types):
-            item = {
-                "machine_type": mtype,
-                "rank": i + 1,
-                "zone": recommended_zone,
-                "recommended_zone": recommended_zone,
-                "obtainability": obtainability,
-                "obtainability_score": obtainability,
-                "obtainability_percent": int(obtainability * 100),
-                "estimated_uptime": estimated_uptime,
-                "estimated_uptime_minutes": 60.0 if "3600" in estimated_uptime else 30.0,
-                "historical_preemption_rate_7d": preemption_rate,
-                "historical_preemption_rate_7d_avg": preemption_rate,
-                "preemption_risk_level": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
-                "suggested_hedging": "100% Spot" if obtainability >= 0.8 else ("80% Spot / 20% Standard" if obtainability >= 0.6 else "100% Standard"),
-                "hedged_policy_recommendation": "100% Spot" if obtainability >= 0.8 else ("80% Spot / 20% Standard" if obtainability >= 0.6 else "100% Standard"),
+            # GCP Capacity Advisor strictly requires instanceSelections to contain exactly one element
+            payload_cap = {
+                "distributionPolicy": {"targetShape": target_distribution_shape.upper()},
+                "instanceFlexibilityPolicy": {
+                    "instanceSelections": {
+                        "selection-1": {"machineTypes": [mtype], "rank": 1}
+                    }
+                },
+                "instanceProperties": {
+                    "scheduling": {"provisioningModel": provisioning_model.upper()}
+                },
+                "size": size,
             }
-            parsed_recs.append(item)
 
+            resp_cap = requests.post(url_cap, headers=headers, json=payload_cap, timeout=4.0)
+            if resp_cap.status_code != 200:
+                if i == 0:
+                    return None
+                continue
+
+            data_cap = resp_cap.json()
+            recs = data_cap.get("recommendations", [])
+            if not recs:
+                if i == 0:
+                    return None
+                continue
+
+            primary_rec = recs[0]
+            scores = primary_rec.get("scores", {})
+            obtainability = float(scores.get("obtainability", 0.8))
+            estimated_uptime = str(scores.get("estimatedUptime", "3600s"))
+
+            shards = primary_rec.get("shards", [])
+            first_shard = shards[0] if shards else {}
+            zone_url = first_shard.get("zone", "")
+            zone_match = re.search(r'/zones/([^/]+)', zone_url)
+            rec_zone = zone_match.group(1) if zone_match else f"{region}-a"
+
+            # Query capacityHistory for preemption rate
+            preemption_rate = 0.20
+            try:
+                payload_hist = {
+                    "instanceProperties": {
+                        "machineType": mtype,
+                        "scheduling": {"provisioningModel": provisioning_model.upper()},
+                    },
+                    "types": ["PREEMPTION"],
+                }
+                resp_hist = requests.post(url_hist, headers=headers, json=payload_hist, timeout=3.0)
+                if resp_hist.status_code == 200:
+                    hist_data = resp_hist.json().get("preemptionHistory", [])
+                    if hist_data:
+                        recent = hist_data[-7:]
+                        preemption_rate = round(
+                            sum(item.get("preemptionRate", 0.2) for item in recent) / len(recent), 3
+                        )
+            except Exception:
+                pass
+
+            risk_lvl = "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH")
+            hedging = (
+                "100% Spot"
+                if obtainability >= 0.85
+                else ("80% Spot / 20% Standard" if obtainability >= 0.65 else "100% Standard")
+            )
+
+            parsed_recs.append(
+                {
+                    "machine_type": mtype,
+                    "rank": i + 1,
+                    "zone": rec_zone,
+                    "recommended_zone": rec_zone,
+                    "obtainability": obtainability,
+                    "obtainability_score": obtainability,
+                    "obtainability_percent": int(obtainability * 100),
+                    "estimated_uptime": estimated_uptime,
+                    "estimated_uptime_minutes": 60.0 if "3600" in estimated_uptime else 30.0,
+                    "historical_preemption_rate_7d": preemption_rate,
+                    "historical_preemption_rate_7d_avg": preemption_rate,
+                    "preemption_risk_level": risk_lvl,
+                    "suggested_hedging": hedging,
+                    "hedged_policy_recommendation": hedging,
+                }
+            )
+
+        if not parsed_recs:
+            return None
+
+        top_rec = parsed_recs[0]
         return {
             "region": region,
             "provisioning_model": provisioning_model,
             "requested_size": size,
             "target_distribution_shape": target_distribution_shape,
-            "primary_machine_type": machine_types[0],
-            "obtainability_score": obtainability,
-            "estimated_uptime": estimated_uptime,
-            "recommended_zone": recommended_zone,
-            "historical_preemption_rate_7d_avg": preemption_rate,
-            "preemption_risk": "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH"),
+            "primary_machine_type": top_rec["machine_type"],
+            "obtainability_score": top_rec["obtainability_score"],
+            "estimated_uptime": top_rec["estimated_uptime"],
+            "recommended_zone": top_rec["recommended_zone"],
+            "historical_preemption_rate_7d_avg": top_rec["historical_preemption_rate_7d"],
+            "preemption_risk": top_rec["preemption_risk_level"],
             "recommendations": parsed_recs,
             "machine_types": parsed_recs,
             "source": "google_compute_engine_capacity_advisor_api",
+            "status": "live",
+            "is_simulated": False,
+            "data_note": "GCP Capacity Advisor Telemetry (Live)",
         }
     except Exception:
         return None

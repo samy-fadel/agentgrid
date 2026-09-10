@@ -61,6 +61,8 @@ class SlurmRuntime(RuntimeAdapter):
         self.baseline_workload_duration_minutes = float(os.getenv("BASELINE_WORKLOAD_DURATION_MINUTES", "25.0"))
         self.machine_type = "n2-standard-16"
         self.provisioning_mix = "100% Spot"
+        self.job_status = "RUNNING"
+        self.job_failed = False
         self.last_slurm_elapsed_secs: float | None = None
         self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or "1"
         self.reset()
@@ -73,6 +75,8 @@ class SlurmRuntime(RuntimeAdapter):
         self.remaining_work_units = 100.0
         self.accrued_cost_eur = 0.0
         self.job_done = False
+        self.job_status = "RUNNING"
+        self.job_failed = False
         self.is_real_slurm_job = False
         self.last_slurm_action = None
         self.machine_type = "n2-standard-16"
@@ -148,9 +152,15 @@ class SlurmRuntime(RuntimeAdapter):
         partition: str | None = None,
         memory_mb: int | None = None,
         script: str | None = None,
+        machine_type: str | None = None,
+        provisioning_model: str | None = None,
     ) -> dict[str, Any]:
         """Submit or initialize a new workload on the Slurm cluster with elastic parameters."""
         allocated_cpu = cpu if cpu is not None else int(os.getenv("INITIAL_WORKLOAD_CPU", "4"))
+        target_machine_type = machine_type or self.machine_type
+        target_provisioning_mix = provisioning_model or self.provisioning_mix
+        comment_str = f"machine_type={target_machine_type};provisioning_model={target_provisioning_mix}"
+
         payload_job: dict[str, Any] = {
             "name": name,
             "tasks": 1,
@@ -158,6 +168,10 @@ class SlurmRuntime(RuntimeAdapter):
             "current_working_directory": "/tmp",
             "environment": ["PATH=/bin:/usr/bin:/usr/local/bin"],
             "script": script or "#!/bin/bash\nsleep 3600\n",
+            "features": target_machine_type,
+            "constraints": target_machine_type,
+            "comment": comment_str,
+            "admin_comment": comment_str,
         }
         if partition:
             payload_job["partition"] = partition
@@ -197,10 +211,15 @@ class SlurmRuntime(RuntimeAdapter):
         self.active_job_id = submitted_id
         self.allocated_cpu = allocated_cpu
         self.allocated_gpu = gpu
+        self.machine_type = target_machine_type
+        self.provisioning_mix = target_provisioning_mix
         self.remaining_work_units = 100.0
         self.elapsed_minutes = 0.0
         self.accrued_cost_eur = 0.0
         self.job_done = False
+        self.job_status = "RUNNING"
+        self.job_failed = False
+        self.last_slurm_elapsed_secs = None
         self.is_real_slurm_job = not submitted_id.startswith("mock-")
 
         return {
@@ -208,21 +227,76 @@ class SlurmRuntime(RuntimeAdapter):
             "allocated_cpu": self.allocated_cpu,
             "allocated_gpu": self.allocated_gpu,
             "partition": partition,
+            "machine_type": self.machine_type,
+            "provisioning_mix": self.provisioning_mix,
             "is_real_slurm_job": self.is_real_slurm_job,
         }
+
+    def _get_cost_factor(self) -> float:
+        if "80% Spot" in self.provisioning_mix:
+            return 0.48
+        elif "Spot" in self.provisioning_mix or "SPOT" in self.provisioning_mix:
+            return 0.35
+        else:
+            return 1.0
+
+    def _sync_job_state(self, job: dict[str, Any]) -> None:
+        """Synchronize local runtime state with authoritative Slurm job telemetry."""
+        # 1. Update allocated CPU from Slurm job resources if present
+        res = job.get("job_resources", {})
+        if isinstance(res, dict) and res.get("allocated_cpus") is not None:
+            self.allocated_cpu = int(res["allocated_cpus"])
+
+        # 2. Synchronize elapsed time and accrue cost for delta elapsed seconds
+        time_info = job.get("time", {})
+        slurm_elapsed_secs = time_info.get("elapsed", 0)
+        if isinstance(slurm_elapsed_secs, (int, float)) and slurm_elapsed_secs >= 0:
+            if self.last_slurm_elapsed_secs is None:
+                delta_secs = float(slurm_elapsed_secs)
+            else:
+                delta_secs = max(0.0, float(slurm_elapsed_secs) - self.last_slurm_elapsed_secs)
+            self.last_slurm_elapsed_secs = float(slurm_elapsed_secs)
+            self.elapsed_minutes = float(slurm_elapsed_secs) / 60.0
+
+            cost_factor = self._get_cost_factor()
+            if delta_secs > 0:
+                self.accrued_cost_eur += (
+                    self.allocated_cpu
+                    * self.cpu_cost_per_hour_eur
+                    * cost_factor
+                    * (delta_secs / 3600.0)
+                )
+
+        # 3. Synchronize lifecycle status
+        state = job.get("job_state", ["RUNNING"])
+        state_str = state[0] if isinstance(state, list) and state else str(state)
+        self.job_status = state_str
+
+        if state_str == "COMPLETED":
+            self.job_done = True
+            self.job_failed = False
+            self.remaining_work_units = 0.0
+        elif state_str in ("FAILED", "TIMEOUT", "CANCELLED", "BOOT_FAIL", "NODE_FAIL", "DEADLINE"):
+            self.job_done = True
+            self.job_failed = True
+            # Do NOT reset remaining_work_units to 0.0 on failure: preserves unfinished work indicator
+        else:
+            # RUNNING or PENDING
+            self.job_done = False
+            self.job_failed = False
+            expected_total_secs = (
+                self.baseline_workload_duration_minutes * 60.0 * (16.0 / max(1, self.allocated_cpu))
+            )
+            elapsed = float(slurm_elapsed_secs) if isinstance(slurm_elapsed_secs, (int, float)) else 0.0
+            progress = min(1.0, elapsed / max(1.0, expected_total_secs))
+            self.remaining_work_units = max(0.1, round(100.0 * (1.0 - progress), 2))
 
     def snapshot(self) -> RuntimeSnapshot:
         # Check real job if active
         job_info = self._get_job()
         if "jobs" in job_info and job_info["jobs"]:
             self.is_real_slurm_job = True
-            job = job_info["jobs"][0]
-            self.allocated_cpu = job.get("job_resources", {}).get("allocated_cpus", self.allocated_cpu)
-            state = job.get("job_state", ["RUNNING"])
-            state_str = state[0] if isinstance(state, list) and state else str(state)
-            if state_str in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"):
-                self.job_done = True
-                self.remaining_work_units = 0.0
+            self._sync_job_state(job_info["jobs"][0])
 
         # Dynamic discovery of cluster nodes, total CPU, and GPUs from Slurm
         nodes_info = self._get_nodes()
@@ -324,6 +398,8 @@ class SlurmRuntime(RuntimeAdapter):
                 estimated_remaining_minutes=round(curr_remaining, 2),
                 accrued_cost_eur=round(self.accrued_cost_eur, 4),
                 done=self.job_done,
+                status=self.job_status,
+                failed=self.job_failed,
                 machine_type=self.machine_type,
                 provisioning_mix=self.provisioning_mix,
             ),
@@ -341,10 +417,19 @@ class SlurmRuntime(RuntimeAdapter):
         if not action.cpu:
             return
 
+        target_cpu = action.cpu
+        target_machine_type = action.machine_type or self.machine_type
+        target_provisioning_mix = action.provisioning_model or self.provisioning_mix
+
+        job_patch: dict[str, Any] = {"cpus_per_task": target_cpu}
         if action.machine_type:
-            self.machine_type = action.machine_type
-        if action.provisioning_model:
-            self.provisioning_mix = action.provisioning_model
+            job_patch["features"] = action.machine_type
+            job_patch["constraints"] = action.machine_type
+
+        # Propagate machine_type and provisioning_model to Slurm comments
+        comment_str = f"machine_type={target_machine_type};provisioning_model={target_provisioning_mix}"
+        job_patch["comment"] = comment_str
+        job_patch["admin_comment"] = comment_str
 
         resp = None
         status_code = None
@@ -353,7 +438,7 @@ class SlurmRuntime(RuntimeAdapter):
             resp = requests.post(
                 f"{self.base_url}/job/{self.active_job_id}",
                 headers=self._headers(),
-                json={"job": {"cpus_per_task": action.cpu}},
+                json={"job": job_patch},
                 timeout=5.0,
             )
             status_code = resp.status_code
@@ -361,11 +446,13 @@ class SlurmRuntime(RuntimeAdapter):
             error_msg = str(e)
 
         if resp is not None and resp.status_code in (200, 201):
-            self.allocated_cpu = action.cpu
+            self.allocated_cpu = target_cpu
+            self.machine_type = target_machine_type
+            self.provisioning_mix = target_provisioning_mix
             self.last_slurm_action = {
                 "action": action.action,
                 "job_id": self.active_job_id,
-                "requested_cpu": action.cpu,
+                "requested_cpu": target_cpu,
                 "machine_type": self.machine_type,
                 "provisioning_mix": self.provisioning_mix,
                 "status_code": status_code,
@@ -374,11 +461,13 @@ class SlurmRuntime(RuntimeAdapter):
             }
         elif os.getenv("MOCK_SLURM", "").lower() in ("true", "1") or str(self.active_job_id).startswith("mock-"):
             # Explicit mock fallback only for tests
-            self.allocated_cpu = action.cpu
+            self.allocated_cpu = target_cpu
+            self.machine_type = target_machine_type
+            self.provisioning_mix = target_provisioning_mix
             self.last_slurm_action = {
                 "action": action.action,
                 "job_id": self.active_job_id,
-                "requested_cpu": action.cpu,
+                "requested_cpu": target_cpu,
                 "machine_type": self.machine_type,
                 "provisioning_mix": self.provisioning_mix,
                 "status_code": status_code or 200,
@@ -391,7 +480,9 @@ class SlurmRuntime(RuntimeAdapter):
             self.last_slurm_action = {
                 "action": action.action,
                 "job_id": self.active_job_id,
-                "requested_cpu": action.cpu,
+                "requested_cpu": target_cpu,
+                "requested_machine_type": action.machine_type,
+                "requested_provisioning_mix": action.provisioning_model,
                 "machine_type": self.machine_type,
                 "provisioning_mix": self.provisioning_mix,
                 "status_code": status_code,
@@ -400,82 +491,42 @@ class SlurmRuntime(RuntimeAdapter):
                 "timestamp": time.time(),
             }
             raise RuntimeError(
-                f"Slurm rejected CPU resize to {action.cpu} for job {self.active_job_id} (HTTP {status_code}): {detail}"
+                f"Slurm rejected CPU resize to {target_cpu} for job {self.active_job_id} (HTTP {status_code}): {detail}"
             )
 
     def tick(self, minutes: float) -> None:
         if self.job_done:
             return
 
-        # Active provisioning cost factor
-        if "80% Spot" in self.provisioning_mix:
-            cost_factor = 0.48
-        elif "Spot" in self.provisioning_mix or "SPOT" in self.provisioning_mix:
-            cost_factor = 0.35
-        else:
-            cost_factor = 1.0
+        cost_factor = self._get_cost_factor()
 
         # 1. Query real Slurm status first as primary source of truth
         job_info = self._get_job()
         if "jobs" in job_info and job_info["jobs"]:
             self.is_real_slurm_job = True
-            job = job_info["jobs"][0]
-            self.allocated_cpu = job.get("job_resources", {}).get("allocated_cpus", self.allocated_cpu)
-            state = job.get("job_state", ["RUNNING"])
-            state_str = state[0] if isinstance(state, list) and state else str(state)
+            self._sync_job_state(job_info["jobs"][0])
+            return
 
-            if state_str in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED", "BOOT_FAIL", "NODE_FAIL", "DEADLINE"):
-                self.job_done = True
-                self.remaining_work_units = 0.0 if state_str == "COMPLETED" else self.remaining_work_units
-                return
-            else:
-                # Job is still running or pending in Slurm; do not artificially complete
-                self.job_done = False
-                time_info = job.get("time", {})
-                slurm_elapsed_secs = time_info.get("elapsed", 0)
-
-                # Case 4.2 fix: Only accrue cost for actual delta in Slurm elapsed seconds
-                if isinstance(slurm_elapsed_secs, (int, float)) and slurm_elapsed_secs >= 0:
-                    if self.last_slurm_elapsed_secs is None:
-                        delta_secs = slurm_elapsed_secs
-                    else:
-                        delta_secs = max(0.0, slurm_elapsed_secs - self.last_slurm_elapsed_secs)
-                    self.last_slurm_elapsed_secs = slurm_elapsed_secs
-                    self.elapsed_minutes = slurm_elapsed_secs / 60.0
-
-                    if delta_secs > 0:
-                        self.accrued_cost_eur += (
-                            self.allocated_cpu
-                            * self.cpu_cost_per_hour_eur
-                            * cost_factor
-                            * (delta_secs / 3600.0)
-                        )
-
-                    # Intrinsic workload burn-down based on baseline duration and speedup
-                    expected_total_secs = (
-                        self.baseline_workload_duration_minutes * 60.0 * (16.0 / max(1, self.allocated_cpu))
-                    )
-                    progress = min(1.0, slurm_elapsed_secs / max(1.0, expected_total_secs))
-                    self.remaining_work_units = max(0.1, round(100.0 * (1.0 - progress), 2))
-        else:
-            # Case 4.3 fix: If Slurm is inaccessible, never silently simulate completion unless explicit mock mode
-            is_mock_enabled = os.getenv("MOCK_SLURM", "").lower() in ("true", "1", "yes") or str(self.active_job_id).startswith("mock-")
-            if not is_mock_enabled:
-                raise RuntimeError(
-                    f"Slurm cluster is unreachable at {self.base_url} (no active job {self.active_job_id} found) and MOCK_SLURM is not enabled."
-                )
-
-            # Fallback for mock/test runs with explicit mock mode
-            self.elapsed_minutes += minutes
-            self.accrued_cost_eur += (
-                self.allocated_cpu * self.cpu_cost_per_hour_eur * cost_factor * (minutes / 60.0)
+        # Case 4.3 fix: If Slurm is inaccessible, never silently simulate completion unless explicit mock mode
+        is_mock_enabled = os.getenv("MOCK_SLURM", "").lower() in ("true", "1", "yes") or str(self.active_job_id).startswith("mock-")
+        if not is_mock_enabled:
+            raise RuntimeError(
+                f"Slurm cluster is unreachable at {self.base_url} (no active job {self.active_job_id} found) and MOCK_SLURM is not enabled."
             )
-            speedup = self.allocated_cpu / 16.0
-            work_completed = (minutes / self.baseline_workload_duration_minutes) * 100.0 * speedup
-            self.remaining_work_units = max(0.0, self.remaining_work_units - work_completed)
-            if self.remaining_work_units <= 0.0:
-                self.job_done = True
-                self.remaining_work_units = 0.0
+
+        # Fallback for mock/test runs with explicit mock mode
+        self.elapsed_minutes += minutes
+        self.accrued_cost_eur += (
+            self.allocated_cpu * self.cpu_cost_per_hour_eur * cost_factor * (minutes / 60.0)
+        )
+        speedup = self.allocated_cpu / 16.0
+        work_completed = (minutes / self.baseline_workload_duration_minutes) * 100.0 * speedup
+        self.remaining_work_units = max(0.0, self.remaining_work_units - work_completed)
+        if self.remaining_work_units <= 0.0:
+            self.job_done = True
+            self.job_status = "COMPLETED"
+            self.job_failed = False
+            self.remaining_work_units = 0.0
 
     def is_done(self) -> bool:
         return self.job_done

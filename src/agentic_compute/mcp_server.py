@@ -117,10 +117,13 @@ def submit_job(
     partition: str | None = None,
     memory_mb: int | None = None,
     script: str | None = None,
+    machine_type: str | None = None,
+    provisioning_model: str | None = None,
 ) -> dict:
     """Submit or initialize a new compute workload to the cluster.
 
-    Registers a new workload with optional CPU, GPU, partition, memory, and script parameters.
+    Registers a new workload with optional CPU, GPU, partition, memory, machine type,
+    provisioning model (SPOT/STANDARD), and script parameters.
     If CPU is omitted, the cluster selects an optimal baseline allocation.
     """
     if hasattr(_runtime, "submit_job"):
@@ -132,6 +135,8 @@ def submit_job(
                 partition=partition,
                 memory_mb=memory_mb,
                 script=script,
+                machine_type=machine_type,
+                provisioning_model=provisioning_model,
             )
             return {"status": "submitted", "job": res, "snapshot": _runtime.snapshot().model_dump()}
         except Exception as exc:

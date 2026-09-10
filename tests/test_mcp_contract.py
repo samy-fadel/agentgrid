@@ -102,4 +102,67 @@ def test_mcp_snapshot_and_reset_endpoints():
     assert "machine_types" in cap_data
 
 
+def test_capacity_advisor_demo_mode_explicit_labeling(monkeypatch):
+    import agentic_compute.capacity_advisor as cap_module
+
+    # Mock _call_gcp_advice_api to return None so it falls back to demo mode
+    monkeypatch.setattr(cap_module, "_call_gcp_advice_api", lambda *args, **kwargs: None)
+
+    advice = cap_module.query_capacity_advice(
+        machine_types="n4-standard-32,n2-standard-32",
+        demo_mode=True,
+    )
+    assert advice["status"] == "simulated"
+    assert advice["is_simulated"] is True
+    assert advice["source"] == "simulated_demo_data"
+    assert "démo" in advice["data_note"].lower()
+    assert len(advice["machine_types"]) == 2
+
+
+def test_capacity_advisor_unavailable_mode_when_not_demo(monkeypatch):
+    import agentic_compute.capacity_advisor as cap_module
+
+    # Mock _call_gcp_advice_api to simulate offline/unreachable GCP API
+    monkeypatch.setattr(cap_module, "_call_gcp_advice_api", lambda *args, **kwargs: None)
+
+    advice = cap_module.query_capacity_advice(
+        machine_types="n4-standard-32",
+        demo_mode=False,
+    )
+    assert advice["status"] == "unavailable"
+    assert advice["is_simulated"] is False
+    assert advice["source"] == "unavailable"
+    assert advice["obtainability_score"] is None
+    assert advice["recommendations"] == []
+    assert advice["machine_types"] == []
+    assert "indisponibles" in advice["data_note"].lower()
+
+
+def test_capacity_advisor_live_telemetry_labeled(monkeypatch):
+    import agentic_compute.capacity_advisor as cap_module
+
+    live_payload = {
+        "region": "us-central1",
+        "primary_machine_type": "n4-standard-32",
+        "obtainability_score": 0.92,
+        "recommendations": [{"machine_type": "n4-standard-32", "rank": 1}],
+        "machine_types": [{"machine_type": "n4-standard-32", "rank": 1}],
+        "source": "google_compute_engine_capacity_advisor_api",
+        "status": "live",
+        "is_simulated": False,
+        "data_note": "GCP Capacity Advisor Telemetry (Live)",
+    }
+    monkeypatch.setattr(cap_module, "_call_gcp_advice_api", lambda *args, **kwargs: live_payload)
+
+    advice = cap_module.query_capacity_advice(
+        machine_types="n4-standard-32",
+        demo_mode=False,
+    )
+    assert advice["status"] == "live"
+    assert advice["is_simulated"] is False
+    assert advice["source"] == "google_compute_engine_capacity_advisor_api"
+    assert advice["obtainability_score"] == 0.92
+
+
+
 

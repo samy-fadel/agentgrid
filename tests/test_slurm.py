@@ -198,3 +198,157 @@ def test_slurm_unreachable_without_mock_raises_error(monkeypatch):
         runtime.tick(5.0)
 
 
+def test_slurm_apply_payload_includes_machine_type_and_provisioning_mix(monkeypatch):
+    captured_payloads = []
+
+    def mock_post(url, *args, **kwargs):
+        captured_payloads.append(kwargs.get("json", {}))
+        return type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"job_id": "777"}})()
+
+    monkeypatch.setattr("requests.post", mock_post)
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"jobs": []}})(),
+    )
+    runtime = SlurmRuntime(job_id="777")
+    action = Action(
+        action="resize_workload",
+        workload_id="777",
+        cpu=64,
+        machine_type="n4-standard-64",
+        provisioning_model="100% Standard",
+        reason="scale up to n4 standard",
+    )
+    runtime.apply(action)
+
+    assert len(captured_payloads) == 1
+    job_payload = captured_payloads[0].get("job", {})
+    assert job_payload.get("cpus_per_task") == 64
+    assert job_payload.get("features") == "n4-standard-64"
+    assert job_payload.get("constraints") == "n4-standard-64"
+    assert "machine_type=n4-standard-64" in job_payload.get("comment", "")
+    assert "provisioning_model=100% Standard" in job_payload.get("comment", "")
+    assert runtime.machine_type == "n4-standard-64"
+    assert runtime.provisioning_mix == "100% Standard"
+
+
+def test_slurm_apply_failure_preserves_previous_metadata(monkeypatch):
+    monkeypatch.delenv("MOCK_SLURM", raising=False)
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 500, "text": "Slurm Controller Error", "json": lambda self: {}})(),
+    )
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"jobs": []}})(),
+    )
+    runtime = SlurmRuntime(job_id="888")
+    original_mtype = runtime.machine_type
+    original_mix = runtime.provisioning_mix
+    original_cpu = runtime.allocated_cpu
+
+    action = Action(
+        action="resize_workload",
+        workload_id="888",
+        cpu=96,
+        machine_type="n4-standard-96",
+        provisioning_model="100% Standard",
+        reason="scale attempt that fails",
+    )
+
+    with pytest.raises(RuntimeError, match="Slurm rejected CPU resize"):
+        runtime.apply(action)
+
+    # Local state must NOT be mutated to fictitious configuration upon failure
+    assert runtime.allocated_cpu == original_cpu
+    assert runtime.machine_type == original_mtype
+    assert runtime.provisioning_mix == original_mix
+    assert runtime.last_slurm_action["status"] == "failed"
+
+
+def test_slurm_completed_job_accrues_final_elapsed_delta_and_cost(monkeypatch):
+    # Step 1: Job is RUNNING at 10 minutes (elapsed = 600s)
+    running_resp = {
+        "jobs": [
+            {
+                "job_id": 999,
+                "job_state": ["RUNNING"],
+                "job_resources": {"allocated_cpus": 16},
+                "time": {"elapsed": 600},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: running_resp})(),
+    )
+    runtime = SlurmRuntime(job_id="999")
+    runtime.tick(5.0)
+
+    cost_at_10m = runtime.accrued_cost_eur
+    assert runtime.elapsed_minutes == 10.0
+    assert cost_at_10m > 0.0
+    assert runtime.is_done() is False
+
+    # Step 2: Job transitions to COMPLETED at 20 minutes (elapsed = 1200s)
+    completed_resp = {
+        "jobs": [
+            {
+                "job_id": 999,
+                "job_state": ["COMPLETED"],
+                "job_resources": {"allocated_cpus": 16},
+                "time": {"elapsed": 1200},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: completed_resp})(),
+    )
+    runtime.tick(5.0)
+
+    # Final elapsed time and cost delta MUST be accounted for upon terminal tick
+    assert runtime.is_done() is True
+    assert runtime.elapsed_minutes == 20.0
+    assert runtime.accrued_cost_eur > cost_at_10m
+    # 1200s is 2x 600s, so accrued cost should be exactly 2x
+    assert round(runtime.accrued_cost_eur, 5) == round(cost_at_10m * 2.0, 5)
+    snapshot = runtime.snapshot()
+    assert snapshot.workload.done is True
+    assert snapshot.workload.failed is False
+    assert snapshot.workload.status == "COMPLETED"
+    assert snapshot.workload.remaining_work_units == 0.0
+
+
+def test_slurm_failed_job_exposed_truthfully(monkeypatch):
+    # Job failed in Slurm at 12 minutes with remaining work
+    failed_resp = {
+        "jobs": [
+            {
+                "job_id": 999,
+                "job_state": ["FAILED"],
+                "job_resources": {"allocated_cpus": 16},
+                "time": {"elapsed": 720},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: failed_resp})(),
+    )
+    runtime = SlurmRuntime(job_id="999")
+    runtime.tick(5.0)
+
+    assert runtime.is_done() is True
+    assert runtime.job_failed is True
+    assert runtime.job_status == "FAILED"
+    # Remaining work units must NOT be zeroed out for failed jobs
+    assert runtime.remaining_work_units > 0.0
+
+    snap = runtime.snapshot()
+    assert snap.workload.done is True
+    assert snap.workload.failed is True
+    assert snap.workload.status == "FAILED"
+    assert snap.workload.remaining_work_units > 0.0
+
+
