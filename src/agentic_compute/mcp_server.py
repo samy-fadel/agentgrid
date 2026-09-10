@@ -88,6 +88,8 @@ async def capacity_advice_route(request):
     region = params.get("region") or None
     provisioning_model = params.get("provisioning_model", "SPOT")
     target_distribution_shape = params.get("target_distribution_shape", "ANY")
+    demo_param = params.get("demo_mode")
+    demo_mode = demo_param.lower() in ("true", "1", "yes") if demo_param is not None else None
 
     advice = query_capacity_advice(
         machine_types=machine_types,
@@ -95,6 +97,7 @@ async def capacity_advice_route(request):
         region=region,
         provisioning_model=provisioning_model,
         target_distribution_shape=target_distribution_shape,
+        demo_mode=demo_mode,
     )
     return JSONResponse(advice)
 
@@ -255,6 +258,7 @@ def get_capacity_advice(
     region: str | None = None,
     provisioning_model: str = "SPOT",
     target_distribution_shape: str = "ANY",
+    demo_mode: bool | None = None,
 ) -> dict:
     """Get real-time Spot capacity advice, obtainability scores, and preemption risk from Google Cloud.
 
@@ -268,6 +272,7 @@ def get_capacity_advice(
         region=region,
         provisioning_model=provisioning_model,
         target_distribution_shape=target_distribution_shape,
+        demo_mode=demo_mode,
     )
 
 

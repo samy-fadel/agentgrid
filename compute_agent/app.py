@@ -189,6 +189,7 @@ def get_capacity_advice_endpoint(
     region: Optional[str] = None,
     provisioning_model: str = "SPOT",
     target_distribution_shape: str = "ANY",
+    demo_mode: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Expose real-time GCP Spot Capacity Advisor to the UI and external callers."""
     mcp_server_url = os.getenv("MCP_SERVER_URL")
@@ -203,16 +204,19 @@ def get_capacity_advice_endpoint(
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
+            params: dict[str, Any] = {
+                "machine_types": machine_types,
+                "size": size,
+                "region": region or "",
+                "provisioning_model": provisioning_model,
+                "target_distribution_shape": target_distribution_shape,
+            }
+            if demo_mode is not None:
+                params["demo_mode"] = str(demo_mode).lower()
             resp = requests.get(
                 f"{base_audience}/capacity-advice",
                 headers=headers,
-                params={
-                    "machine_types": machine_types,
-                    "size": size,
-                    "region": region or "",
-                    "provisioning_model": provisioning_model,
-                    "target_distribution_shape": target_distribution_shape,
-                },
+                params=params,
                 timeout=5.0,
             )
             if resp.status_code == 200:
@@ -227,6 +231,7 @@ def get_capacity_advice_endpoint(
         region=region,
         provisioning_model=provisioning_model,
         target_distribution_shape=target_distribution_shape,
+        demo_mode=demo_mode,
     )
 
 

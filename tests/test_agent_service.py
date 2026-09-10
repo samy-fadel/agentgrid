@@ -61,6 +61,14 @@ def test_agent_api_capacity_advice_endpoint():
     assert "machine_types" in data
     assert "recommendations" in data
 
+    # Test explicit demo mode
+    demo_resp = client.get("/api/capacity-advice?size=10&demo_mode=true")
+    assert demo_resp.status_code == 200
+    demo_data = demo_resp.json()
+    assert demo_data["is_simulated"] is True
+    assert demo_data["status"] == "simulated"
+
+
 
 def test_optimize_stream_endpoint_json_body():
     client = TestClient(app)
