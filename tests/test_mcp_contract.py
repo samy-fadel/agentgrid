@@ -164,5 +164,122 @@ def test_capacity_advisor_live_telemetry_labeled(monkeypatch):
     assert advice["obtainability_score"] == 0.92
 
 
+def test_parse_duration_to_minutes():
+    import pytest
+    from agentic_compute.capacity_advisor import parse_duration_to_minutes
+
+    assert parse_duration_to_minutes("900s") == 15.0
+    assert parse_duration_to_minutes("5400s") == 90.0
+    assert parse_duration_to_minutes("90.5s") == pytest.approx(1.5083, rel=1e-3)
+    assert parse_duration_to_minutes(3600) == 60.0
+    assert parse_duration_to_minutes(90.5) == pytest.approx(1.5083, rel=1e-3)
+    assert parse_duration_to_minutes("invalid") is None
+    assert parse_duration_to_minutes(None) is None
+    assert parse_duration_to_minutes("") is None
+    assert parse_duration_to_minutes("-100s") is None
+
+
+def test_capacity_advisor_partial_live_when_history_fails(monkeypatch):
+    import agentic_compute.capacity_advisor as cap_module
+
+    cap_data = {
+        "recommendations": [
+            {
+                "scores": {"obtainability": 0.88, "estimatedUptime": "5400s"},
+                "shards": [{"zone": "projects/p/zones/us-central1-a"}],
+            }
+        ]
+    }
+
+    def mock_post(url, *args, **kwargs):
+        if "advice/capacityHistory" in url:
+            return type("MockResponse", (), {"status_code": 503, "text": "Unavailable", "json": lambda self: {}})()
+        return type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: cap_data})()
+
+    monkeypatch.setattr(cap_module, "HAVE_GOOGLE_AUTH", True)
+    monkeypatch.setattr(
+        "google.auth.default",
+        lambda *args, **kwargs: (type("Creds", (), {"valid": True, "token": "dummy"})(), "project"),
+    )
+    monkeypatch.setattr("requests.post", mock_post)
+
+    advice = cap_module.query_capacity_advice(machine_types="n2-standard-32", demo_mode=False)
+
+    assert advice["status"] == "partial_live"
+    assert advice["is_simulated"] is False
+    assert advice["obtainability_score"] == 0.88
+    assert advice["historical_preemption_rate_7d_avg"] is None
+    assert advice["preemption_risk"] == "UNKNOWN"
+    rec = advice["machine_types"][0]
+    assert rec["obtainability"] == 0.88
+    assert rec["estimated_uptime_minutes"] == 90.0
+    assert rec["historical_preemption_rate_7d"] is None
+    assert rec["preemption_risk_level"] == "UNKNOWN"
+
+
+def test_capacity_advisor_zero_preemption_preserved(monkeypatch):
+    import agentic_compute.capacity_advisor as cap_module
+
+    cap_data = {
+        "recommendations": [
+            {
+                "scores": {"obtainability": 0.95, "estimatedUptime": "3600s"},
+                "shards": [{"zone": "projects/p/zones/us-central1-f"}],
+            }
+        ]
+    }
+    hist_data = {
+        "preemptionHistory": [{"preemptionRate": 0.0}, {"preemptionRate": 0.0}]
+    }
+
+    def mock_post(url, *args, **kwargs):
+        if "advice/capacityHistory" in url:
+            return type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: hist_data})()
+        return type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: cap_data})()
+
+    monkeypatch.setattr(cap_module, "HAVE_GOOGLE_AUTH", True)
+    monkeypatch.setattr(
+        "google.auth.default",
+        lambda *args, **kwargs: (type("Creds", (), {"valid": True, "token": "dummy"})(), "project"),
+    )
+    monkeypatch.setattr("requests.post", mock_post)
+
+    advice = cap_module.query_capacity_advice(machine_types="n4-standard-32", demo_mode=False)
+
+    assert advice["status"] == "live"
+    assert advice["obtainability_score"] == 0.95
+    assert advice["historical_preemption_rate_7d_avg"] == 0.0
+    assert advice["preemption_risk"] == "LOW"
+    rec = advice["machine_types"][0]
+    assert rec["historical_preemption_rate_7d"] == 0.0
+    assert rec["preemption_risk_level"] == "LOW"
+
+
+def test_mcp_resize_workload_reports_truthful_status(monkeypatch):
+    from agentic_compute.mcp_server import resize_workload
+    import agentic_compute.mcp_server as mcp_mod
+    from agentic_compute.slurm_adapter import SlurmRuntime
+
+    slurm_rt = SlurmRuntime(job_id="mcp-test")
+    slurm_rt.job_status = "PENDING"
+    monkeypatch.setattr(mcp_mod, "_runtime", slurm_rt)
+
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+
+    # Pending verification returned through MCP tool
+    res = resize_workload("mcp-test", 60, machine_type="c2-standard-60", provisioning_model="100% Standard")
+    assert res["status"] == "pending_verification"
+    assert res["slurm_verification"]["status"] == "pending_verification"
+
+    # Unsupported configuration returned through MCP tool
+    unsupported_res = resize_workload("mcp-test", 60, machine_type="n4-standard-64")
+    assert unsupported_res["status"] == "unsupported"
+    assert "unsupported" in unsupported_res["error"].lower()
+
+
+
 
 

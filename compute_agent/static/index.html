@@ -579,13 +579,42 @@
                     <span className="text-slate-400">Live Allocated CPU:</span>
                     <span className="text-emerald-400 font-bold">{workload.allocated_cpu} cpus_per_task</span>
                   </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Verification Status:</span>
+                    <span className={
+                      workload.verification_status === 'verified'
+                        ? "text-emerald-400 font-bold"
+                        : (workload.verification_status === 'pending_verification'
+                            ? "text-amber-400 font-bold"
+                            : (workload.verification_status === 'unsupported'
+                                ? "text-rose-400 font-bold"
+                                : "text-slate-300 font-bold"))
+                    }>
+                      {workload.verification_status ? workload.verification_status.toUpperCase().replace('_', ' ') : 'VERIFIED'}
+                    </span>
+                  </div>
+                  {workload.verification_detail && (
+                    <div className="text-[11px] text-slate-400 italic bg-slate-900/50 p-1.5 rounded border border-slate-800">
+                      {workload.verification_detail}
+                    </div>
+                  )}
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Cost Basis:</span>
+                    <span className="text-cyan-400 font-mono text-[11px]">
+                      {workload.cost_basis || 'observed_allocation'}
+                    </span>
+                  </div>
                   {slurmVerification && (
                     <div className="flex justify-between border-t border-slate-900 pt-1.5">
-                      <span className="text-slate-400">Last Slurm REST Receipt:</span>
-                      <span className={slurmVerification.status === 'failed' ? "text-rose-400" : "text-emerald-400"}>
+                      <span className="text-slate-400">Last Slurm Action Receipt:</span>
+                      <span className={slurmVerification.status === 'failed' || slurmVerification.status === 'unsupported' ? "text-rose-400 font-bold" : (slurmVerification.status === 'pending_verification' ? "text-amber-400 font-bold" : "text-emerald-400 font-bold")}>
                         {slurmVerification.status === 'failed'
-                          ? `HTTP ${slurmVerification.status_code || 500} FAILED`
-                          : `HTTP ${slurmVerification.status_code || 200} OK`}
+                          ? `FAILED (${slurmVerification.status_code || 500})`
+                          : (slurmVerification.status === 'unsupported'
+                              ? `UNSUPPORTED`
+                              : (slurmVerification.status === 'pending_verification'
+                                  ? `PENDING VERIFICATION`
+                                  : `APPLIED (HTTP ${slurmVerification.status_code || 200})`))}
                       </span>
                     </div>
                   )}
@@ -669,15 +698,43 @@
                           </div>
                           <div className="flex items-center space-x-1.5">
                             <span className="text-slate-400 text-[11px]">Obtainability:</span>
-                            <span className={`font-bold ${(m.obtainability_score || m.obtainability || 0.8) >= 0.85 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                              {m.obtainability_percent || Math.round((m.obtainability_score || m.obtainability || 0.8) * 100)}%
-                            </span>
+                            {(() => {
+                              const score = (m.obtainability_score !== undefined && m.obtainability_score !== null)
+                                ? m.obtainability_score
+                                : ((m.obtainability !== undefined && m.obtainability !== null) ? m.obtainability : null);
+                              const percent = (m.obtainability_percent !== undefined && m.obtainability_percent !== null)
+                                ? m.obtainability_percent
+                                : (score !== null ? Math.round(score * 100) : null);
+                              return (
+                                <span className={`font-bold ${score !== null && score >= 0.85 ? 'text-emerald-400' : (score !== null ? 'text-amber-400' : 'text-slate-500')}`}>
+                                  {percent !== null ? `${percent}%` : 'N/D'}
+                                </span>
+                              );
+                            })()}
                           </div>
                         </div>
                         <div className="flex items-center justify-between text-[11px] text-slate-400 border-t border-slate-900 pt-1">
-                          <span>Zone: <span className="text-cyan-300">{m.recommended_zone || m.zone || 'us-central1-f'}</span></span>
-                          <span>7d Preempt: <span className="text-amber-400">{(((m.historical_preemption_rate_7d !== undefined ? m.historical_preemption_rate_7d : m.historical_preemption_rate_7d_avg) || 0.1) * 100).toFixed(1)}%</span></span>
-                          <span>Est. Uptime: <span className="text-slate-300">{Math.round((m.estimated_uptime_minutes || (m.estimated_uptime ? (parseInt(m.estimated_uptime) / 60) : 60)))}m</span></span>
+                          <span>Zone: <span className="text-cyan-300">{m.recommended_zone || m.zone || 'N/D'}</span></span>
+                          {(() => {
+                            const pr = (m.historical_preemption_rate_7d !== undefined && m.historical_preemption_rate_7d !== null)
+                              ? m.historical_preemption_rate_7d
+                              : ((m.historical_preemption_rate_7d_avg !== undefined && m.historical_preemption_rate_7d_avg !== null) ? m.historical_preemption_rate_7d_avg : null);
+                            return (
+                              <span>7d Preempt: <span className={pr !== null ? (pr < 0.15 ? 'text-emerald-400' : (pr < 0.25 ? 'text-amber-400' : 'text-rose-400')) : 'text-slate-500'}>
+                                {pr !== null ? `${(pr * 100).toFixed(1)}%` : 'N/D'}
+                              </span></span>
+                            );
+                          })()}
+                          {(() => {
+                            const mins = (m.estimated_uptime_minutes !== undefined && m.estimated_uptime_minutes !== null)
+                              ? m.estimated_uptime_minutes
+                              : (m.estimated_uptime ? (parseFloat(m.estimated_uptime) / 60.0) : null);
+                            return (
+                              <span>Est. Uptime: <span className={mins !== null && !isNaN(mins) ? 'text-slate-300' : 'text-slate-500'}>
+                                {mins !== null && !isNaN(mins) ? `${Math.round(mins)}m` : 'N/D'}
+                              </span></span>
+                            );
+                          })()}
                         </div>
                         <div className="flex items-center justify-between text-[10px] text-slate-500 pt-0.5">
                           <span>Hedging Mix:</span>
@@ -832,7 +889,7 @@
                               </div>
                             </td>
                             <td className="py-2.5">
-                              {c.obtainability_score ? (
+                              {(c.obtainability_score !== null && c.obtainability_score !== undefined) ? (
                                 <span className={`font-bold ${c.obtainability_score >= 0.85 ? 'text-emerald-400' : 'text-amber-400'}`}>
                                   {Math.round(c.obtainability_score * 100)}%
                                 </span>

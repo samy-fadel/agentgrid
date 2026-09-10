@@ -20,19 +20,32 @@ def test_slurm_adapter_snapshot_and_apply(monkeypatch):
     assert snapshot.workload.id == "1"
     assert len(snapshot.candidate_allocations) > 0
 
-    # Test applying resize action
+    # Test applying resize action on a pending job
+    runtime.job_status = "PENDING"
     action = Action(
         action="resize_workload",
         workload_id="1",
         cpu=64,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
         reason="scale up on Slurm",
     )
     runtime.apply(action)
+    # HTTP 200 places job in pending_verification without prematurely altering observed allocation
+    assert runtime.last_slurm_action is not None
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+    assert runtime.allocated_cpu == 4
+
+    # Controller confirms allocation
+    runtime._sync_job_state({
+        "job_id": "1",
+        "job_resources": {"allocated_cpus": 64},
+        "partition": "compute",
+    })
     updated = runtime.snapshot()
     assert updated.workload.allocated_cpu == 64
-    assert runtime.last_slurm_action is not None
-    assert runtime.last_slurm_action["requested_cpu"] == 64
     assert runtime.last_slurm_action["status"] == "applied"
+    assert updated.workload.verification_status == "verified"
 
     # Test tick progress burn-down
     runtime.tick(5.0)
@@ -71,12 +84,15 @@ def test_slurm_adapter_apply_failure_raises(monkeypatch):
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 500, "text": "Internal Server Error", "json": lambda self: {}})(),
     )
     runtime = SlurmRuntime()
+    runtime.job_status = "PENDING"
     initial_cpu = runtime.allocated_cpu
 
     action = Action(
         action="resize_workload",
         workload_id="1",
         cpu=96,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
         reason="scale up on Slurm",
     )
     with pytest.raises(RuntimeError, match="Slurm rejected CPU resize"):
@@ -211,25 +227,36 @@ def test_slurm_apply_payload_includes_machine_type_and_provisioning_mix(monkeypa
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"jobs": []}})(),
     )
     runtime = SlurmRuntime(job_id="777")
+    runtime.job_status = "PENDING"
     action = Action(
         action="resize_workload",
         workload_id="777",
-        cpu=64,
-        machine_type="n4-standard-64",
+        cpu=60,
+        machine_type="c2-standard-60",
         provisioning_model="100% Standard",
-        reason="scale up to n4 standard",
+        reason="scale up to c2 standard on compute partition",
     )
     runtime.apply(action)
 
     assert len(captured_payloads) == 1
     job_payload = captured_payloads[0].get("job", {})
-    assert job_payload.get("cpus_per_task") == 64
-    assert job_payload.get("features") == "n4-standard-64"
-    assert job_payload.get("constraints") == "n4-standard-64"
-    assert "machine_type=n4-standard-64" in job_payload.get("comment", "")
+    assert job_payload.get("cpus_per_task") == 60
+    assert job_payload.get("features") == "c2-standard-60"
+    assert job_payload.get("constraints") == "c2-standard-60"
+    assert job_payload.get("partition") == "compute"
+    assert "machine_type=c2-standard-60" in job_payload.get("comment", "")
     assert "provisioning_model=100% Standard" in job_payload.get("comment", "")
-    assert runtime.machine_type == "n4-standard-64"
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+
+    # When Slurm telemetry confirms the new allocation
+    runtime._sync_job_state({
+        "job_id": "777",
+        "job_resources": {"allocated_cpus": 60},
+        "partition": "compute",
+    })
+    assert runtime.machine_type == "c2-standard-60"
     assert runtime.provisioning_mix == "100% Standard"
+    assert runtime.last_slurm_action["status"] == "applied"
 
 
 def test_slurm_apply_failure_preserves_previous_metadata(monkeypatch):
@@ -243,6 +270,7 @@ def test_slurm_apply_failure_preserves_previous_metadata(monkeypatch):
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"jobs": []}})(),
     )
     runtime = SlurmRuntime(job_id="888")
+    runtime.job_status = "PENDING"
     original_mtype = runtime.machine_type
     original_mix = runtime.provisioning_mix
     original_cpu = runtime.allocated_cpu
@@ -250,8 +278,8 @@ def test_slurm_apply_failure_preserves_previous_metadata(monkeypatch):
     action = Action(
         action="resize_workload",
         workload_id="888",
-        cpu=96,
-        machine_type="n4-standard-96",
+        cpu=60,
+        machine_type="c2-standard-60",
         provisioning_model="100% Standard",
         reason="scale attempt that fails",
     )
@@ -350,5 +378,174 @@ def test_slurm_failed_job_exposed_truthfully(monkeypatch):
     assert snap.workload.failed is True
     assert snap.workload.status == "FAILED"
     assert snap.workload.remaining_work_units > 0.0
+
+
+def test_slurm_unsupported_configuration_rejected(monkeypatch):
+    monkeypatch.delenv("MOCK_SLURM", raising=False)
+    runtime = SlurmRuntime(job_id="901")
+    runtime.job_status = "PENDING"
+    original_cpu = runtime.allocated_cpu
+    original_mtype = runtime.machine_type
+    original_mix = runtime.provisioning_mix
+
+    # 1. Unsupported machine type
+    action_mtype = Action(
+        action="resize_workload",
+        workload_id="901",
+        cpu=64,
+        machine_type="n4-standard-64",
+        provisioning_model="100% Standard",
+        reason="request unsupported N4",
+    )
+    with pytest.raises(RuntimeError, match="Unsupported configuration on Slurm cluster"):
+        runtime.apply(action_mtype)
+
+    assert runtime.verification_status == "unsupported"
+    assert runtime.last_slurm_action["status"] == "unsupported"
+    assert runtime.allocated_cpu == original_cpu
+    assert runtime.machine_type == original_mtype
+
+    # 2. Unsupported Spot mix on Slurm cluster
+    action_spot = Action(
+        action="resize_workload",
+        workload_id="901",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="80% Spot / 20% Standard",
+        reason="request unsupported spot mix",
+    )
+    with pytest.raises(RuntimeError, match="Unsupported configuration on Slurm cluster"):
+        runtime.apply(action_spot)
+
+    assert runtime.verification_status == "unsupported"
+    assert runtime.last_slurm_action["status"] == "unsupported"
+    assert runtime.allocated_cpu == original_cpu
+    assert runtime.provisioning_mix == original_mix
+
+
+def test_slurm_running_job_hot_resize_rejected(monkeypatch):
+    runtime = SlurmRuntime(job_id="902")
+    runtime.job_status = "RUNNING"
+    original_cpu = runtime.allocated_cpu
+
+    action = Action(
+        action="resize_workload",
+        workload_id="902",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="hot-resize running job",
+    )
+    with pytest.raises(RuntimeError, match="Hot-resizing an active running Slurm job"):
+        runtime.apply(action)
+
+    assert runtime.verification_status == "unsupported"
+    assert runtime.last_slurm_action["status"] == "unsupported"
+    assert runtime.allocated_cpu == original_cpu
+
+
+def test_slurm_pending_job_http_200_remains_pending_verification(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"jobs": []}})(),
+    )
+    runtime = SlurmRuntime(job_id="903")
+    runtime.job_status = "PENDING"
+    assert runtime.allocated_cpu == 4
+
+    action = Action(
+        action="resize_workload",
+        workload_id="903",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="resize pending job",
+    )
+    runtime.apply(action)
+
+    # HTTP 200 from Slurm must NOT claim applied yet
+    assert runtime.verification_status == "pending_verification"
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+    assert runtime.allocated_cpu == 4  # Observed CPU has NOT changed
+    assert runtime.requested_cpu == 60
+    snap = runtime.snapshot()
+    assert snap.workload.allocated_cpu == 4
+    assert snap.workload.requested_cpu == 60
+    assert snap.workload.verification_status == "pending_verification"
+
+
+def test_slurm_observed_change_transitions_to_applied_and_verified(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+    runtime = SlurmRuntime(job_id="904")
+    runtime.job_status = "PENDING"
+    action = Action(
+        action="resize_workload",
+        workload_id="904",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="resize pending job",
+    )
+    runtime.apply(action)
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+
+    # Authoritative telemetry arrives from Slurm showing allocated_cpus: 60
+    runtime._sync_job_state({
+        "job_id": 904,
+        "job_state": ["RUNNING"],
+        "job_resources": {"allocated_cpus": 60},
+        "partition": "compute",
+    })
+
+    assert runtime.verification_status == "verified"
+    assert runtime.last_slurm_action["status"] == "applied"
+    assert runtime.allocated_cpu == 60
+    assert runtime.machine_type == "c2-standard-60"
+    assert runtime.snapshot().workload.allocated_cpu == 60
+
+
+def test_slurm_cost_accrual_strictly_depends_on_observed_allocation(monkeypatch):
+    runtime = SlurmRuntime(job_id="905")
+    runtime.job_status = "PENDING"
+    runtime.allocated_cpu = 4
+    runtime.cpu_cost_per_hour_eur = 0.05
+    runtime.provisioning_mix = "100% Standard"
+
+    # Resize requested to 60 CPUs, remains pending
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+    action = Action(
+        action="resize_workload",
+        workload_id="905",
+        cpu=60,
+        machine_type="c2-standard-60",
+        provisioning_model="100% Standard",
+        reason="request 60 CPUs",
+    )
+    runtime.apply(action)
+    assert runtime.verification_status == "pending_verification"
+
+    # Simulate 1 hour elapsed (3600 seconds) observed with 4 CPUs
+    runtime._sync_job_state({
+        "job_id": 905,
+        "job_state": ["RUNNING"],
+        "job_resources": {"allocated_cpus": 4},
+        "time": {"elapsed": 3600},
+    })
+
+    # Expected cost: 4 vCPUs * 0.05 EUR/h * 1.0 factor * 1.0 h = 0.20 EUR
+    # If it had used requested_cpu (60), cost would have been 3.00 EUR.
+    assert round(runtime.accrued_cost_eur, 4) == 0.2000
+    assert runtime.snapshot().workload.cost_basis == "observed_allocation"
+
 
 

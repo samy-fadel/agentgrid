@@ -13,6 +13,36 @@ except ImportError:
     HAVE_GOOGLE_AUTH = False
 
 
+def parse_duration_to_minutes(duration_val: Any) -> float | None:
+    """Parse GCP API duration string or numeric seconds to minutes.
+
+    Handles:
+    - Strings ending with 's' or with whitespace, e.g. "900s", "5400s", "90.5s"
+    - Plain numeric strings or ints/floats representing seconds, e.g. 3600, "3600", 90.5
+    - Returns None for invalid, empty, negative, or NaN values.
+    """
+    if duration_val is None:
+        return None
+    if isinstance(duration_val, (int, float)):
+        if duration_val < 0 or duration_val != duration_val:
+            return None
+        return round(float(duration_val) / 60.0, 4)
+    if isinstance(duration_val, str):
+        s = duration_val.strip()
+        if s.endswith("s"):
+            s = s[:-1].strip()
+        if not s:
+            return None
+        try:
+            val = float(s)
+            if val < 0 or val != val:
+                return None
+            return round(val / 60.0, 4)
+        except ValueError:
+            return None
+    return None
+
+
 def query_capacity_advice(
     machine_types: list[str] | str = "n4-standard-32,n2-standard-32,n2-standard-16",
     size: int = 10,
@@ -43,19 +73,7 @@ def query_capacity_advice(
 
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID") or "dubai-489009"
 
-    # 1. Attempt live GCP Compute Engine Capacity Advisor API
-    live_result = _call_gcp_advice_api(
-        project_id=project_id,
-        region=target_region,
-        machine_types=types_list,
-        size=size,
-        provisioning_model=provisioning_model,
-        target_distribution_shape=target_distribution_shape,
-    )
-    if live_result:
-        return live_result
-
-    # 2. Check if demo mode is enabled or permitted
+    # Check if demo mode is enabled or permitted
     if demo_mode is not None:
         is_demo = bool(demo_mode)
     else:
@@ -64,27 +82,41 @@ def query_capacity_advice(
             or os.getenv("COMPUTE_RUNTIME", "simulator").lower() == "simulator"
         )
 
-    # 3. If not in demo mode and live API is unavailable, return explicit unavailable state
-    if not is_demo:
-        return {
-            "region": target_region,
-            "provisioning_model": provisioning_model,
-            "requested_size": size,
-            "target_distribution_shape": target_distribution_shape,
-            "primary_machine_type": types_list[0],
-            "obtainability_score": None,
-            "estimated_uptime": None,
-            "recommended_zone": None,
-            "historical_preemption_rate_7d_avg": None,
-            "preemption_risk": "UNKNOWN",
-            "recommendations": [],
-            "machine_types": [],
-            "source": "unavailable",
-            "status": "unavailable",
-            "is_simulated": False,
-            "data_note": "Données télémétriques GCP Capacity Advisor indisponibles",
-            "error": "GCP Compute Engine Capacity Advisor API is currently unavailable or unreachable",
-        }
+    # If demo mode is explicitly requested, bypass live GCP API
+    if demo_mode is not True:
+        # 1. Attempt live GCP Compute Engine Capacity Advisor API
+        live_result = _call_gcp_advice_api(
+            project_id=project_id,
+            region=target_region,
+            machine_types=types_list,
+            size=size,
+            provisioning_model=provisioning_model,
+            target_distribution_shape=target_distribution_shape,
+        )
+        if live_result:
+            return live_result
+
+        # 2. If not in demo mode and live API is unavailable, return explicit unavailable state
+        if not is_demo:
+            return {
+                "region": target_region,
+                "provisioning_model": provisioning_model,
+                "requested_size": size,
+                "target_distribution_shape": target_distribution_shape,
+                "primary_machine_type": types_list[0],
+                "obtainability_score": None,
+                "estimated_uptime": None,
+                "recommended_zone": None,
+                "historical_preemption_rate_7d_avg": None,
+                "preemption_risk": "UNKNOWN",
+                "recommendations": [],
+                "machine_types": [],
+                "source": "unavailable",
+                "status": "unavailable",
+                "is_simulated": False,
+                "data_note": "Données télémétriques GCP Capacity Advisor indisponibles",
+                "error": "GCP Compute Engine Capacity Advisor API is currently unavailable or unreachable",
+            }
 
     # 4. Synthetic values strictly reserved for demo mode
     primary_type = types_list[0]
@@ -128,7 +160,7 @@ def query_capacity_advice(
             "obtainability_score": score_adj,
             "obtainability_percent": int(score_adj * 100),
             "estimated_uptime": est_uptime,
-            "estimated_uptime_minutes": 60.0 if "3600" in est_uptime else 30.0,
+            "estimated_uptime_minutes": parse_duration_to_minutes(est_uptime),
             "historical_preemption_rate_7d": preemption_rate,
             "historical_preemption_rate_7d_avg": preemption_rate,
             "preemption_risk_level": risk_lvl,
@@ -220,8 +252,11 @@ def _call_gcp_advice_api(
 
             primary_rec = recs[0]
             scores = primary_rec.get("scores", {})
-            obtainability = float(scores.get("obtainability", 0.8))
-            estimated_uptime = str(scores.get("estimatedUptime", "3600s"))
+            obtainability_val = scores.get("obtainability")
+            obtainability = float(obtainability_val) if obtainability_val is not None else None
+            est_uptime_raw = scores.get("estimatedUptime")
+            estimated_uptime_str = str(est_uptime_raw) if est_uptime_raw is not None else None
+            estimated_uptime_mins = parse_duration_to_minutes(est_uptime_raw)
 
             shards = primary_rec.get("shards", [])
             first_shard = shards[0] if shards else {}
@@ -230,7 +265,7 @@ def _call_gcp_advice_api(
             rec_zone = zone_match.group(1) if zone_match else f"{region}-a"
 
             # Query capacityHistory for preemption rate
-            preemption_rate = 0.20
+            preemption_rate = None
             try:
                 payload_hist = {
                     "instanceProperties": {
@@ -244,17 +279,25 @@ def _call_gcp_advice_api(
                     hist_data = resp_hist.json().get("preemptionHistory", [])
                     if hist_data:
                         recent = hist_data[-7:]
-                        preemption_rate = round(
-                            sum(item.get("preemptionRate", 0.2) for item in recent) / len(recent), 3
-                        )
+                        rates = [
+                            float(item["preemptionRate"])
+                            for item in recent
+                            if "preemptionRate" in item and item["preemptionRate"] is not None
+                        ]
+                        if rates:
+                            preemption_rate = round(sum(rates) / len(rates), 3)
             except Exception:
                 pass
 
-            risk_lvl = "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH")
+            if preemption_rate is not None:
+                risk_lvl = "LOW" if preemption_rate < 0.15 else ("MEDIUM" if preemption_rate < 0.25 else "HIGH")
+            else:
+                risk_lvl = "UNKNOWN"
+
             hedging = (
                 "100% Spot"
-                if obtainability >= 0.85
-                else ("80% Spot / 20% Standard" if obtainability >= 0.65 else "100% Standard")
+                if (obtainability is not None and obtainability >= 0.85)
+                else ("80% Spot / 20% Standard" if (obtainability is not None and obtainability >= 0.65) else "100% Standard")
             )
 
             parsed_recs.append(
@@ -265,9 +308,9 @@ def _call_gcp_advice_api(
                     "recommended_zone": rec_zone,
                     "obtainability": obtainability,
                     "obtainability_score": obtainability,
-                    "obtainability_percent": int(obtainability * 100),
-                    "estimated_uptime": estimated_uptime,
-                    "estimated_uptime_minutes": 60.0 if "3600" in estimated_uptime else 30.0,
+                    "obtainability_percent": int(obtainability * 100) if obtainability is not None else None,
+                    "estimated_uptime": estimated_uptime_str,
+                    "estimated_uptime_minutes": estimated_uptime_mins,
                     "historical_preemption_rate_7d": preemption_rate,
                     "historical_preemption_rate_7d_avg": preemption_rate,
                     "preemption_risk_level": risk_lvl,
@@ -280,6 +323,13 @@ def _call_gcp_advice_api(
             return None
 
         top_rec = parsed_recs[0]
+        has_unknown_history = any(r.get("historical_preemption_rate_7d") is None for r in parsed_recs)
+        overall_status = "partial_live" if has_unknown_history else "live"
+        data_note = (
+            "GCP Capacity Advisor Telemetry (Partial Live: preemption history unavailable)"
+            if has_unknown_history
+            else "GCP Capacity Advisor Telemetry (Live)"
+        )
         return {
             "region": region,
             "provisioning_model": provisioning_model,
@@ -294,9 +344,9 @@ def _call_gcp_advice_api(
             "recommendations": parsed_recs,
             "machine_types": parsed_recs,
             "source": "google_compute_engine_capacity_advisor_api",
-            "status": "live",
+            "status": overall_status,
             "is_simulated": False,
-            "data_note": "GCP Capacity Advisor Telemetry (Live)",
+            "data_note": data_note,
         }
     except Exception:
         return None

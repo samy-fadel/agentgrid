@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 import time
 
@@ -15,6 +16,17 @@ from .runtime import RuntimeAdapter
 from .slurm_adapter import generate_candidate_cpus
 
 
+def compute_hedged_cost_factor(cpu: int, mix: str) -> float:
+    """Compute effective pricing factor based on vCPU capacity and floor(cpu * 0.8) rounding."""
+    if "80% Spot" in mix:
+        spot_cpu = math.floor(cpu * 0.8)
+        standard_cpu = cpu - spot_cpu
+        return (spot_cpu * 0.35 + standard_cpu * 1.0) / max(1, cpu)
+    elif "Spot" in mix or "SPOT" in mix:
+        return 0.35
+    return 1.0
+
+
 @dataclass
 class _SimWorkload:
     id: str = "mc-001"
@@ -25,6 +37,12 @@ class _SimWorkload:
     accrued_cost_eur: float = 0.0
     machine_type: str = "n2-standard-32"
     provisioning_mix: str = "100% Spot"
+    requested_cpu: int | None = None
+    requested_machine_type: str | None = None
+    requested_provisioning_mix: str | None = None
+    verification_status: str = "verified"
+    verification_detail: str | None = "Simulated allocation verified"
+    cost_basis: str = "observed_allocation"
 
 
 class SimulatedRuntime(RuntimeAdapter):
@@ -116,13 +134,12 @@ class SimulatedRuntime(RuntimeAdapter):
 
         if slack_ratio > 1.5:
             pmix = "100% Spot"
-            cost_factor = 0.35
         elif slack_ratio > 1.1:
             pmix = "80% Spot / 20% Standard"
-            cost_factor = 0.48
         else:
             pmix = "100% Standard"
-            cost_factor = 1.0
+
+        cost_factor = compute_hedged_cost_factor(cpu, pmix)
 
         if cpu >= 64:
             mtype = f"n4-standard-{min(64, cpu)}"
@@ -180,6 +197,15 @@ class SimulatedRuntime(RuntimeAdapter):
                 failed=False,
                 machine_type=self.workload.machine_type,
                 provisioning_mix=self.workload.provisioning_mix,
+                requested_cpu=self.workload.requested_cpu or self.workload.allocated_cpu,
+                requested_machine_type=self.workload.requested_machine_type or self.workload.machine_type,
+                requested_provisioning_mix=self.workload.requested_provisioning_mix or self.workload.provisioning_mix,
+                observed_cpu=self.workload.allocated_cpu,
+                observed_machine_type=self.workload.machine_type,
+                observed_provisioning_mix=self.workload.provisioning_mix,
+                verification_status=self.workload.verification_status,
+                verification_detail=self.workload.verification_detail,
+                cost_basis=self.workload.cost_basis,
             ),
             objective=self.objective,
             candidate_allocations=candidates,
@@ -205,19 +231,29 @@ class SimulatedRuntime(RuntimeAdapter):
                 f"CPU allocation {action.cpu} is not allowed. Choose from {sorted(allowed)}"
             )
 
+        self.workload.requested_cpu = action.cpu
         self.workload.allocated_cpu = action.cpu
         if action.machine_type:
+            self.workload.requested_machine_type = action.machine_type
             self.workload.machine_type = action.machine_type
         if action.provisioning_model:
+            self.workload.requested_provisioning_mix = action.provisioning_model
             self.workload.provisioning_mix = action.provisioning_model
+
+        self.workload.verification_status = "verified"
+        self.workload.verification_detail = f"Simulated allocation verified ({action.cpu} CPUs, {self.workload.machine_type}, {self.workload.provisioning_mix})"
+        self.workload.cost_basis = "observed_allocation"
 
         self.last_slurm_action = {
             "action": action.action,
             "job_id": self.workload.id,
             "requested_cpu": action.cpu,
+            "observed_cpu": self.workload.allocated_cpu,
             "machine_type": self.workload.machine_type,
             "provisioning_mix": self.workload.provisioning_mix,
             "status_code": 200,
+            "status": "applied",
+            "verification_status": "verified",
             "simulated": True,
             "timestamp": time.time(),
         }
@@ -232,13 +268,8 @@ class SimulatedRuntime(RuntimeAdapter):
         time_to_finish = self.workload.remaining_work_units / rate
         actual_minutes = min(minutes, time_to_finish)
 
-        # Active provisioning cost factor
-        if "80% Spot" in self.workload.provisioning_mix:
-            cost_factor = 0.48
-        elif "Spot" in self.workload.provisioning_mix or "SPOT" in self.workload.provisioning_mix:
-            cost_factor = 0.35
-        else:
-            cost_factor = 1.0
+        # Active provisioning cost factor based on vCPU capacity and rounding
+        cost_factor = compute_hedged_cost_factor(self.workload.allocated_cpu, self.workload.provisioning_mix)
 
         self.workload.remaining_work_units = max(
             0.0,

@@ -26,6 +26,26 @@ class WorkloadState(BaseModel):
     failed: bool = False
     machine_type: str | None = None
     provisioning_mix: str | None = None
+    # Requested vs Observed configuration separation
+    requested_cpu: int | None = None
+    requested_machine_type: str | None = None
+    requested_provisioning_mix: str | None = None
+    observed_cpu: int | None = None
+    observed_machine_type: str | None = None
+    observed_provisioning_mix: str | None = None
+    verification_status: Literal["verified", "pending_verification", "unsupported", "failed"] = "verified"
+    verification_detail: str | None = None
+    cost_basis: str = "observed_allocation"
+
+    @model_validator(mode="after")
+    def sync_observed(self) -> "WorkloadState":
+        if self.observed_cpu is None:
+            self.observed_cpu = self.allocated_cpu
+        if self.observed_machine_type is None and self.machine_type is not None:
+            self.observed_machine_type = self.machine_type
+        if self.observed_provisioning_mix is None and self.provisioning_mix is not None:
+            self.observed_provisioning_mix = self.provisioning_mix
+        return self
 
 
 class Objective(BaseModel):

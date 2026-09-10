@@ -187,8 +187,11 @@ def resize_workload(
     try:
         _runtime.apply(action)
     except Exception as exc:
+        is_unsupported = "unsupported" in str(exc).lower() or (
+            hasattr(_runtime, "verification_status") and getattr(_runtime, "verification_status") == "unsupported"
+        )
         return {
-            "status": "error",
+            "status": "unsupported" if is_unsupported else "error",
             "error": str(exc),
             "workload_id": workload_id,
             "cpu": cpu,
@@ -197,13 +200,15 @@ def resize_workload(
             "slurm_verification": getattr(_runtime, "last_slurm_action", None),
             "snapshot": _runtime.snapshot().model_dump(),
         }
+    verification = getattr(_runtime, "last_slurm_action", None)
+    status = verification.get("status", "applied") if verification else "applied"
     return {
-        "status": "applied",
+        "status": status,
         "workload_id": workload_id,
         "cpu": cpu,
         "machine_type": machine_type,
         "provisioning_model": provisioning_model,
-        "slurm_verification": getattr(_runtime, "last_slurm_action", None),
+        "slurm_verification": verification,
         "snapshot": _runtime.snapshot().model_dump(),
     }
 
