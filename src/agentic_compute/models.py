@@ -33,18 +33,21 @@ class WorkloadState(BaseModel):
     observed_cpu: int | None = None
     observed_machine_type: str | None = None
     observed_provisioning_mix: str | None = None
-    verification_status: Literal["verified", "pending_verification", "unsupported", "failed"] = "verified"
+    verification_status: Literal[
+        "verified", "pending_verification", "unverified", "mismatch", "unsupported", "failed"
+    ] = "unverified"
     verification_detail: str | None = None
-    cost_basis: str = "observed_allocation"
+    cost_basis: str = "unverified"
 
     @model_validator(mode="after")
     def sync_observed(self) -> "WorkloadState":
-        if self.observed_cpu is None:
-            self.observed_cpu = self.allocated_cpu
-        if self.observed_machine_type is None and self.machine_type is not None:
-            self.observed_machine_type = self.machine_type
-        if self.observed_provisioning_mix is None and self.provisioning_mix is not None:
-            self.observed_provisioning_mix = self.provisioning_mix
+        if self.verification_status in ("verified", "mismatch"):
+            if self.observed_cpu is None:
+                self.observed_cpu = self.allocated_cpu
+            if self.observed_machine_type is None and self.machine_type is not None:
+                self.observed_machine_type = self.machine_type
+            if self.observed_provisioning_mix is None and self.provisioning_mix is not None:
+                self.observed_provisioning_mix = self.provisioning_mix
         return self
 
 

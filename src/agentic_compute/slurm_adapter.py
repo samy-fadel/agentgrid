@@ -69,19 +69,55 @@ class SlurmRuntime(RuntimeAdapter):
         self.max_cost_eur = float(os.getenv("MAX_COST_EUR", "10.0"))
         self.minimize_cost = os.getenv("MINIMIZE_COST", "true").lower() in ("true", "1", "yes")
         self.baseline_workload_duration_minutes = float(os.getenv("BASELINE_WORKLOAD_DURATION_MINUTES", "25.0"))
-        self.machine_type = "c2-standard-60"
-        self.provisioning_mix = "100% Standard"
-        self.requested_cpu: int | None = None
-        self.requested_machine_type: str | None = None
-        self.requested_provisioning_mix: str | None = None
-        self.verification_status: str = "verified"
-        self.verification_detail: str | None = "Initial cluster allocation verified"
-        self.cost_basis: str = "observed_allocation"
-        self.job_status = "RUNNING"
-        self.job_failed = False
-        self.last_slurm_elapsed_secs: float | None = None
         self.active_job_id = job_id or os.getenv("SLURM_JOB_ID") or "1"
         self.reset()
+
+    def _validate_cluster_capabilities(
+        self,
+        machine_type: str | None,
+        provisioning_model: str | None,
+        action_name: str = "resize_workload",
+        cpu: int | None = None,
+    ) -> None:
+        """Shared capability validation for job submission and workload resizing."""
+        is_spot_requested = provisioning_model and (
+            "spot" in provisioning_model.lower() or "80%" in provisioning_model
+        )
+        is_unsupported_machine = (
+            machine_type is not None
+            and machine_type not in SUPPORTED_SLURM_MACHINE_TYPES
+        )
+
+        if is_spot_requested or is_unsupported_machine:
+            reason_parts = []
+            if is_spot_requested:
+                reason_parts.append(
+                    f"provisioning mix '{provisioning_model}' is unsupported on this Slurm cluster "
+                    f"(cluster only supports STANDARD on-demand nodesets: debug, compute, h3)"
+                )
+            if is_unsupported_machine:
+                reason_parts.append(
+                    f"machine type '{machine_type}' is unsupported "
+                    f"(cluster only supports: {', '.join(sorted(SUPPORTED_SLURM_MACHINE_TYPES))})"
+                )
+            detail = "Unsupported configuration on Slurm cluster: " + "; ".join(reason_parts)
+            self.verification_status = "unsupported"
+            self.verification_detail = detail
+            self.last_slurm_action = {
+                "action": action_name,
+                "job_id": self.active_job_id,
+                "requested_cpu": cpu,
+                "requested_machine_type": machine_type,
+                "requested_provisioning_mix": provisioning_model,
+                "observed_cpu": self.observed_cpu,
+                "observed_machine_type": self.observed_machine_type,
+                "observed_provisioning_mix": self.observed_provisioning_mix,
+                "status": "unsupported",
+                "verification_status": "unsupported",
+                "error": detail,
+                "timestamp": time.time(),
+            }
+            raise RuntimeError(detail)
 
     def reset(self) -> None:
         self.start_time = time.time()
@@ -91,19 +127,22 @@ class SlurmRuntime(RuntimeAdapter):
         self.remaining_work_units = 100.0
         self.accrued_cost_eur = 0.0
         self.job_done = False
-        self.job_status = "RUNNING"
+        self.job_status = "PENDING"
         self.job_failed = False
         self.is_real_slurm_job = False
         self.last_slurm_action = None
-        self.machine_type = "c2-standard-60"
-        self.provisioning_mix = "100% Standard"
-        self.requested_cpu = None
-        self.requested_machine_type = None
-        self.requested_provisioning_mix = None
-        self.verification_status = "verified"
-        self.verification_detail = "Initial cluster allocation verified"
-        self.cost_basis = "observed_allocation"
-        self.last_slurm_elapsed_secs = None
+        self.machine_type: str | None = None
+        self.provisioning_mix: str | None = None
+        self.requested_cpu: int | None = None
+        self.requested_machine_type: str | None = None
+        self.requested_provisioning_mix: str | None = None
+        self.observed_cpu: int | None = None
+        self.observed_machine_type: str | None = None
+        self.observed_provisioning_mix: str | None = None
+        self.verification_status: str = "unverified"
+        self.verification_detail: str | None = "Awaiting initial Slurm telemetry"
+        self.cost_basis: str = "unverified"
+        self.last_slurm_elapsed_secs: float | None = None
 
     def configure_objective(
         self,
@@ -179,9 +218,34 @@ class SlurmRuntime(RuntimeAdapter):
     ) -> dict[str, Any]:
         """Submit or initialize a new workload on the Slurm cluster with elastic parameters."""
         allocated_cpu = cpu if cpu is not None else int(os.getenv("INITIAL_WORKLOAD_CPU", "4"))
-        target_machine_type = machine_type or self.machine_type
-        target_provisioning_mix = provisioning_model or self.provisioning_mix
-        comment_str = f"machine_type={target_machine_type};provisioning_model={target_provisioning_mix}"
+        req_mtype = machine_type or self.machine_type
+        req_pmix = provisioning_model or self.provisioning_mix or "100% Standard"
+
+        # 1. Shared validation of cluster capabilities: reject unsupported machine types & Spot
+        self._validate_cluster_capabilities(
+            machine_type=req_mtype,
+            provisioning_model=req_pmix,
+            action_name="submit_job",
+            cpu=allocated_cpu,
+        )
+
+        # 2. Determine target partition
+        target_partition = partition
+        if not target_partition and req_mtype:
+            for part_name, part_info in SUPPORTED_SLURM_PARTITIONS.items():
+                if part_info["machine_type"] == req_mtype:
+                    target_partition = part_name
+                    break
+        if not target_partition:
+            if allocated_cpu <= 4:
+                target_partition = "debug"
+            elif allocated_cpu <= 600:
+                target_partition = "compute"
+            else:
+                target_partition = "h3"
+
+        part_mtype = SUPPORTED_SLURM_PARTITIONS.get(target_partition, {}).get("machine_type") if target_partition else None
+        comment_str = f"machine_type={req_mtype or part_mtype or 'unknown'};provisioning_model={req_pmix}"
 
         payload_job: dict[str, Any] = {
             "name": name,
@@ -190,13 +254,13 @@ class SlurmRuntime(RuntimeAdapter):
             "current_working_directory": "/tmp",
             "environment": ["PATH=/bin:/usr/bin:/usr/local/bin"],
             "script": script or "#!/bin/bash\nsleep 3600\n",
-            "features": target_machine_type,
-            "constraints": target_machine_type,
+            "partition": target_partition,
             "comment": comment_str,
             "admin_comment": comment_str,
         }
-        if partition:
-            payload_job["partition"] = partition
+        if req_mtype:
+            payload_job["features"] = req_mtype
+            payload_job["constraints"] = req_mtype
         if memory_mb:
             payload_job["memory_per_node"] = memory_mb
         if gpu > 0:
@@ -233,34 +297,59 @@ class SlurmRuntime(RuntimeAdapter):
         self.active_job_id = submitted_id
         self.allocated_cpu = allocated_cpu
         self.allocated_gpu = gpu
-        self.machine_type = target_machine_type
-        self.provisioning_mix = target_provisioning_mix
         self.requested_cpu = allocated_cpu
-        self.requested_machine_type = target_machine_type
-        self.requested_provisioning_mix = target_provisioning_mix
-        self.verification_status = "verified"
-        self.verification_detail = f"Job submitted and registered on Slurm cluster (partition: {partition or 'default'})"
-        self.cost_basis = "observed_allocation"
+        self.requested_machine_type = req_mtype
+        self.requested_provisioning_mix = req_pmix
+        # Keep observed machine type and provisioning unknown until telemetry observation
+        self.machine_type = None
+        self.provisioning_mix = None
+        self.observed_cpu = None
+        self.observed_machine_type = None
+        self.observed_provisioning_mix = None
+        self.verification_status = "pending_verification"
+        self.verification_detail = (
+            f"Job {submitted_id} submitted to partition '{target_partition}'; pending verification from Slurm telemetry"
+        )
+        self.cost_basis = "unverified"
         self.remaining_work_units = 100.0
         self.elapsed_minutes = 0.0
         self.accrued_cost_eur = 0.0
         self.job_done = False
-        self.job_status = "RUNNING"
+        self.job_status = "PENDING"
         self.job_failed = False
         self.last_slurm_elapsed_secs = None
         self.is_real_slurm_job = not submitted_id.startswith("mock-")
+
+        self.last_slurm_action = {
+            "action": "submit_job",
+            "job_id": self.active_job_id,
+            "requested_cpu": allocated_cpu,
+            "requested_machine_type": req_mtype,
+            "requested_provisioning_mix": req_pmix,
+            "observed_cpu": None,
+            "observed_machine_type": None,
+            "observed_provisioning_mix": None,
+            "status": "pending_verification",
+            "verification_status": "pending_verification",
+            "timestamp": time.time(),
+        }
 
         return {
             "job_id": self.active_job_id,
             "allocated_cpu": self.allocated_cpu,
             "allocated_gpu": self.allocated_gpu,
-            "partition": partition,
+            "partition": target_partition,
             "machine_type": self.machine_type,
+            "requested_machine_type": self.requested_machine_type,
             "provisioning_mix": self.provisioning_mix,
+            "requested_provisioning_mix": self.requested_provisioning_mix,
+            "verification_status": self.verification_status,
             "is_real_slurm_job": self.is_real_slurm_job,
         }
 
     def _get_cost_factor(self) -> float:
+        if not self.provisioning_mix:
+            return 1.0
         if "80% Spot" in self.provisioning_mix:
             return 0.48
         elif "Spot" in self.provisioning_mix or "SPOT" in self.provisioning_mix:
@@ -274,31 +363,85 @@ class SlurmRuntime(RuntimeAdapter):
         res = job.get("job_resources", {})
         if isinstance(res, dict) and res.get("allocated_cpus") is not None:
             self.allocated_cpu = int(res["allocated_cpus"])
+            self.observed_cpu = int(res["allocated_cpus"])
+        elif "cpus_per_task" in job and job.get("cpus_per_task") is not None:
+            self.allocated_cpu = int(job["cpus_per_task"])
+            self.observed_cpu = int(job["cpus_per_task"])
 
-        # Check partition to sync observed machine_type and provisioning
+        # Check partition to independently observe machine_type and provisioning
         job_part = job.get("partition")
+        observed_machine_type = None
+        observed_provisioning = None
         if job_part and job_part in SUPPORTED_SLURM_PARTITIONS:
-            self.machine_type = SUPPORTED_SLURM_PARTITIONS[job_part]["machine_type"]
-            self.provisioning_mix = SUPPORTED_SLURM_PARTITIONS[job_part]["provisioning"]
+            observed_machine_type = SUPPORTED_SLURM_PARTITIONS[job_part]["machine_type"]
+            observed_provisioning = SUPPORTED_SLURM_PARTITIONS[job_part]["provisioning"]
 
-        # Confirm pending verification if authoritative Slurm observation matches requested allocation
-        if self.verification_status == "pending_verification":
-            cpu_matched = (self.requested_cpu is None or self.allocated_cpu == self.requested_cpu)
-            if cpu_matched:
+        # Strictly record independent observations - NEVER overwrite with requested values!
+        self.machine_type = observed_machine_type
+        self.observed_machine_type = observed_machine_type
+        self.provisioning_mix = observed_provisioning
+        self.observed_provisioning_mix = observed_provisioning
+
+        # Independent verification check against every requested property
+        has_pending_request = (
+            self.verification_status == "pending_verification"
+            or self.requested_cpu is not None
+            or self.requested_machine_type is not None
+            or self.requested_provisioning_mix is not None
+        )
+
+        if has_pending_request:
+            mismatches = []
+            if self.requested_cpu is not None and self.allocated_cpu != self.requested_cpu:
+                mismatches.append(
+                    f"CPU mismatch (requested {self.requested_cpu}, observed {self.allocated_cpu})"
+                )
+            if self.requested_machine_type is not None and self.machine_type != self.requested_machine_type:
+                mismatches.append(
+                    f"machine type mismatch (requested '{self.requested_machine_type}', "
+                    f"observed '{self.machine_type}' from partition '{job_part}')"
+                )
+            if (
+                self.requested_provisioning_mix is not None
+                and self.provisioning_mix != self.requested_provisioning_mix
+            ):
+                mismatches.append(
+                    f"provisioning mix mismatch (requested '{self.requested_provisioning_mix}', "
+                    f"observed '{self.provisioning_mix}')"
+                )
+
+            if not mismatches:
                 self.verification_status = "verified"
                 self.verification_detail = (
-                    f"Observed authoritative allocation from Slurm controller ({self.allocated_cpu} CPUs)"
+                    f"Observed authoritative allocation from Slurm controller: "
+                    f"{self.allocated_cpu} CPUs, {self.machine_type}, {self.provisioning_mix} (partition: {job_part})"
                 )
-                if self.requested_machine_type:
-                    self.machine_type = self.requested_machine_type
-                if self.requested_provisioning_mix:
-                    self.provisioning_mix = self.requested_provisioning_mix
+                self.cost_basis = "observed_allocation"
                 if self.last_slurm_action:
                     self.last_slurm_action["status"] = "applied"
                     self.last_slurm_action["verification_status"] = "verified"
                     self.last_slurm_action["observed_cpu"] = self.allocated_cpu
                     self.last_slurm_action["observed_machine_type"] = self.machine_type
                     self.last_slurm_action["observed_provisioning_mix"] = self.provisioning_mix
+            else:
+                self.verification_status = "mismatch"
+                detail = "Allocation mismatch: " + "; ".join(mismatches)
+                self.verification_detail = detail
+                self.cost_basis = "observed_allocation"
+                if self.last_slurm_action:
+                    self.last_slurm_action["status"] = "mismatch"
+                    self.last_slurm_action["verification_status"] = "mismatch"
+                    self.last_slurm_action["observed_cpu"] = self.allocated_cpu
+                    self.last_slurm_action["observed_machine_type"] = self.machine_type
+                    self.last_slurm_action["observed_provisioning_mix"] = self.provisioning_mix
+                    self.last_slurm_action["error"] = detail
+        else:
+            self.verification_status = "verified"
+            self.verification_detail = (
+                f"Observed authoritative allocation from Slurm controller: "
+                f"{self.allocated_cpu} CPUs, {self.machine_type}, {self.provisioning_mix} (partition: {job_part})"
+            )
+            self.cost_basis = "observed_allocation"
 
         # 2. Synchronize elapsed time and accrue cost for delta elapsed seconds
         time_info = job.get("time", {})
@@ -451,9 +594,9 @@ class SlurmRuntime(RuntimeAdapter):
                 requested_cpu=self.requested_cpu,
                 requested_machine_type=self.requested_machine_type,
                 requested_provisioning_mix=self.requested_provisioning_mix,
-                observed_cpu=self.allocated_cpu,
-                observed_machine_type=self.machine_type,
-                observed_provisioning_mix=self.provisioning_mix,
+                observed_cpu=self.observed_cpu,
+                observed_machine_type=self.observed_machine_type,
+                observed_provisioning_mix=self.observed_provisioning_mix,
                 verification_status=self.verification_status,
                 verification_detail=self.verification_detail,
                 cost_basis=self.cost_basis,
@@ -474,46 +617,23 @@ class SlurmRuntime(RuntimeAdapter):
 
         target_cpu = action.cpu
         target_machine_type = action.machine_type or self.machine_type
-        target_provisioning_mix = action.provisioning_model or self.provisioning_mix
+        target_provisioning_mix = action.provisioning_model or self.provisioning_mix or "100% Standard"
 
-        # 1. Validation of cluster capabilities:
-        # Check if requested configuration is supported on this Slurm cluster
-        is_spot_requested = target_provisioning_mix and (
-            "spot" in target_provisioning_mix.lower() or "80%" in target_provisioning_mix
-        )
-        is_unsupported_machine = (
-            action.machine_type is not None
-            and action.machine_type not in SUPPORTED_SLURM_MACHINE_TYPES
-        )
+        if not target_machine_type:
+            if target_cpu <= 4:
+                target_machine_type = "n2-standard-2"
+            elif target_cpu <= 600:
+                target_machine_type = "c2-standard-60"
+            else:
+                target_machine_type = "h3-standard-88"
 
-        if is_spot_requested or is_unsupported_machine:
-            reason_parts = []
-            if is_spot_requested:
-                reason_parts.append(
-                    f"provisioning mix '{target_provisioning_mix}' is unsupported on this Slurm cluster (cluster only supports STANDARD on-demand nodesets: debug, compute, h3)"
-                )
-            if is_unsupported_machine:
-                reason_parts.append(
-                    f"machine type '{target_machine_type}' is unsupported (cluster only supports: {', '.join(sorted(SUPPORTED_SLURM_MACHINE_TYPES))})"
-                )
-            detail = "Unsupported configuration on Slurm cluster: " + "; ".join(reason_parts)
-            self.verification_status = "unsupported"
-            self.verification_detail = detail
-            self.last_slurm_action = {
-                "action": action.action,
-                "job_id": self.active_job_id,
-                "requested_cpu": target_cpu,
-                "requested_machine_type": target_machine_type,
-                "requested_provisioning_mix": target_provisioning_mix,
-                "observed_cpu": self.allocated_cpu,
-                "observed_machine_type": self.machine_type,
-                "observed_provisioning_mix": self.provisioning_mix,
-                "status": "unsupported",
-                "verification_status": "unsupported",
-                "error": detail,
-                "timestamp": time.time(),
-            }
-            raise RuntimeError(detail)
+        # 1. Validation of cluster capabilities (shared with submit_job):
+        self._validate_cluster_capabilities(
+            machine_type=action.machine_type or target_machine_type,
+            provisioning_model=action.provisioning_model or target_provisioning_mix,
+            action_name=action.action,
+            cpu=target_cpu,
+        )
 
         # 2. Check active workload state:
         # Running Slurm jobs cannot be hot-resized without interruption
@@ -530,9 +650,9 @@ class SlurmRuntime(RuntimeAdapter):
                 "requested_cpu": target_cpu,
                 "requested_machine_type": target_machine_type,
                 "requested_provisioning_mix": target_provisioning_mix,
-                "observed_cpu": self.allocated_cpu,
-                "observed_machine_type": self.machine_type,
-                "observed_provisioning_mix": self.provisioning_mix,
+                "observed_cpu": self.observed_cpu,
+                "observed_machine_type": self.observed_machine_type,
+                "observed_provisioning_mix": self.observed_provisioning_mix,
                 "status": "unsupported",
                 "verification_status": "unsupported",
                 "error": detail,
@@ -587,9 +707,9 @@ class SlurmRuntime(RuntimeAdapter):
                 "requested_cpu": target_cpu,
                 "requested_machine_type": target_machine_type,
                 "requested_provisioning_mix": target_provisioning_mix,
-                "observed_cpu": self.allocated_cpu,
-                "observed_machine_type": self.machine_type,
-                "observed_provisioning_mix": self.provisioning_mix,
+                "observed_cpu": self.observed_cpu,
+                "observed_machine_type": self.observed_machine_type,
+                "observed_provisioning_mix": self.observed_provisioning_mix,
                 "status_code": status_code,
                 "status": "pending_verification",
                 "verification_status": "pending_verification",
@@ -602,9 +722,9 @@ class SlurmRuntime(RuntimeAdapter):
                 "requested_cpu": target_cpu,
                 "requested_machine_type": target_machine_type,
                 "requested_provisioning_mix": target_provisioning_mix,
-                "observed_cpu": self.allocated_cpu,
-                "observed_machine_type": self.machine_type,
-                "observed_provisioning_mix": self.provisioning_mix,
+                "observed_cpu": self.observed_cpu,
+                "observed_machine_type": self.observed_machine_type,
+                "observed_provisioning_mix": self.observed_provisioning_mix,
                 "status_code": status_code or 200,
                 "status": "pending_verification",
                 "verification_status": "pending_verification",
@@ -621,9 +741,9 @@ class SlurmRuntime(RuntimeAdapter):
                 "requested_cpu": target_cpu,
                 "requested_machine_type": target_machine_type,
                 "requested_provisioning_mix": target_provisioning_mix,
-                "observed_cpu": self.allocated_cpu,
-                "observed_machine_type": self.machine_type,
-                "observed_provisioning_mix": self.provisioning_mix,
+                "observed_cpu": self.observed_cpu,
+                "observed_machine_type": self.observed_machine_type,
+                "observed_provisioning_mix": self.observed_provisioning_mix,
                 "status_code": status_code,
                 "status": "failed",
                 "verification_status": "failed",

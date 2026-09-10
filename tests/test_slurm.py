@@ -548,4 +548,120 @@ def test_slurm_cost_accrual_strictly_depends_on_observed_allocation(monkeypatch)
     assert runtime.snapshot().workload.cost_basis == "observed_allocation"
 
 
+def test_slurm_initial_startup_is_unverified_with_unknown_properties(monkeypatch):
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"jobs": []}})(),
+    )
+    runtime = SlurmRuntime(job_id="906")
+    assert runtime.verification_status == "unverified"
+    assert runtime.cost_basis == "unverified"
+    assert runtime.machine_type is None
+    assert runtime.provisioning_mix is None
+    assert runtime.observed_machine_type is None
+    assert runtime.observed_provisioning_mix is None
+
+    snap = runtime.snapshot()
+    assert snap.workload.verification_status == "unverified"
+    assert snap.workload.cost_basis == "unverified"
+    assert snap.workload.machine_type is None
+    assert snap.workload.observed_machine_type is None
+
+
+def test_slurm_machine_type_mismatch_detected_and_never_overwrites_observed(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
+    )
+    runtime = SlurmRuntime(job_id="907")
+    runtime.job_status = "PENDING"
+
+    # User scenario: Request 60 CPU on h3-standard-88
+    action = Action(
+        action="resize_workload",
+        workload_id="907",
+        cpu=60,
+        machine_type="h3-standard-88",
+        provisioning_model="100% Standard",
+        reason="request h3 machine type with 60 cpus",
+    )
+    runtime.apply(action)
+    assert runtime.verification_status == "pending_verification"
+    assert runtime.last_slurm_action["status"] == "pending_verification"
+    assert runtime.requested_machine_type == "h3-standard-88"
+    assert runtime.requested_cpu == 60
+
+    # Slurm controller responds with 60 CPU on partition compute (c2-standard-60)
+    runtime._sync_job_state({
+        "job_id": 907,
+        "job_state": ["RUNNING"],
+        "job_resources": {"allocated_cpus": 60},
+        "partition": "compute",
+    })
+
+    # Verification must flag mismatch: observed machine is c2-standard-60, NOT h3-standard-88
+    assert runtime.machine_type == "c2-standard-60"
+    assert runtime.observed_machine_type == "c2-standard-60"
+    assert runtime.verification_status == "mismatch"
+    assert runtime.last_slurm_action["status"] == "mismatch"
+    assert "machine type mismatch" in runtime.verification_detail
+    assert "requested 'h3-standard-88'" in runtime.verification_detail
+    assert "observed 'c2-standard-60'" in runtime.verification_detail
+
+    snap = runtime.snapshot()
+    assert snap.workload.machine_type == "c2-standard-60"
+    assert snap.workload.observed_machine_type == "c2-standard-60"
+    assert snap.workload.verification_status == "mismatch"
+
+
+def test_slurm_submit_job_shares_capability_validation_and_rejects_unsupported(monkeypatch):
+    runtime = SlurmRuntime()
+
+    # 1. Reject N4 on submit
+    with pytest.raises(RuntimeError, match="machine type 'n4-standard-64' is unsupported"):
+        runtime.submit_job(name="n4-job", cpu=64, machine_type="n4-standard-64")
+    assert runtime.verification_status == "unsupported"
+    assert runtime.last_slurm_action["status"] == "unsupported"
+
+    # 2. Reject Spot on submit
+    with pytest.raises(RuntimeError, match="provisioning mix '100% Spot' is unsupported"):
+        runtime.submit_job(name="spot-job", cpu=32, provisioning_model="100% Spot")
+    assert runtime.verification_status == "unsupported"
+    assert runtime.last_slurm_action["status"] == "unsupported"
+
+    # 3. Reject N4 + Spot combined on submit
+    with pytest.raises(RuntimeError, match="Unsupported configuration on Slurm cluster"):
+        runtime.submit_job(name="n4-spot-job", cpu=64, machine_type="n4-standard-64", provisioning_model="100% Spot")
+    assert runtime.verification_status == "unsupported"
+    assert runtime.last_slurm_action["status"] == "unsupported"
+
+
+def test_slurm_submit_job_remains_pending_verification_until_observed(monkeypatch):
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {"job_id": "999"}})(),
+    )
+    runtime = SlurmRuntime()
+    res = runtime.submit_job(name="valid-job", cpu=60, machine_type="c2-standard-60", provisioning_model="100% Standard")
+
+    assert res["job_id"] == "999"
+    assert res["verification_status"] == "pending_verification"
+    assert runtime.verification_status == "pending_verification"
+    assert runtime.cost_basis == "unverified"
+    assert runtime.machine_type is None
+    assert runtime.observed_machine_type is None
+
+    # Telemetry arrives from Slurm
+    runtime._sync_job_state({
+        "job_id": "999",
+        "job_resources": {"allocated_cpus": 60},
+        "partition": "compute",
+    })
+    assert runtime.verification_status == "verified"
+    assert runtime.machine_type == "c2-standard-60"
+    assert runtime.observed_machine_type == "c2-standard-60"
+    assert runtime.last_slurm_action["status"] == "applied"
+
+
+
 

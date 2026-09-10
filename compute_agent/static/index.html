@@ -580,17 +580,25 @@
                     <span className="text-emerald-400 font-bold">{workload.allocated_cpu} cpus_per_task</span>
                   </div>
                   <div className="flex justify-between">
+                    <span className="text-slate-400">Observed Machine:</span>
+                    <span className="text-slate-200">{workload.observed_machine_type || workload.machine_type || 'Unknown (unverified)'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Observed Provisioning:</span>
+                    <span className="text-slate-200">{workload.observed_provisioning_mix || workload.provisioning_mix || 'Unknown (unverified)'}</span>
+                  </div>
+                  <div className="flex justify-between">
                     <span className="text-slate-400">Verification Status:</span>
                     <span className={
                       workload.verification_status === 'verified'
                         ? "text-emerald-400 font-bold"
                         : (workload.verification_status === 'pending_verification'
                             ? "text-amber-400 font-bold"
-                            : (workload.verification_status === 'unsupported'
+                            : (workload.verification_status === 'unsupported' || workload.verification_status === 'mismatch'
                                 ? "text-rose-400 font-bold"
-                                : "text-slate-300 font-bold"))
+                                : "text-slate-400 font-bold"))
                     }>
-                      {workload.verification_status ? workload.verification_status.toUpperCase().replace('_', ' ') : 'VERIFIED'}
+                      {workload.verification_status ? workload.verification_status.toUpperCase().replace('_', ' ') : 'UNVERIFIED'}
                     </span>
                   </div>
                   {workload.verification_detail && (
@@ -601,20 +609,22 @@
                   <div className="flex justify-between">
                     <span className="text-slate-400">Cost Basis:</span>
                     <span className="text-cyan-400 font-mono text-[11px]">
-                      {workload.cost_basis || 'observed_allocation'}
+                      {workload.cost_basis || 'unverified'}
                     </span>
                   </div>
                   {slurmVerification && (
                     <div className="flex justify-between border-t border-slate-900 pt-1.5">
                       <span className="text-slate-400">Last Slurm Action Receipt:</span>
-                      <span className={slurmVerification.status === 'failed' || slurmVerification.status === 'unsupported' ? "text-rose-400 font-bold" : (slurmVerification.status === 'pending_verification' ? "text-amber-400 font-bold" : "text-emerald-400 font-bold")}>
+                      <span className={slurmVerification.status === 'failed' || slurmVerification.status === 'unsupported' || slurmVerification.status === 'mismatch' ? "text-rose-400 font-bold" : (slurmVerification.status === 'pending_verification' ? "text-amber-400 font-bold" : "text-emerald-400 font-bold")}>
                         {slurmVerification.status === 'failed'
                           ? `FAILED (${slurmVerification.status_code || 500})`
                           : (slurmVerification.status === 'unsupported'
                               ? `UNSUPPORTED`
-                              : (slurmVerification.status === 'pending_verification'
-                                  ? `PENDING VERIFICATION`
-                                  : `APPLIED (HTTP ${slurmVerification.status_code || 200})`))}
+                              : (slurmVerification.status === 'mismatch'
+                                  ? `MISMATCH`
+                                  : (slurmVerification.status === 'pending_verification'
+                                      ? `PENDING VERIFICATION`
+                                      : `APPLIED (HTTP ${slurmVerification.status_code || 200})`)))}
                       </span>
                     </div>
                   )}
