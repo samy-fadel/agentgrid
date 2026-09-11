@@ -634,30 +634,59 @@ def track_workload_lifecycle(
     workload_id: str,
     progress_percent: float | None = None,
     job_state: str | None = None,
-    elapsed_minutes: float = 0.0,
-    cost_incurred_eur: float = 0.0,
+    # None, not 0.0: a status query that carries no figure must not overwrite the
+    # recorded cost and duration with zeros.
+    elapsed_minutes: float | None = None,
+    cost_incurred_eur: float | None = None,
 ) -> dict:
     """Track workload state transitions, attempts, and observable progress.
 
     Reports progress percent if measured, or explicitly 'unavailable' if unmeasured.
     Handles checkpoint recovery when supported and enforces bounded retry limits.
     """
-    if workload_id not in default_lifecycle_manager._workloads:
-        default_lifecycle_manager.register_workload({"workload_id": workload_id})
+    # This used to call register_workload() for any workload missing from process
+    # memory. After a restart that meant rebuilding an empty record on top of a
+    # real run and then persisting it: a completed workload lost its cost, its
+    # attempts and its final status. Storage is consulted instead, and a
+    # genuinely unknown workload is reported as unknown.
+    try:
+        default_lifecycle_manager._require(workload_id)
+    except KeyError:
+        return {
+            "workload_id": workload_id,
+            "status": "unknown_workload",
+            "reason": (
+                f"No workload '{workload_id}' is registered or persisted. Define it "
+                "before tracking it; inventing one here would overwrite nothing "
+                "useful and hide the mistake."
+            ),
+        }
+
     rec = default_lifecycle_manager.update_progress(
         workload_id=workload_id,
         progress_percent=progress_percent,
         job_state=job_state,
         elapsed_minutes=elapsed_minutes,
         cost_incurred_eur=cost_incurred_eur,
+        # Whatever arrives through this tool was stated by the caller -- often a
+        # language model. A stated figure is recorded but never labelled as an
+        # observation; the runtime is the only source of a measured cost.
+        metrics_source="caller_declared",
     )
     return {
         "workload_id": workload_id,
+        "status": "tracked",
         "state": rec["state"],
         "progress_percent": rec["progress_percent"],
         "progress_status": rec["progress_status"],
         "total_calculated_cost_eur": rec["total_calculated_cost_eur"],
         "total_elapsed_minutes": rec["total_elapsed_minutes"],
+        "metrics_source": rec.get("metrics_source", "caller_declared"),
+        "metrics_caveat": (
+            "Figures passed to this tool are declared by the caller, not measured. "
+            "They are stored with cost_status='estimated'. Only the runtime adapter "
+            "produces a cost labelled calculated_from_usage."
+        ),
     }
 
 

@@ -162,7 +162,8 @@ $$S = \frac{\text{Deadline} - \text{Elapsed Time}}{\text{Estimated Remaining Tim
 
 ## Six Core Product Capabilities
 
-AgentGrid delivers an end-to-end autonomous compute control plane governed by operator control policies:
+AgentGrid delivers an end-to-end compute control plane whose every mutation is governed by an
+operator control mode. The mode is held by the server; a caller cannot grant itself permission.
 
 ### 1. Recherche de capacité compatible (Multi-Stage Capacity Search)
 * **4-Stage Sourcing Lifecycle**:
@@ -199,13 +200,25 @@ Structured taxonomy classifying execution impediments into:
   * **Delegation (`delegation`)**: Autonomous execution strictly bounded by `DelegationPolicy` guardrails (max budget ceiling, allowed machine types, allowed regions, allowed provisioning models).
 * **Execution Safety**:
   * **Ordered Fallback Ladder**: Automatic failover (e.g., Spot → Standard On-Demand) when stockouts occur, staying within remaining budget.
-  * **Idempotent Anti-Duplicate Submission**: Re-checks cluster job registry before submitting to prevent duplicate jobs on network timeouts.
+  * **Idempotent Anti-Duplicate Submission**: A submission is claimed in a persistent SQLite
+    ledger, keyed by workload and plan fingerprint, *before* the runtime is touched. The claim
+    is the primary key itself, so a double click, a replayed HTTP request or a process restart
+    resolves to the same job id instead of creating a second job. An ambiguous timeout is
+    resolved by looking up that identity, not by guessing.
   * **Safe Downscaling**: Automatically releases temporary allocations and resizes cluster to baseline upon completion or cancellation.
 
 ### 5. Suivi et reprise (Lifecycle Management & Resumption)
 * **Lifecycle States**: `DEFINED` → `PLANNING` → `READY_FOR_APPROVAL` → `SUBMITTING` → `QUEUED` → `RUNNING` → `COMPLETED` / `PREEMPTED` / `FAILED` / `CANCELLED`.
-* **Observable Progress**: Reports verified percent (0–100%) when measured; explicitly reports `"unavailable"` when unmeasured (zero simulated or fabricated progress numbers).
-* **Checkpoint Resumption vs. Full Restart**: Resumes from latest checkpoint if `supports_checkpointing=True` and updates remaining duration; mandates restart from 0% if unsupported.
+* **Observable Progress**: Three states, never conflated — `measured` (read from the runtime),
+  `declared_unverified` (a figure someone stated, including the language model through the MCP
+  tools) and `unavailable`. A declared cost is stored with `cost_status="estimated"`; only the
+  runtime adapter produces `calculated_from_usage`.
+* **Checkpoint Resumption vs. Full Restart**: The checkpoint location is *inspected* before a
+  resume is promised. A local path is read; a `gs://` URI is listed when the GCS client is
+  available. Three outcomes are distinguished — `verified_present`, `verified_absent` and
+  `unverified` — and a retry only records a recovery against a checkpoint verified present.
+  A workload with previous attempts and a demonstrably empty location is told it restarts
+  from 0% rather than being promised a resume that does not exist.
 * **Bounded Retries**: Enforces strict `max_retries` ceiling to protect operator budget from runaway crash loops.
 
 ### 6. Coût réel, historique et comparaison aux estimations (3-Tier Cost Reconciliation)
@@ -215,6 +228,24 @@ Structured taxonomy classifying execution impediments into:
   2. `calculated_from_usage_eur`: Actual elapsed node-hours × verified VM rates.
   3. `reconciled_billed_cost_eur`: Verified GCP Cloud Billing export (explicitly flagged when not integrated).
 * **Continuous Benchmark Calibration**: Aggregates verified work-unit execution rates and interruption frequencies into a self-calibrating benchmark table.
+
+
+## What is verified, and what is not
+
+Being precise about this matters more than the feature list. As of the current commit:
+
+| Area | Status | How it was checked |
+| :--- | :--- | :--- |
+| Governance (advisory / validation / delegation), plan registration, fingerprint-bound approval, idempotent submission | **Verified** | `tests/test_http_journey.py`, `tests/test_mcp_http_governance.py`, plus a full journey run with `curl` against a live server |
+| Plan comparison, infeasibility explanations, constraint rejection | **Verified** | `tests/test_evolved_capabilities.py`, `tests/test_agentgrid_evolutions.py` |
+| Location constraints and quota staging | **Verified** | `tests/test_capacity_location_constraints.py` |
+| Lifecycle, checkpoint verification, cost accounting across attempts and restarts | **Verified** | `tests/test_checkpoint_verification.py`, `tests/test_cost_accounting_journey.py` |
+| GCP quota read | **Exercised against the real API** | a live `/api/capacity-search` returned `data_provenance: gcp_live_api` with a genuine `QUOTA_EXCEEDED` |
+| Execution | **Simulator only** | no VM has been provisioned by this project's test runs |
+| Slurm adapter | **Mocked HTTP only** | `tests/test_slurm.py`, `tests/test_slurm_telemetry_defects.py` drive stubbed `slurmrestd` responses. **Not validated against a real cluster.** |
+| Dashboard | **Compiled and rendered offline, not opened in a browser** | `tools/check_jsx.py`, `tools/render_check.py`. CSS, layout and real event dispatch are **not** covered. |
+| `gs://` checkpoints | **Not verifiable in the reference environment** | `google-cloud-storage` is not installed; the result is reported as `unverified`, never as present |
+| Multi-tenant authentication | **Out of scope** | governance works without it, but there is no user identity model |
 
 
 ## Supported Compute Runtimes
@@ -265,7 +296,45 @@ GOOGLE_CLOUD_LOCATION=us-central1
 AGENTIC_COMPUTE_MODEL=gemini-2.5-flash
 ```
 
-### 3. Run the Agent Locally
+### 3. Run the control plane and the dashboard
+
+The API and the operator dashboard are one FastAPI application. It needs **no
+cloud credentials** to start: capacity search, plan comparison, diagnostics,
+governance, execution against the simulator, lifecycle tracking and history all
+work offline. Credentials only affect the live GCP quota lookup, the Capacity
+Advisor signal and the LLM-driven `/optimize` endpoints.
+
+```bash
+# from the repository root, with the environment installed as above
+PORT=8080 python3 -m compute_agent.app
+```
+
+Then open `http://localhost:8080/ui` for the dashboard.
+
+> `/` performs content negotiation: a browser (`Accept: text/html`) receives the
+> dashboard, any other client receives service metadata as JSON. `/ui` and
+> `/dashboard` always return the dashboard.
+
+Useful checks:
+
+```bash
+curl -s localhost:8080/health
+curl -s -X POST localhost:8080/api/capacity-search \
+  -H 'Content-Type: application/json' \
+  -d '{"cpu_requested": 8, "allowed_regions": ["europe-west4"]}'
+curl -s -X POST localhost:8080/api/plans/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"workload_profile": {"workload_id": "wl-demo", "cpu_requested": 8,
+       "memory_mb_requested": 16384, "estimated_duration_minutes": 60,
+       "budget_amount": 500}}'
+```
+
+> An unknown key in `workload_profile` is rejected with HTTP 400 naming the
+> field. This is deliberate: a misspelled `budget_eur` used to be dropped
+> silently, and the answer came back "feasible" without the budget ever having
+> been considered.
+
+### 4. Run the ADK playground (optional, requires Gemini credentials)
 
 Launch the ADK graphical playground:
 
@@ -283,11 +352,20 @@ Or run directly from the CLI:
 adk run compute_agent
 ```
 
-Run unit and contract tests:
+### 5. Tests and the offline dashboard gate
 
 ```bash
-PYTHONPATH=".:src" pytest -v
+pytest -q                       # pythonpath is configured in pyproject.toml
+python3 tools/check_jsx.py      # parses the dashboard's JSX offline
+python3 tools/render_check.py   # renders every tab in duktape and reports errors
 ```
+
+`check_jsx.py` and `render_check.py` exist because there is no Node.js and no
+browser in the reference development environment. They transpile the dashboard
+with the TypeScript compiler bundled in `dukpy` and execute it against a minimal
+React stub. They catch syntax errors, undefined references at render time and
+tabs that render nothing. **They are not a browser**: CSS, layout, real event
+dispatch and network behaviour are not covered by them.
 
 ---
 
@@ -375,7 +453,9 @@ AgentGrid delivers 6 core operational capabilities for intelligent compute manag
    - Safe downscaling protecting active compute nodes from termination.
 5. **Suivi du cycle de vie et reprise** (`track_workload_lifecycle`, `LifecycleManager`):
    - Clean separation between compute identity (`workload_id`) and attempt history (`attempt_id`).
-   - Automated checkpoint resumption from cloud storage URIs for interruptible workloads.
+   - Checkpoint resumption is granted only against a checkpoint that was actually inspected;
+     a location that cannot be read is reported as `unverified` and the resume is declared
+     unproven rather than promised.
    - Strict rejection of inconsistent partial resumptions for non-interruptible workloads.
 6. **Coûts réels, historique persistant et étalonnage** (`get_cost_history`, `HistoryStore`):
    - Persistent disk storage (SQLite / JSON) surviving application restarts.

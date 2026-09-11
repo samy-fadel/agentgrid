@@ -31,6 +31,11 @@ dependencies = [
 dev = [
   "pytest>=8.0",
   "ruff>=0.8",
+  # fastapi.testclient / starlette.testclient import httpx at module import time.
+  "httpx>=0.27",
+  # tools/check_jsx.py and tools/render_check.py transpile and execute the
+  # dashboard offline; dukpy ships the TypeScript compiler they drive.
+  "dukpy>=0.3",
 ]
 
 [project.scripts]

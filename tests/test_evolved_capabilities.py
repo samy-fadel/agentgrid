@@ -545,7 +545,11 @@ def test_scenario_10_interruption_checkpoint_resume_and_non_interruptible_reject
             estimated_cost_eur=8.0,
         )
 
-        # 1. Interruptible workload with checkpointing
+        # 1a. Interruptible workload whose checkpoint location cannot be inspected
+        # from here (no GCS client). The old behaviour was to synthesise
+        # "<location>/step_latest" and record it as a recovery, so the attempt
+        # history claimed progress that nothing supported. The honest answer is
+        # that the resume is unproven and no recovery is recorded.
         ckpt_profile = WorkloadProfile(
             workload_id="wl-ckpt-ok",
             is_interruptible=True,
@@ -560,10 +564,37 @@ def test_scenario_10_interruption_checkpoint_resume_and_non_interruptible_reject
         assert can_resume is True
         assert "checkpoints/wl-ckpt-ok" in msg
 
-        # Resumed attempt recovers checkpoint URI
+        evidence = mgr.verify_checkpoint("wl-ckpt-ok")
         att2 = mgr.start_attempt(workload_id="wl-ckpt-ok", plan=plan, job_id="job-2")
-        assert att2.checkpoint_recovered_from is not None
-        assert "checkpoints/wl-ckpt-ok" in att2.checkpoint_recovered_from
+        if evidence["verification"] == "verified_present":
+            assert att2.checkpoint_recovered_from == "gs://bucket/checkpoints/wl-ckpt-ok"
+        else:
+            assert att2.checkpoint_recovered_from is None, (
+                "an unverifiable checkpoint must not be recorded as a recovery"
+            )
+            assert "could NOT be verified" in msg
+
+        # 1b. A checkpoint that genuinely exists does produce a recorded recovery.
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            local_profile = WorkloadProfile(
+                workload_id="wl-ckpt-local",
+                is_interruptible=True,
+                supports_checkpointing=True,
+                checkpoint_location=ckpt_dir,
+            )
+            mgr.register_workload(local_profile)
+            mgr.start_attempt(workload_id="wl-ckpt-local", plan=plan, job_id="job-l1")
+            mgr.finish_attempt(
+                workload_id="wl-ckpt-local", final_status="PREEMPTED", failure_reason="Spot preemption"
+            )
+            with open(os.path.join(ckpt_dir, "step_000042.pt"), "wb") as ckpt:
+                ckpt.write(b"state")
+
+            resumable, local_msg = mgr.can_resume_from_checkpoint("wl-ckpt-local")
+            assert resumable is True
+            assert "verified" in local_msg.lower()
+            att_local = mgr.start_attempt(workload_id="wl-ckpt-local", plan=plan, job_id="job-l2")
+            assert att_local.checkpoint_recovered_from == ckpt_dir
 
         # 2. Non-interruptible workload
         non_int_profile = WorkloadProfile(

@@ -27,12 +27,19 @@ def isolated_agentgrid_state(tmp_path, monkeypatch):
 
     history = importlib.import_module("agentic_compute.history")
     governance = importlib.import_module("agentic_compute.governance")
+    lifecycle = importlib.import_module("agentic_compute.lifecycle_manager")
 
     # Drop cached singletons so they re-open against the new path.
     history._history_store = None
     governance.reset_governance_store()
+    # The module-level manager also caches workloads in memory. Left in place,
+    # a workload registered by an earlier test stays visible after the database
+    # has been swapped, and a test could pass on stale memory instead of on
+    # persisted state.
+    lifecycle.default_lifecycle_manager._workloads.clear()
 
     yield db_path
 
     history._history_store = None
     governance.reset_governance_store()
+    lifecycle.default_lifecycle_manager._workloads.clear()

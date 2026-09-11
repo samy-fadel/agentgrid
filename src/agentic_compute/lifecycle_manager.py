@@ -32,13 +32,46 @@ class LifecycleManager:
     """Manages the lifecycle of a compute workload across attempts, checkpoint restarts, and bounded retries."""
 
     def __init__(self, history_store: HistoryStore | None = None) -> None:
-        self.history_store = history_store or get_history_store()
+        # Kept as None when not supplied, and resolved on each access. The
+        # module-level manager below is built at import time; capturing the
+        # singleton here bound it to whichever database existed at import,
+        # which is not necessarily the configured one.
+        self._history_store = history_store
         # In-memory tracking cache: workload_id -> state dict
         self._workloads: dict[str, dict[str, Any]] = {}
 
-    def register_workload(self, profile: WorkloadProfile | dict[str, Any]) -> dict[str, Any]:
-        """Register a new workload in DEFINED state."""
+    @property
+    def history_store(self) -> HistoryStore:
+        return self._history_store or get_history_store()
+
+    def register_workload(
+        self,
+        profile: WorkloadProfile | dict[str, Any],
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """Register a new workload in DEFINED state.
+
+        A workload that already has recorded attempts is *not* reset. This used
+        to be destructive: registering an existing workload rebuilt the record
+        with zero attempts and zero cost, and the next state change persisted
+        that empty record over the real history. The MCP tracking tool did
+        exactly this for any workload it did not find in memory, so a single
+        tracking call after a restart erased a completed run's cost, attempts and
+        final status. Pass ``replace=True`` to deliberately start over.
+        """
         prof = profile if isinstance(profile, WorkloadProfile) else WorkloadProfile(**profile)
+
+        if not replace:
+            existing = self._workloads.get(prof.workload_id) or self._rehydrate(prof.workload_id)
+            if existing is not None and existing.get("attempts"):
+                logger.info(
+                    "Workload %s already has %d recorded attempt(s); keeping the "
+                    "existing record instead of resetting it.",
+                    prof.workload_id,
+                    len(existing["attempts"]),
+                )
+                return existing
+
         self.history_store.save_workload_profile(prof)
 
         record = {
@@ -162,13 +195,33 @@ class LifecycleManager:
                 raise ValueError(
                     f"Cannot resume workload '{workload_id}': checkpointing is not supported by this workload profile."
                 )
+            evidence = self.verify_checkpoint(workload_id)
+            if evidence["verification"] == "verified_absent":
+                raise ValueError(
+                    f"Cannot resume workload '{workload_id}' from "
+                    f"'{checkpoint_recovered_from}': {evidence['reason']} Starting "
+                    "this attempt as a recovery would record progress that does not exist."
+                )
 
-        # Determine checkpoint recovery
+        # Determine checkpoint recovery.
+        #
+        # This used to synthesise "<checkpoint_location>/step_latest" whenever a
+        # previous attempt existed, without ever looking for that object. The
+        # attempt then carried a recovery claim that nothing supported. A
+        # recovery is now recorded only against a checkpoint verified present.
         recovered_ckpt = checkpoint_recovered_from
         if not recovered_ckpt and prof.is_interruptible and prof.supports_checkpointing and prof.checkpoint_location:
-            # If previous attempt ran, recover from existing checkpoint
             if len(attempts) > 0:
-                recovered_ckpt = f"{prof.checkpoint_location}/step_latest"
+                evidence = self.verify_checkpoint(workload_id)
+                if evidence["verification"] == "verified_present":
+                    recovered_ckpt = prof.checkpoint_location
+                else:
+                    logger.info(
+                        "Workload %s attempt %d starts from scratch: %s",
+                        workload_id,
+                        attempt_num,
+                        evidence["reason"],
+                    )
 
         attempt = ExecutionAttempt(
             attempt_id=f"{workload_id}-att-{attempt_num}",
@@ -200,25 +253,46 @@ class LifecycleManager:
         workload_id: str,
         progress_percent: float | None = None,
         job_state: str | None = None,
-        elapsed_minutes: float = 0.0,
-        cost_incurred_eur: float = 0.0,
+        elapsed_minutes: float | None = None,
+        cost_incurred_eur: float | None = None,
+        metrics_source: Literal["observed", "caller_declared"] = "observed",
     ) -> dict[str, Any]:
-        """Update workload execution metrics with explicit observable vs unavailable progress."""
+        """Update workload execution metrics with explicit observable vs unavailable progress.
+
+        ``elapsed_minutes`` and ``cost_incurred_eur`` default to ``None``, not to
+        ``0.0``. They used to default to zero and were assigned unconditionally,
+        so a bare polling call -- "what is the state of this workload?" -- wrote
+        0.0 over the attempt's real cost and duration. Omitting a metric now
+        means "no new measurement", which is not the same as "the measurement is
+        zero".
+
+        ``metrics_source`` says where the figures come from. ``observed`` means
+        the caller read them from the runtime. ``caller_declared`` means someone
+        -- an operator, a script, or the language model driving the MCP tools --
+        simply stated them. A stated figure is recorded, because it is often the
+        only one available, but it is labelled ``estimated`` /
+        ``declared_unverified`` and never presented as a measurement.
+        """
         rec = self._require(workload_id)
+        declared = metrics_source != "observed"
 
         curr_att: ExecutionAttempt | None = rec.get("current_attempt")
         if curr_att:
-            curr_att.elapsed_minutes = elapsed_minutes
-            curr_att.cost_calculated_eur = cost_incurred_eur
+            if elapsed_minutes is not None:
+                curr_att.elapsed_minutes = elapsed_minutes
+            if cost_incurred_eur is not None:
+                curr_att.cost_calculated_eur = cost_incurred_eur
+                curr_att.cost_status = "estimated" if declared else "calculated_from_usage"
             if job_state:
                 curr_att.status = job_state
 
         rec["total_calculated_cost_eur"] = sum(a.cost_calculated_eur for a in rec["attempts"])
         rec["total_elapsed_minutes"] = sum(a.elapsed_minutes for a in rec["attempts"])
+        rec["metrics_source"] = metrics_source
 
         if progress_percent is not None:
             rec["progress_percent"] = max(0.0, min(100.0, progress_percent))
-            rec["progress_status"] = "measured"
+            rec["progress_status"] = "declared_unverified" if declared else "measured"
         else:
             rec["progress_percent"] = None
             rec["progress_status"] = "unavailable"
@@ -254,6 +328,12 @@ class LifecycleManager:
                 curr_att.elapsed_minutes = actual_duration_minutes
             curr_att.events.append({"time": now, "event": "attempt_finished", "status": final_status, "reason": failure_reason})
             self.history_store.record_attempt(curr_att)
+
+        # Recompute the cumulative figures here too. They used to be refreshed
+        # only in update_progress, so a workload that finished without a progress
+        # poll kept reporting the cost of one attempt while several had been paid.
+        rec["total_calculated_cost_eur"] = sum(a.cost_calculated_eur for a in rec["attempts"])
+        rec["total_elapsed_minutes"] = sum(a.elapsed_minutes for a in rec["attempts"])
 
         if final_status == "COMPLETED":
             rec["progress_percent"] = 100.0
@@ -454,7 +534,12 @@ class LifecycleManager:
         total_cost = sum(a.cost_calculated_eur for a in attempts)
         total_dur = sum(a.elapsed_minutes for a in attempts)
         est_cost = plan.estimated_cost_eur if plan else (prof.budget_amount or 0.0)
-        est_dur = plan.total_time_to_result_minutes if plan else (prof.estimated_duration_minutes or 0.0)
+        # A plan whose ETA was never computed reports 0.0. Comparing an observed
+        # 65 minutes against "0 estimated" invents a 100% overrun, so fall back to
+        # the duration the profile declared.
+        est_dur = (plan.total_time_to_result_minutes if plan else 0.0) or (
+            prof.estimated_duration_minutes or 0.0
+        )
 
         hist_record = ExecutionHistoryRecord(
             workload_id=workload_id,

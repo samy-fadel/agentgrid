@@ -143,6 +143,9 @@
       const [capacityCandidates, setCapacityCandidates] = useState([]);
       const [loadingCandidates, setLoadingCandidates] = useState(false);
       const [capacityError, setCapacityError] = useState(null);
+      // What the server says it actually searched. A single-region answer must
+      // not be mistaken for an exhaustive one.
+      const [capacityMeta, setCapacityMeta] = useState(null);
 
       const [diagnosticsList, setDiagnosticsList] = useState([]);
       const [loadingDiagnostics, setLoadingDiagnostics] = useState(false);
@@ -164,6 +167,10 @@
       // single field can be changed and transmitted on its own.
       const [cpuRequested, setCpuRequested] = useState(16);
       const [memoryGbRequested, setMemoryGbRequested] = useState(32);
+      // Location constraints. The API used to drop them silently, so the field
+      // exists only now that the backend honours it.
+      const [allowedRegions, setAllowedRegions] = useState("");
+      const [allowRegionChange, setAllowRegionChange] = useState(false);
 
       const WORKLOAD_ID = "workload-gui";
 
@@ -201,18 +208,31 @@
             body: JSON.stringify({
               cpu_requested: Number(cpuRequested),
               memory_gb_requested: Number(memoryGbRequested),
+              allowed_regions: allowedRegions
+                .split(",")
+                .map((r) => r.trim())
+                .filter((r) => r.length > 0),
+              allow_region_change: allowRegionChange,
             }),
           });
           if (!res.ok) {
             setCapacityError(await describeError(res, "Capacity search failed"));
             setCapacityCandidates([]);
+            setCapacityMeta(null);
             return;
           }
           const data = await res.json();
           setCapacityCandidates(data.candidates || []);
+          setCapacityMeta({
+            searched_region: data.searched_region,
+            allowed_regions: data.allowed_regions || [],
+            allow_region_change: data.allow_region_change,
+            location_note: data.location_note,
+          });
         } catch (e) {
           setCapacityError(`Unable to reach the API: ${e.message}`);
           setCapacityCandidates([]);
+          setCapacityMeta(null);
         } finally {
           setLoadingCandidates(false);
         }
@@ -1499,7 +1519,50 @@
                     className="w-24 bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-slate-100"
                   />
                 </label>
+                <label className="flex flex-col space-y-1">
+                  <span className="text-slate-400 uppercase tracking-wider">
+                    Régions autorisées
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="europe-west4, europe-west1"
+                    value={allowedRegions}
+                    onChange={(e) => setAllowedRegions(e.target.value)}
+                    className="w-64 bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-slate-100"
+                  />
+                </label>
+                <label className="flex items-center space-x-2 pb-1">
+                  <input
+                    type="checkbox"
+                    checked={allowRegionChange}
+                    onChange={(e) => setAllowRegionChange(e.target.checked)}
+                    className="accent-cyan-500"
+                  />
+                  <span className="text-slate-400 uppercase tracking-wider">
+                    Autoriser un changement de région
+                  </span>
+                </label>
               </div>
+
+              {capacityMeta && (
+                <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs text-slate-300 space-y-1">
+                  <div>
+                    Région interrogée :{" "}
+                    <span className="font-mono text-cyan-300">
+                      {capacityMeta.searched_region}
+                    </span>
+                    {capacityMeta.allowed_regions.length > 0 && (
+                      <span className="text-slate-400">
+                        {" "}
+                        — autorisées : {capacityMeta.allowed_regions.join(", ")}
+                      </span>
+                    )}
+                  </div>
+                  {capacityMeta.location_note && (
+                    <div className="text-amber-300">{capacityMeta.location_note}</div>
+                  )}
+                </div>
+              )}
 
               {loadingCandidates && (
                 <div className="text-sm text-slate-400 py-8 text-center">Interrogation des sources de capacité…</div>
