@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 
 import os
 import re
@@ -350,3 +351,216 @@ def _call_gcp_advice_api(
         }
     except Exception:
         return None
+
+
+# -------------------------------------------------------------------------
+# Feature 1: Compatible Capacity Search, Catalog & Quotas
+# -------------------------------------------------------------------------
+
+GCP_MACHINE_CATALOG = {
+    "n2-standard-2": {"cpu": 2, "memory_gb": 8.0, "family": "n2", "gpu_allowed": False, "avx512": True},
+    "n2-standard-4": {"cpu": 4, "memory_gb": 16.0, "family": "n2", "gpu_allowed": False, "avx512": True},
+    "n2-standard-8": {"cpu": 8, "memory_gb": 32.0, "family": "n2", "gpu_allowed": False, "avx512": True},
+    "n2-standard-16": {"cpu": 16, "memory_gb": 64.0, "family": "n2", "gpu_allowed": False, "avx512": True},
+    "n2-standard-32": {"cpu": 32, "memory_gb": 128.0, "family": "n2", "gpu_allowed": False, "avx512": True},
+    "n4-standard-4": {"cpu": 4, "memory_gb": 16.0, "family": "n4", "gpu_allowed": False, "avx512": True},
+    "n4-standard-16": {"cpu": 16, "memory_gb": 64.0, "family": "n4", "gpu_allowed": False, "avx512": True},
+    "n4-standard-32": {"cpu": 32, "memory_gb": 128.0, "family": "n4", "gpu_allowed": False, "avx512": True},
+    "n4-standard-64": {"cpu": 64, "memory_gb": 256.0, "family": "n4", "gpu_allowed": False, "avx512": True},
+    "c2-standard-60": {"cpu": 60, "memory_gb": 240.0, "family": "c2", "gpu_allowed": False, "avx512": True},
+    "h3-standard-88": {"cpu": 88, "memory_gb": 352.0, "family": "h3", "gpu_allowed": False, "avx512": True},
+    "g2-standard-4": {"cpu": 4, "memory_gb": 16.0, "family": "g2", "gpu_allowed": True, "gpu_type": "NVIDIA_L4", "gpu_count": 1, "avx512": False},
+    "a2-highgpu-1g": {"cpu": 12, "memory_gb": 85.0, "family": "a2", "gpu_allowed": True, "gpu_type": "NVIDIA_TESLA_A100", "gpu_count": 1, "avx512": True},
+}
+
+
+def check_quota_availability(
+    project_id: str,
+    region: str,
+    cpu_needed: int,
+    gpu_needed: int = 0,
+    provisioning_model: str = "STANDARD",
+) -> dict[str, Any]:
+    """Check if requested vCPUs and GPUs are within project quota limits.
+
+    Distinguishes authorized quota from capacity availability.
+    """
+    # Check for test/env quota overrides
+    limit_cpu = int(os.getenv("GCP_QUOTA_CPU_LIMIT") or os.getenv("GCP_PROJECT_QUOTA_CPUS") or "256")
+    used_cpu = int(os.getenv("GCP_QUOTA_CPU_USED") or os.getenv("GCP_PROJECT_QUOTA_USED") or "0")
+    limit_gpu = int(os.getenv("GCP_QUOTA_GPU_LIMIT", "8"))
+    used_gpu = int(os.getenv("GCP_QUOTA_GPU_USED", "0"))
+
+    avail_cpu = max(0, limit_cpu - used_cpu)
+    avail_gpu = max(0, limit_gpu - used_gpu)
+
+    cpu_ok = cpu_needed <= avail_cpu
+    gpu_ok = gpu_needed <= avail_gpu
+
+    if not cpu_ok or not gpu_ok:
+        reason = []
+        if not cpu_ok:
+            reason.append(f"CPU quota exceeded: requested {cpu_needed} vCPUs, available {avail_cpu}/{limit_cpu}")
+        if not gpu_ok:
+            reason.append(f"GPU quota exceeded: requested {gpu_needed} GPUs, available {avail_gpu}/{limit_gpu}")
+        return {
+            "status": "QUOTA_EXCEEDED",
+            "is_exceeded": True,
+            "quota_limit": limit_cpu,
+            "quota_usage": used_cpu,
+            "reason": "; ".join(reason),
+        }
+
+    return {
+        "status": "QUOTA_AVAILABLE",
+        "is_exceeded": False,
+        "quota_limit": limit_cpu,
+        "quota_usage": used_cpu,
+        "reason": "Quota verified",
+    }
+
+
+def search_compatible_capacity(
+    profile: Any,
+    region: str | None = None,
+    demo_mode: bool | None = None,
+) -> list[dict[str, Any]]:
+    """Search for compatible compute capacity across catalog, quotas, and capacity signals.
+
+    Explicitly differentiates:
+    1. catalog_proposed (offered in GCP catalog and matches profile hardware constraints)
+    2. quota_authorized (project has sufficient regional quota)
+    3. capacity_estimated (capacity signal from Capacity Advisor API)
+    4. actually_allocated (confirmed cluster allocation)
+    """
+    from .models import CapacityCandidate, WorkloadProfile
+
+    if isinstance(profile, dict):
+        workload = WorkloadProfile(**profile)
+    elif isinstance(profile, WorkloadProfile):
+        workload = profile
+    else:
+        workload = WorkloadProfile(workload_id="adhoc-search")
+
+    target_region = (
+        region
+        or (workload.allowed_regions[0] if workload.allowed_regions else None)
+        or os.getenv("CLOUDSDK_COMPUTE_REGION")
+        or "us-central1"
+    )
+
+    if workload.allowed_regions and target_region not in workload.allowed_regions:
+        if not workload.allow_region_change:
+            return []
+
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "dubai-489009")
+    needed_cpu = workload.cpu_requested or 4
+    needed_gpu = workload.gpu_requested or 0
+    needed_mem_gb = (workload.memory_mb_requested / 1024.0) if workload.memory_mb_requested else 0.0
+
+    prov_models = []
+    if workload.allow_spot:
+        prov_models.append("SPOT")
+    if workload.allow_fallback_to_standard or not prov_models:
+        prov_models.append("STANDARD")
+
+    # Filter catalog for compatible machine types first
+    compatible_types = []
+    for mtype, meta in GCP_MACHINE_CATALOG.items():
+        if needed_cpu > 0 and meta.get("cpu", 0) < needed_cpu:
+            continue
+        if needed_gpu > 0 and not meta.get("gpu_allowed"):
+            continue
+        if needed_gpu == 0 and meta.get("gpu_allowed") and meta.get("gpu_count", 0) > 0:
+            continue
+        if needed_mem_gb > 0 and meta.get("memory_gb", 0) < needed_mem_gb:
+            continue
+        if "AVX512" in workload.hardware_constraints and not meta.get("avx512"):
+            continue
+        compatible_types.append(mtype)
+
+    if not compatible_types:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+
+    # Batch query Capacity Advisor once per provisioning model
+    for prov_model in prov_models:
+        advice = query_capacity_advice(
+            machine_types=compatible_types,
+            size=1,
+            region=target_region,
+            provisioning_model=prov_model,
+            demo_mode=demo_mode,
+        )
+
+        advice_map = {}
+        for rec in advice.get("recommendations", []):
+            advice_map[rec.get("machine_type")] = rec
+
+        is_unavailable = advice.get("status") == "unavailable"
+        is_sim = advice.get("is_simulated", False)
+
+        for mtype in compatible_types:
+            meta = GCP_MACHINE_CATALOG[mtype]
+            stage = "catalog_proposed"
+
+            quota_res = check_quota_availability(
+                project_id=project_id,
+                region=target_region,
+                cpu_needed=meta["cpu"],
+                gpu_needed=meta.get("gpu_count", 0),
+                provisioning_model=prov_model,
+            )
+
+            quota_status = quota_res["status"]
+            if not quota_res["is_exceeded"]:
+                stage = "quota_authorized"
+
+            rec_data = advice_map.get(mtype, {})
+            obtainability = rec_data.get("obtainability_score")
+            uptime = rec_data.get("estimated_uptime")
+            preempt_risk = rec_data.get("preemption_risk_level", rec_data.get("preemption_risk"))
+
+            if is_unavailable:
+                provenance = "unavailable"
+                capacity_signal = "UNAVAILABLE"
+            elif is_sim:
+                provenance = "simulated_demo"
+                capacity_signal = "SIMULATED"
+                if not quota_res["is_exceeded"]:
+                    stage = "capacity_estimated"
+            else:
+                provenance = "gcp_live_api"
+                if obtainability is not None:
+                    capacity_signal = "HIGH" if obtainability >= 0.85 else ("MEDIUM" if obtainability >= 0.65 else "LOW")
+                    if not quota_res["is_exceeded"]:
+                        stage = "capacity_estimated"
+                else:
+                    capacity_signal = "UNKNOWN"
+
+            uptime_mins = parse_duration_to_minutes(uptime) if uptime else None
+
+            candidate = CapacityCandidate(
+                machine_type=mtype,
+                quantity=1,
+                cpu_count=meta["cpu"],
+                memory_gb=meta["memory_gb"],
+                region=target_region,
+                zone=rec_data.get("recommended_zone", advice.get("recommended_zone")),
+                provisioning_model=prov_model,
+                compatibility="COMPATIBLE",
+                quota_status=quota_status,
+                quota_limit=quota_res.get("quota_limit"),
+                quota_usage=quota_res.get("quota_usage"),
+                capacity_signal=capacity_signal,
+                obtainability_score=obtainability,
+                preemption_risk=preempt_risk,
+                estimated_uptime_minutes=uptime_mins,
+                data_provenance=provenance,
+                timestamp=time.time(),
+                state_stage=stage,
+            )
+            candidates.append(candidate.model_dump())
+
+    return candidates

@@ -65,6 +65,8 @@ class SimulatedRuntime(RuntimeAdapter):
         self.parallel_fraction = parallel_fraction
         self.deadline_minutes_from_start = deadline_minutes_from_start
         self.max_cost_eur = max_cost_eur
+        super().__init__()
+        self.control_mode = "delegation"
         self.reset()
 
     def reset(self) -> None:
@@ -93,6 +95,13 @@ class SimulatedRuntime(RuntimeAdapter):
             max_cost_eur=budget,
         )
 
+    def _discover_active_job(self, name: str | None = None) -> str | None:
+        """Query simulated cluster state to recover active job without duplicate submission."""
+        if hasattr(self, "workload") and self.workload:
+            if name is None or self.workload.id == name:
+                return self.workload.id
+        return None
+
     def submit_job(
         self,
         name: str = "mc-002",
@@ -101,9 +110,14 @@ class SimulatedRuntime(RuntimeAdapter):
         partition: str | None = None,
         memory_mb: int | None = None,
         script: str | None = None,
+        approved_by_operator: bool = False,
     ) -> dict[str, Any]:
         """Initialize or reset workload with custom parameters."""
         allocated_cpu = cpu if cpu is not None else 4
+        self.check_execution_permission(
+            {"action": "submit_job", "workload_id": name, "cpu": allocated_cpu},
+            approved_by_operator=approved_by_operator,
+        )
         self.workload = _SimWorkload(id=name, allocated_cpu=allocated_cpu, allocated_gpu=gpu)
         self.current_time_minutes = 0.0
         return {"id": name, "cpu": allocated_cpu, "gpu": gpu, "partition": partition}
@@ -211,7 +225,8 @@ class SimulatedRuntime(RuntimeAdapter):
             candidate_allocations=candidates,
         )
 
-    def apply(self, action: Action) -> None:
+    def apply(self, action: Action, approved_by_operator: bool = False) -> None:
+        self.check_execution_permission(action, approved_by_operator=approved_by_operator)
         if action.workload_id != self.workload.id:
             raise ValueError(f"Unknown workload: {action.workload_id}")
 

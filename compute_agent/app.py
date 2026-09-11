@@ -235,6 +235,154 @@ def get_capacity_advice_endpoint(
     )
 
 
+
+@app.post("/api/capacity-search")
+@app.get("/api/capacity-search")
+async def search_capacity_endpoint(request: Request) -> dict[str, Any]:
+    """Search compatible capacity candidates across catalog, quota, and capacity signals."""
+    from agentic_compute.capacity_search import search_compatible_capacity
+    data: dict[str, Any] = {}
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+
+    qp = dict(request.query_params)
+    merged = {**qp, **data}
+    cpu_req = int(merged.get("cpu_requested", 4))
+    gpu_req = int(merged.get("gpu_requested", 0))
+    mem_req = float(merged.get("memory_gb_requested", 16.0))
+    allow_spot = str(merged.get("allow_spot", "true")).lower() in ("true", "1")
+    allow_std = str(merged.get("allow_standard", "true")).lower() in ("true", "1")
+    demo_mode = str(merged.get("demo_mode", "false")).lower() in ("true", "1") if "demo_mode" in merged else None
+
+    candidates = search_compatible_capacity(
+        cpu_requested=cpu_req,
+        gpu_requested=gpu_req,
+        memory_gb_requested=mem_req,
+        allow_spot=allow_spot,
+        allow_standard=allow_std,
+        demo_mode=demo_mode,
+    )
+    return {"candidates": [c.model_dump() for c in candidates]}
+
+
+@app.post("/api/diagnose")
+@app.get("/api/diagnose")
+async def diagnose_endpoint(request: Request) -> dict[str, Any]:
+    """Diagnose blockers across Slurm, GCP APIs, and application logs."""
+    from agentic_compute.diagnostic import diagnose_blockers
+    data = {}
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+    else:
+        data = dict(request.query_params)
+
+    exit_code = int(data["exit_code"]) if data.get("exit_code") is not None else None
+    items = diagnose_blockers(
+        job_state=data.get("job_state"),
+        state_reason=data.get("state_reason"),
+        exit_code=exit_code,
+        gcp_error=data.get("gcp_error"),
+        error_log=data.get("error_log"),
+        workload_profile=data.get("workload_profile"),
+    )
+    return {"diagnostics": items}
+
+
+@app.post("/api/plans/compare")
+async def compare_plans_endpoint(request: Request) -> dict[str, Any]:
+    """Deterministically generate and compare execution plans."""
+    from agentic_compute.plan_engine import evaluate_and_compare_plans
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    profile = body.get("workload_profile") or body
+    cluster_cpu = int(body.get("cluster_total_cpu", 128))
+    res = evaluate_and_compare_plans(
+        profile=profile,
+        cluster_total_cpu=cluster_cpu,
+        demo_mode=body.get("demo_mode"),
+    )
+    return res
+
+
+@app.post("/api/plans/approve")
+async def approve_plan_endpoint(request: Request) -> dict[str, Any]:
+    """Approve a plan for execution in validation mode."""
+    from agentic_compute.history import get_history_store
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    plan_id = body.get("plan_id")
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id is required")
+    store = get_history_store()
+    success = store.approve_execution_plan(plan_id)
+    return {"status": "approved" if success else "not_found", "plan_id": plan_id}
+
+
+@app.post("/api/execute-plan")
+async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
+    """Execute a plan with control mode enforcement."""
+    from agentic_compute.execution_controller import ExecutionController
+    from agentic_compute.mcp_server import _runtime
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    profile = body.get("workload_profile") or {}
+    plan = body.get("plan") or {}
+    control_mode = body.get("control_mode", "validation")
+    delegation_policy = body.get("delegation_policy")
+    is_approved = bool(body.get("is_operator_approved", False))
+    approved_plan_id = body.get("approved_plan_id")
+
+    controller = ExecutionController(_runtime)
+    res = controller.submit_plan(
+        profile=profile,
+        plan=plan,
+        control_mode=control_mode,
+        delegation_policy=delegation_policy,
+        is_operator_approved=is_approved,
+        approved_plan_id=approved_plan_id,
+        runtime=_runtime,
+    )
+    return res
+
+
+@app.get("/api/history")
+def get_history_endpoint(workload_id: Optional[str] = None, limit: int = 50) -> dict[str, Any]:
+    """Fetch persistent execution history and cost reconciliations."""
+    from agentic_compute.history import get_history_store
+    store = get_history_store()
+    if workload_id:
+        rec = store.get_history_record(workload_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail=f"Workload '{workload_id}' not found")
+        comp = store.reconcile_costs(workload_id)
+        return {"record": rec.model_dump(), "comparison": comp}
+    records = store.list_history_records(limit=limit)
+    return {"records": [r.model_dump() for r in records]}
+
+
+@app.get("/api/benchmarks")
+def get_benchmarks_endpoint(key: str = "default") -> dict[str, Any]:
+    """Fetch continuous benchmark metrics."""
+    from agentic_compute.history import get_history_store
+    store = get_history_store()
+    metrics = store.get_benchmark_metrics(key)
+    return {"benchmark": metrics}
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Cloud Run health check probe."""

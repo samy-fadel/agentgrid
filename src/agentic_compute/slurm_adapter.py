@@ -73,6 +73,8 @@ class SlurmRuntime(RuntimeAdapter):
         self.verification_timeout_seconds = float(
             os.getenv("SLURM_VERIFICATION_TIMEOUT_SECS", "60.0")
         )
+        super().__init__()
+        self.control_mode = "delegation"
         self.reset()
 
     def _check_verification_timeout(self) -> None:
@@ -234,6 +236,19 @@ class SlurmRuntime(RuntimeAdapter):
             pass
         return {"jobs": []}
 
+    def _discover_active_job(self, name: str | None = None) -> str | None:
+        """Query Slurm controller to discover active job matching name for ambiguous timeout recovery."""
+        try:
+            resp = requests.get(f"{self.base_url}/jobs", headers=self._headers(), timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for j in data.get("jobs", []):
+                    if j.get("name") == name and j.get("job_state") in ("PENDING", "RUNNING"):
+                        return str(j.get("job_id"))
+        except Exception:
+            pass
+        return None
+
     def submit_job(
         self,
         name: str = "agentgrid-workload",
@@ -244,6 +259,7 @@ class SlurmRuntime(RuntimeAdapter):
         script: str | None = None,
         machine_type: str | None = None,
         provisioning_model: str | None = None,
+        approved_by_operator: bool = False,
     ) -> dict[str, Any]:
         """Submit or initialize a new workload on the Slurm cluster with elastic parameters."""
         allocated_cpu = cpu if cpu is not None else int(os.getenv("INITIAL_WORKLOAD_CPU", "4"))
@@ -256,6 +272,17 @@ class SlurmRuntime(RuntimeAdapter):
             provisioning_model=req_pmix,
             action_name="submit_job",
             cpu=allocated_cpu,
+        )
+
+        self.check_execution_permission(
+            {
+                "action": "submit_job",
+                "workload_id": name,
+                "cpu": allocated_cpu,
+                "machine_type": req_mtype,
+                "provisioning_model": req_pmix,
+            },
+            approved_by_operator=approved_by_operator,
         )
 
         # 2. Determine target partition
@@ -319,7 +346,10 @@ class SlurmRuntime(RuntimeAdapter):
                         f"Slurm submission rejected (HTTP {resp.status_code}): {resp.text}"
                     )
         except requests.RequestException as exc:
-            if os.getenv("MOCK_SLURM", "").lower() in ("true", "1"):
+            discovered = self._discover_active_job(name=name)
+            if discovered:
+                submitted_id = discovered
+            elif os.getenv("MOCK_SLURM", "").lower() in ("true", "1"):
                 submitted_id = f"mock-{int(time.time()) % 100000}"
             else:
                 self.requested_cpu = None
@@ -689,11 +719,12 @@ class SlurmRuntime(RuntimeAdapter):
             candidate_allocations=candidates,
         )
 
-    def apply(self, action: Action) -> None:
+    def apply(self, action: Action, approved_by_operator: bool = False) -> None:
         if action.action == "noop":
             return
         if not action.cpu:
             return
+        self.check_execution_permission(action, approved_by_operator=approved_by_operator)
 
         target_cpu = action.cpu
         target_machine_type = action.machine_type or self.machine_type

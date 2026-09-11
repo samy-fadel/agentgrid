@@ -112,6 +112,134 @@ def _create_runtime() -> RuntimeAdapter:
 _runtime: RuntimeAdapter = _create_runtime()
 
 
+from .capacity_search import search_compatible_capacity
+from .diagnostic import diagnose_blockers
+from .execution_controller import ExecutionController
+from .history import get_history_store
+from .lifecycle_manager import default_lifecycle_manager
+from .models import (
+    DelegationPolicy,
+    DiagnosticItem,
+    ExecutionPlan,
+    WorkloadProfile,
+)
+from .plan_engine import evaluate_and_compare_plans
+
+_execution_controller = ExecutionController(_runtime)
+_history_store = get_history_store()
+
+
+@mcp.custom_route("/search-capacity", methods=["POST", "GET"])
+async def search_capacity_route(request):
+    """Search compatible capacity candidates across catalog, quotas, and availability signals."""
+    from starlette.responses import JSONResponse
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    else:
+        body = dict(request.query_params)
+
+    candidates = search_compatible_capacity(
+        workload_profile=body.get("workload_profile"),
+        cpu_requested=int(body.get("cpu_requested", 4)),
+        gpu_requested=int(body.get("gpu_requested", 0)),
+        memory_gb_requested=float(body.get("memory_gb_requested", 16.0)),
+        allowed_regions=body.get("allowed_regions") if isinstance(body.get("allowed_regions"), list) else None,
+        allow_spot=str(body.get("allow_spot", "true")).lower() in ("true", "1"),
+        allow_standard=str(body.get("allow_standard", "true")).lower() in ("true", "1"),
+        demo_mode=str(body.get("demo_mode", "false")).lower() in ("true", "1") if "demo_mode" in body else None,
+    )
+    return JSONResponse({"candidates": [c.model_dump() for c in candidates]})
+
+
+@mcp.custom_route("/diagnose", methods=["POST", "GET"])
+async def diagnose_route(request):
+    """Diagnose execution blockers and categorize impediment causes."""
+    from starlette.responses import JSONResponse
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    else:
+        body = dict(request.query_params)
+
+    exit_code = int(body["exit_code"]) if body.get("exit_code") is not None else None
+    items = diagnose_blockers(
+        job_state=body.get("job_state"),
+        state_reason=body.get("state_reason"),
+        exit_code=exit_code,
+        gcp_error=body.get("gcp_error"),
+        error_log=body.get("error_log"),
+        workload_profile=body.get("workload_profile"),
+        slurm_job_details=body.get("slurm_job_details"),
+    )
+    return JSONResponse({"diagnostics": items})
+
+
+@mcp.custom_route("/plans/compare", methods=["POST"])
+async def compare_plans_route(request):
+    """Evaluate, compare, and price execution plans deterministically."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    profile = body.get("workload_profile") or body
+    cluster_cpu = int(body.get("cluster_total_cpu", 128))
+    result = evaluate_and_compare_plans(
+        profile=profile,
+        cluster_total_cpu=cluster_cpu,
+        demo_mode=body.get("demo_mode"),
+    )
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/plans/approve", methods=["POST"])
+async def approve_plan_route(request):
+    """Human-in-the-loop endpoint to approve a concrete execution plan."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    plan_id = body.get("plan_id")
+    if not plan_id:
+        return JSONResponse({"error": "plan_id is required"}, status_code=400)
+    success = _history_store.approve_execution_plan(plan_id)
+    return JSONResponse({"status": "approved" if success else "not_found", "plan_id": plan_id})
+
+
+@mcp.custom_route("/history", methods=["GET"])
+async def history_route(request):
+    """Query persistent execution history records and cost reconciliation."""
+    from starlette.responses import JSONResponse
+    params = request.query_params
+    workload_id = params.get("workload_id")
+    if workload_id:
+        rec = _history_store.get_history_record(workload_id)
+        if not rec:
+            return JSONResponse({"error": f"Workload '{workload_id}' not found"}, status_code=404)
+        comp = _history_store.reconcile_costs(workload_id)
+        return JSONResponse({"record": rec.model_dump(), "comparison": comp})
+
+    records = _history_store.list_history_records(limit=int(params.get("limit", 50)))
+    return JSONResponse({"records": [r.model_dump() for r in records]})
+
+
+@mcp.custom_route("/benchmarks", methods=["GET"])
+async def benchmarks_route(request):
+    """Get continuous benchmark metrics for runtime calibration."""
+    from starlette.responses import JSONResponse
+    key = request.query_params.get("key", "default")
+    metrics = _history_store.get_benchmark_metrics(key)
+    return JSONResponse({"benchmark": metrics})
+
+
+
 @mcp.tool()
 def submit_job(
     name: str = "agentgrid-workload",
@@ -279,6 +407,168 @@ def get_capacity_advice(
         target_distribution_shape=target_distribution_shape,
         demo_mode=demo_mode,
     )
+
+
+
+
+@mcp.tool()
+def search_capacity(
+    workload_id: str = "workload-1",
+    cpu_requested: int = 4,
+    gpu_requested: int = 0,
+    memory_gb_requested: float = 16.0,
+    allowed_regions: list[str] | None = None,
+    allow_spot: bool = True,
+    allow_standard: bool = True,
+    demo_mode: bool | None = None,
+) -> dict:
+    """Search compatible cloud capacity across catalog, quotas, and Capacity Advisor availability signals.
+
+    Traces candidates through a 4-stage lifecycle:
+    1. catalog_proposed (hardware compatibility)
+    2. quota_authorized (vCPU and region limits)
+    3. capacity_estimated (preemption risk and obtainability score)
+    4. actually_allocated (scheduled onto runtime)
+    """
+    candidates = search_compatible_capacity(
+        workload_profile={"workload_id": workload_id, "cpu_requested": cpu_requested},
+        cpu_requested=cpu_requested,
+        gpu_requested=gpu_requested,
+        memory_gb_requested=memory_gb_requested,
+        allowed_regions=allowed_regions,
+        allow_spot=allow_spot,
+        allow_standard=allow_standard,
+        demo_mode=demo_mode,
+    )
+    return {"candidates": [c.model_dump() for c in candidates]}
+
+
+@mcp.tool()
+def diagnose_blockers_tool(
+    job_state: str | None = None,
+    state_reason: str | None = None,
+    exit_code: int | None = None,
+    gcp_error: str | None = None,
+    error_log: str | None = None,
+    workload_profile: dict | None = None,
+) -> dict:
+    """Analyze telemetry to diagnose and categorize execution blockers.
+
+    Categories: resource_waiting, priority, dependencies, quota,
+    capacity_shortage, incompatible_configuration, application_error.
+    Returns confirmed facts, origin sources, timestamps, and concrete remediation actions.
+    """
+    findings = diagnose_blockers(
+        job_state=job_state,
+        state_reason=state_reason,
+        exit_code=exit_code,
+        gcp_error=gcp_error,
+        error_log=error_log,
+        workload_profile=workload_profile,
+    )
+    return {"diagnostics": findings}
+
+
+@mcp.tool()
+def compare_plans(
+    workload_profile: dict,
+    cluster_total_cpu: int = 128,
+    demo_mode: bool | None = None,
+) -> dict:
+    """Deterministically generate and compare up to 3 execution plans:
+    1. cost_optimized: Minimal spend meeting deadline and budget
+    2. deadline_favored: Fastest completion within budget
+    3. balanced_tradeoff: Hedged allocation balancing cost and preemption SLA
+
+    If no plan satisfies constraints, returns an explicit explanation of what blocks
+    and suggested relaxations without inventing a winning plan.
+    """
+    return evaluate_and_compare_plans(
+        profile=workload_profile,
+        cluster_total_cpu=cluster_total_cpu,
+        demo_mode=demo_mode,
+    )
+
+
+@mcp.tool()
+def execute_plan_controlled(
+    workload_profile: dict,
+    plan: dict,
+    control_mode: str = "validation",
+    delegation_policy: dict | None = None,
+    is_operator_approved: bool = False,
+    approved_plan_id: str | None = None,
+) -> dict:
+    """Execute a plan governed by one of three control modes:
+    - advisory: Strictly read-only; blocks all execution attempts
+    - validation: Requires explicit operator approval for the concrete plan_id
+    - delegation: Autonomous execution strictly bounded by DelegationPolicy guardrails
+
+    Includes post-action verification, anti-duplicate idempotent checks, and fallback handling.
+    """
+    res = _execution_controller.submit_plan(
+        profile=workload_profile,
+        plan=plan,
+        control_mode=control_mode,
+        delegation_policy=delegation_policy,
+        is_operator_approved=is_operator_approved,
+        approved_plan_id=approved_plan_id,
+        runtime=_runtime,
+    )
+    return res
+
+
+@mcp.tool()
+def track_workload_lifecycle(
+    workload_id: str,
+    progress_percent: float | None = None,
+    job_state: str | None = None,
+    elapsed_minutes: float = 0.0,
+    cost_incurred_eur: float = 0.0,
+) -> dict:
+    """Track workload state transitions, attempts, and observable progress.
+
+    Reports progress percent if measured, or explicitly 'unavailable' if unmeasured.
+    Handles checkpoint recovery when supported and enforces bounded retry limits.
+    """
+    if workload_id not in default_lifecycle_manager._workloads:
+        default_lifecycle_manager.register_workload({"workload_id": workload_id})
+    rec = default_lifecycle_manager.update_progress(
+        workload_id=workload_id,
+        progress_percent=progress_percent,
+        job_state=job_state,
+        elapsed_minutes=elapsed_minutes,
+        cost_incurred_eur=cost_incurred_eur,
+    )
+    return {
+        "workload_id": workload_id,
+        "state": rec["state"],
+        "progress_percent": rec["progress_percent"],
+        "progress_status": rec["progress_status"],
+        "total_calculated_cost_eur": rec["total_calculated_cost_eur"],
+        "total_elapsed_minutes": rec["total_elapsed_minutes"],
+    }
+
+
+@mcp.tool()
+def get_cost_history(
+    workload_id: str | None = None,
+    reconcile_billed_eur: float | None = None,
+) -> dict:
+    """Query persistent execution history, comparing 3-tier costs:
+    - estimated_cost
+    - calculated_from_usage
+    - reconciled_billed (explicitly distinguished from calculated)
+    """
+    if workload_id:
+        rec = _history_store.get_history_record(workload_id)
+        comp = _history_store.reconcile_costs(workload_id, billed_cost_eur=reconcile_billed_eur)
+        return {
+            "record": rec.model_dump() if rec else None,
+            "reconciliation": comp,
+        }
+    records = _history_store.list_history_records()
+    return {"records": [r.model_dump() for r in records]}
 
 
 # Expose ASGI application for Uvicorn / Cloud Run

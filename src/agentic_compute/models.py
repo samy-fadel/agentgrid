@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+import time
+
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -91,3 +93,183 @@ class Action(BaseModel):
             raise ValueError("cpu is required for resize_workload")
         return self
 
+
+
+class WorkloadProfile(BaseModel):
+    """Profile of a computation, its resource requirements, constraints, and resilience capabilities."""
+    workload_id: str
+    name: str = "compute-workload"
+    command: str | None = None
+    script: str | None = None
+    input_data_uri: str | None = None
+    output_data_uri: str | None = None
+    
+    # Hardware requests
+    cpu_requested: int | None = None
+    gpu_requested: int = 0
+    memory_mb_requested: int | None = None
+    nodes_requested: int = 1
+    tasks_requested: int = 1
+    hardware_constraints: list[str] = Field(default_factory=list)
+    
+    # Financial & Time SLAs
+    budget_amount: float | None = None
+    budget_currency: str = "EUR"
+    deadline_minutes_from_start: float | None = None
+    deadline_iso: str | None = None
+    timezone: str = "UTC"
+    allowed_regions: list[str] = Field(default_factory=lambda: ["us-central1"])
+    allowed_zones: list[str] = Field(default_factory=list)
+    
+    # Performance estimation
+    estimated_duration_minutes: float | None = None
+    estimation_source: str | None = None  # "historical_average", "user_specified", "dry_run", "unknown"
+    
+    # Elasticity, Interruption & Checkpoint
+    is_parallelizable: bool = True
+    is_interruptible: bool = True
+    supports_checkpointing: bool = False
+    checkpoint_interval_minutes: float | None = None
+    checkpoint_location: str | None = None
+    
+    # Strict preferences & limits
+    allow_spot: bool = True
+    allow_fallback_to_standard: bool = True
+    allow_zone_change: bool = True
+    allow_region_change: bool = False  # Strongly coupled workloads must not be arbitrarily split across regions
+    max_retries: int = 3
+    max_cost_limit_eur: float | None = None
+    max_wait_minutes: float | None = None
+
+
+class ExecutionAttempt(BaseModel):
+    """Represents a specific physical execution attempt of a workload."""
+    attempt_id: str
+    workload_id: str
+    attempt_number: int = 1
+    job_id: str | None = None
+    status: str = "PENDING"  # PENDING, RUNNING, COMPLETED, FAILED, PREEMPTED, CANCELLED
+    started_at: float | None = None
+    ended_at: float | None = None
+    elapsed_minutes: float = 0.0
+    allocated_machine_type: str | None = None
+    allocated_cpu: int = 0
+    allocated_gpu: int = 0
+    provisioning_mode: str = "100% Standard"
+    region: str = "us-central1"
+    zone: str | None = None
+    checkpoint_recovered_from: str | None = None
+    failure_reason: str | None = None
+    cost_calculated_eur: float = 0.0
+    cost_status: Literal["estimated", "calculated_from_usage", "reconciled_billed"] = "calculated_from_usage"
+    events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CapacityCandidate(BaseModel):
+    """Candidate compute capacity identified across catalog, quotas, and availability signals."""
+    machine_type: str
+    quantity: int = 1
+    cpu_count: int
+    memory_gb: float
+    region: str
+    zone: str | None = None
+    provisioning_model: str = "SPOT"  # SPOT, STANDARD
+    compatibility: Literal["COMPATIBLE", "INCOMPATIBLE", "UNKNOWN"] = "COMPATIBLE"
+    compatibility_details: str | None = None
+    
+    quota_status: Literal["QUOTA_AVAILABLE", "QUOTA_EXCEEDED", "QUOTA_UNKNOWN"] = "QUOTA_AVAILABLE"
+    quota_limit: int | None = None
+    quota_usage: int | None = None
+    
+    capacity_signal: Literal["HIGH", "MEDIUM", "LOW", "UNAVAILABLE", "SIMULATED", "UNKNOWN"] = "HIGH"
+    obtainability_score: float | None = None
+    preemption_risk: str | None = None
+    estimated_uptime_minutes: float | None = None
+    
+    data_provenance: Literal["gcp_live_api", "simulated_demo", "unavailable", "unknown"] = "gcp_live_api"
+    timestamp: float = Field(default_factory=time.time)
+    state_stage: Literal["catalog_proposed", "quota_authorized", "capacity_estimated", "actually_allocated"] = "catalog_proposed"
+
+
+class DiagnosticItem(BaseModel):
+    """Structured diagnostic finding for workload blockers and execution impediments."""
+    category: Literal[
+        "resource_waiting",
+        "priority",
+        "dependencies",
+        "quota",
+        "capacity_shortage",
+        "incompatible_configuration",
+        "application_error",
+        "unknown",
+    ]
+    observed_facts: str
+    source: str  # "slurm_controller", "gcp_capacity_advisor", "gcp_compute_api", "workload_log"
+    timestamp: float = Field(default_factory=time.time)
+    confirmed: bool = True  # True if confirmed by facts, False if unverified hypothesis
+    hypothesis_details: str | None = None
+    possible_actions: list[dict[str, str]] = Field(default_factory=list)  # list of {"action": "...", "consequences": "..."}
+
+
+class ExecutionPlan(BaseModel):
+    """Evaluated execution plan comparing trade-offs between cost, latency, and capacity."""
+    plan_id: str
+    plan_type: Literal["cost_optimized", "deadline_favored", "balanced_tradeoff", "fallback_alternative"]
+    title: str
+    machine_type: str
+    cpu: int
+    gpu: int = 0
+    region: str = "us-central1"
+    zone: str | None = None
+    provisioning_model: str = "100% Spot"
+    quantity: int = 1
+    
+    satisfied_constraints: list[str] = Field(default_factory=list)
+    unverified_points: list[str] = Field(default_factory=list)
+    
+    estimated_cost_eur: float
+    cost_scope_included: list[str] = Field(default_factory=lambda: ["vm_compute_hourly"])
+    cost_exclusions_known: list[str] = Field(default_factory=lambda: ["network_egress", "persistent_disk_storage"])
+    
+    estimated_wait_minutes: float = 0.0
+    estimated_prep_minutes: float = 0.0
+    estimated_execution_minutes: float = 0.0
+    estimated_recovery_minutes: float = 0.0
+    total_time_to_result_minutes: float = 0.0
+    
+    performance_assumptions: str = "Amdahl scaling model based on estimated parallel fraction"
+    uncertainty_factors: list[str] = Field(default_factory=list)
+    ranking_rationale: str = "Deterministic ranking based on objective trade-offs"
+    fallback_plan_id: str | None = None
+    fallback_chain: list[str] = Field(default_factory=list)
+
+
+class DelegationPolicy(BaseModel):
+    """Operator-defined guardrail policy for delegated execution mode."""
+    max_budget_eur: float = 100.0
+    allowed_machine_types: list[str] = Field(default_factory=list)
+    allowed_provisioning_models: list[str] = Field(default_factory=list)
+    allowed_regions: list[str] = Field(default_factory=list)
+    max_retries: int = 3
+    auto_approve_if_within_policy: bool = True
+
+
+class ExecutionHistoryRecord(BaseModel):
+    """Historical execution record persisted across application restarts."""
+    workload_id: str
+    workload_name: str
+    profile: WorkloadProfile
+    plans_evaluated: list[ExecutionPlan] = Field(default_factory=list)
+    approved_plan: ExecutionPlan | None = None
+    control_mode: str = "validation"  # "advisory", "validation", "delegation"
+    attempts: list[ExecutionAttempt] = Field(default_factory=list)
+    final_status: str = "COMPLETED"
+    initial_estimated_cost_eur: float = 0.0
+    final_calculated_cost_eur: float = 0.0
+    cost_comparison_delta_eur: float = 0.0
+    initial_estimated_duration_minutes: float = 0.0
+    final_actual_duration_minutes: float = 0.0
+    duration_comparison_delta_minutes: float = 0.0
+    reconciliation_status: Literal["estimated", "calculated_from_usage", "reconciled_billed"] = "calculated_from_usage"
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)

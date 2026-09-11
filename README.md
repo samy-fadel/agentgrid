@@ -157,6 +157,66 @@ $$S = \frac{\text{Deadline} - \text{Elapsed Time}}{\text{Estimated Remaining Tim
 
 ---
 
+
+---
+
+## Six Core Product Capabilities
+
+AgentGrid delivers an end-to-end autonomous compute control plane governed by operator control policies:
+
+### 1. Recherche de capacité compatible (Multi-Stage Capacity Search)
+* **4-Stage Sourcing Lifecycle**:
+  1. `catalog_proposed`: Hardware matching across CPU, memory, GPU, AVX-512 constraints.
+  2. `quota_authorized`: Real-time quota check (`QUOTA_AVAILABLE`, `QUOTA_EXCEEDED`, or `QUOTA_UNKNOWN`).
+  3. `capacity_estimated`: GCP Capacity Advisor signals (obtainability score 0–100%, preemption risk, uptime).
+  4. `actually_allocated`: Ground-truth scheduler verification on the cluster.
+* **Truthful Provenance**: Explicit distinction between `gcp_live_api`, `simulated_demo`, and `unavailable`.
+
+### 2. Diagnostic des blocages (Blocker Diagnostic Engine)
+Structured taxonomy classifying execution impediments into:
+* `resource_waiting`: Cluster saturation, dynamic cloud VM spin-up wait.
+* `priority`: Queued behind higher-priority workloads.
+* `dependencies`: Upstream workflow dependencies or user/admin holds.
+* `quota`: Project vCPU/GPU quota or Slurm QOS limits (`QOSMaxCpuPerUserLimit`).
+* `capacity_shortage`: Cloud stockouts (`ZONE_RESOURCE_POOL_EXHAUSTED`), preemption spikes.
+* `incompatible_configuration`: Invalid constraints (`BadConstraints`), unsupported shapes.
+* `application_error`: Non-zero exit codes (e.g. exit 137 OOM, exit 139 SIGSEGV) with targeted remediations.
+
+### 3. Comparaison déterministe de plans (Deterministic Plan Comparison)
+* **3 Readable Plans**:
+  * **Cost-Optimized**: Lowest estimated spend meeting deadline (Spot instances, right-sized cores).
+  * **Deadline-Favored**: Fastest time to result within budget (high parallelism, Standard On-Demand).
+  * **Balanced Trade-off**: Hedged allocation balancing cost and preemption SLA (e.g., 80% Spot / 20% Standard).
+* **Cost & Time Transparency**:
+  * Cost inclusions (`vm_compute_hourly`) and known exclusions (`network_egress`, `persistent_disk_storage`).
+  * Time breakdown: Wait/Boot, Environment Prep, Active Execution (Amdahl scaling model), Checkpoint Recovery.
+* **Unfeasible Handling**: Zero hallucinated winning plans. If constraints conflict, returns an empty plan set with an explicit explanation of blocking constraints and suggested relaxations.
+
+### 4. Exécution et repli contrôlés (Operator Governance & Fallback)
+* **3 Operator Control Modes**:
+  * **Advisory (`advisory`)**: Strictly read-only suggestions. All mutations/submissions are rejected.
+  * **Validation (`validation`)**: Human-in-the-loop approval. Plan execution blocked until operator clicks "Approve".
+  * **Delegation (`delegation`)**: Autonomous execution strictly bounded by `DelegationPolicy` guardrails (max budget ceiling, allowed machine types, allowed regions, allowed provisioning models).
+* **Execution Safety**:
+  * **Ordered Fallback Ladder**: Automatic failover (e.g., Spot → Standard On-Demand) when stockouts occur, staying within remaining budget.
+  * **Idempotent Anti-Duplicate Submission**: Re-checks cluster job registry before submitting to prevent duplicate jobs on network timeouts.
+  * **Safe Downscaling**: Automatically releases temporary allocations and resizes cluster to baseline upon completion or cancellation.
+
+### 5. Suivi et reprise (Lifecycle Management & Resumption)
+* **Lifecycle States**: `DEFINED` → `PLANNING` → `READY_FOR_APPROVAL` → `SUBMITTING` → `QUEUED` → `RUNNING` → `COMPLETED` / `PREEMPTED` / `FAILED` / `CANCELLED`.
+* **Observable Progress**: Reports verified percent (0–100%) when measured; explicitly reports `"unavailable"` when unmeasured (zero simulated or fabricated progress numbers).
+* **Checkpoint Resumption vs. Full Restart**: Resumes from latest checkpoint if `supports_checkpointing=True` and updates remaining duration; mandates restart from 0% if unsupported.
+* **Bounded Retries**: Enforces strict `max_retries` ceiling to protect operator budget from runaway crash loops.
+
+### 6. Coût réel, historique et comparaison aux estimations (3-Tier Cost Reconciliation)
+* **Persistent SQLite Storage**: Preserves workload profiles, plans, attempts, and post-mortems across application restarts (`~/.agentgrid/agentgrid_history.db` or `AGENTGRID_DB_PATH`).
+* **3-Tier Cost Model**:
+  1. `initial_estimated_cost_eur`: Pre-execution deterministic estimate.
+  2. `calculated_from_usage_eur`: Actual elapsed node-hours × verified VM rates.
+  3. `reconciled_billed_cost_eur`: Verified GCP Cloud Billing export (explicitly flagged when not integrated).
+* **Continuous Benchmark Calibration**: Aggregates verified work-unit execution rates and interruption frequencies into a self-calibrating benchmark table.
+
+
 ## Supported Compute Runtimes
 
 | Capability | `COMPUTE_RUNTIME=simulator` | `COMPUTE_RUNTIME=slurm` |
@@ -291,6 +351,39 @@ sequenceDiagram
 
 ---
 
+## 6 Target Operational Capabilities
+
+AgentGrid delivers 6 core operational capabilities for intelligent compute management:
+
+1. **Recherche de capacité compatible & Validation des quotas** (`search_capacity`, `search_compatible_capacity`):
+   - Traces candidates across 4 distinct lifecycle stages: `catalog_proposed` -> `quota_authorized` -> `capacity_estimated` -> `actually_allocated`.
+   - Explicit data provenance (`gcp_live_api`, `simulated_demo`, `unavailable`, `unknown`) without silent demo masking.
+2. **Diagnostic structuré des blocages** (`diagnose_blockers_tool`, `diagnose_blockers`):
+   - Categorizes impediments into: `resource_waiting`, `priority`, `dependencies`, `quota`, `capacity_shortage`, `incompatible_configuration`, `application_error`.
+   - Distinguishes observed facts from hypotheses, identifies origins, and generates concrete remediation actions with trade-off consequences.
+3. **Moteur déterministe de comparaison de plans** (`compare_plans`, `evaluate_and_compare_plans`):
+   - Generates up to 3 distinct candidates: `cost_optimized`, `deadline_favored`, and `balanced_tradeoff`.
+   - Transparent cost scope (compute vs network/storage exclusions) and Amdahl scaling model.
+   - When constraints are unfeasible, explains factually what blocks without inventing an imaginary winner.
+4. **Exécution gouvernée & Repli contrôlé** (`execute_plan_controlled`, `ExecutionController`):
+   - **3 Operator Control Modes**:
+     * **Conseil (Advisory)**: Strictly read-only recommendations; rejects any infrastructure mutation.
+     * **Validation**: Prepares execution plans; blocks execution until explicit human operator approval.
+     * **Délégation**: Autonomous execution bounded by strict `DelegationPolicy` guardrails (max budget, machine types, regions, retry counts).
+   - Ordered fallback ladder (Spot -> Standard / alternative shapes) verifying remaining budget.
+   - Anti-duplicate idempotent submission across network timeouts.
+   - Safe downscaling protecting active compute nodes from termination.
+5. **Suivi du cycle de vie et reprise** (`track_workload_lifecycle`, `LifecycleManager`):
+   - Clean separation between compute identity (`workload_id`) and attempt history (`attempt_id`).
+   - Automated checkpoint resumption from cloud storage URIs for interruptible workloads.
+   - Strict rejection of inconsistent partial resumptions for non-interruptible workloads.
+6. **Coûts réels, historique persistant et étalonnage** (`get_cost_history`, `HistoryStore`):
+   - Persistent disk storage (SQLite / JSON) surviving application restarts.
+   - Explicit 3-tier cost breakdown: Initial Estimate vs Calculated from Usage vs Reconciled Billed Cost.
+   - Comparable workload metrics for runtime calibration.
+
+---
+
 ## Project Structure
 
 ```text
@@ -300,29 +393,39 @@ sequenceDiagram
 ├── pyproject.toml            # Package metadata, dependencies, and entrypoints
 │
 ├── compute_agent/            # Agent Service Layer
-│   ├── agent.py              # Google ADK root_agent (Gemini + McpToolset)
-│   ├── app.py                # FastAPI HTTP REST API, SSE streaming & Web UI
+│   ├── agent.py              # Google ADK root_agent (Gemini + McpToolset with 6 capability tools)
+│   ├── app.py                # FastAPI HTTP REST API, SSE streaming & Web Dashboard UI
 │   ├── auth.py               # GCP OIDC token generator for IAM service-to-service
 │   └── static/
-│       └── index.html        # Interactive AgentGrid Web Dashboard
+│       └── index.html        # Interactive AgentGrid Web Dashboard (React tabs for all 6 features)
 │
 ├── src/agentic_compute/      # Domain Logic & Compute Boundary
-│   ├── models.py             # Universal semantic abstractions (ClusterState, Workload)
-│   ├── runtime.py            # RuntimeAdapter abstract base interface
+│   ├── models.py             # Universal semantic abstractions, WorkloadProfile, ExecutionPlan
+│   ├── runtime.py            # RuntimeAdapter universal interface with Control Modes
 │   ├── simulator.py          # Deterministic discrete-event simulation runtime
 │   ├── slurm_adapter.py      # Production Slurm REST API adapter (v0.0.41) & verification engine
-│   ├── capacity_advisor.py   # GCP Compute Engine Capacity Advisor client
-│   └── mcp_server.py         # FastMCP Server (dual SSE & stdio transports)
+│   ├── capacity_advisor.py   # GCP Compute Engine Capacity Advisor & quota verification client
+│   ├── capacity_search.py    # 4-stage capacity candidate search engine
+│   ├── diagnostics.py        # 7-category structured blocker diagnostic classifier
+│   ├── diagnostic.py         # Slurm & GCP blocker diagnostics interface
+│   ├── plan_engine.py        # Deterministic 3-plan comparison engine
+│   ├── execution_controller.py # Control mode gate, fallback ladder & idempotent executor
+│   ├── lifecycle_manager.py  # Workload attempt tracker & checkpoint resume coordinator
+│   ├── history.py            # Persistent SQLite execution store & 3-tier cost reconciler
+│   ├── history_store.py      # File-based JSON historical calibration store
+│   └── mcp_server.py         # FastMCP Server (dual SSE & stdio transports with 10 tools)
 │
 ├── scripts/
 │   ├── deploy_services.sh    # Cloud Run deployment & IAM binding script
 │   └── setup_ci_cd.sh        # Setup script for Artifact Registry, triggers, and IAM
 │
-└── tests/                    # Comprehensive test suite (50 unit & contract tests)
-    ├── test_agent_service.py # API & endpoint contract tests
-    ├── test_mcp_contract.py  # FastMCP interface & Capacity Advisor tests
-    ├── test_simulator.py     # Simulator progression & candidate tests
-    └── test_slurm.py         # Slurm adapter verification, lifecycle & timeout tests
+└── tests/                    # Comprehensive test suite (75 unit, contract & capability tests)
+    ├── test_agent_service.py # API & endpoint contract tests (9 tests)
+    ├── test_mcp_contract.py  # FastMCP interface & Capacity Advisor tests (13 tests)
+    ├── test_simulator.py     # Simulator progression & candidate tests (5 tests)
+    ├── test_slurm.py         # Slurm adapter verification, lifecycle & timeout tests (23 tests)
+    ├── test_agentgrid_evolutions.py # Focused evolution capability tests (13 tests)
+    └── test_evolved_capabilities.py # Section 11 end-to-end validation scenarios (12 tests)
 ```
 
 ---

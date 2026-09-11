@@ -131,8 +131,125 @@
 
       const logsEndRef = useRef(null);
 
+      const [activeTab, setActiveTab] = useState("mission"); // "mission", "plans", "capacity", "diagnostics", "history"
+      const [controlMode, setControlMode] = useState("validation"); // "advisory", "validation", "delegation"
+      const [delegationBudget, setDelegationBudget] = useState(10.0);
+      const [approvedPlanId, setApprovedPlanId] = useState(null);
+
+      const [planComparison, setPlanComparison] = useState(null);
+      const [loadingPlans, setLoadingPlans] = useState(false);
+
+      const [capacityCandidates, setCapacityCandidates] = useState([]);
+      const [loadingCandidates, setLoadingCandidates] = useState(false);
+
+      const [diagnosticsList, setDiagnosticsList] = useState([]);
+      const [loadingDiagnostics, setLoadingDiagnostics] = useState(false);
+
+      const [historyRecords, setHistoryRecords] = useState([]);
+      const [loadingHistory, setLoadingHistory] = useState(false);
+
+      const fetchCapacityCandidates = async () => {
+        setLoadingCandidates(true);
+        try {
+          const res = await fetch(`${API_BASE}/api/capacity-search?cpu_requested=16&memory_gb_requested=32`);
+          if (res.ok) {
+            const data = await res.json();
+            setCapacityCandidates(data.candidates || []);
+          }
+        } catch (e) {
+          console.error("Error fetching candidates:", e);
+        } finally {
+          setLoadingCandidates(false);
+        }
+      };
+
+      const fetchPlanComparison = async () => {
+        setLoadingPlans(true);
+        try {
+          const payload = {
+            workload_profile: {
+              workload_id: "workload-gui",
+              name: "compute-simulation",
+              deadline_minutes_from_start: parseFloat(deadline),
+              budget_amount: parseFloat(budget),
+              is_parallelizable: true,
+              supports_checkpointing: true,
+              checkpoint_location: "gs://agentgrid-checkpoints/workload-gui",
+            },
+            cluster_total_cpu: 128,
+          };
+          const res = await fetch(`${API_BASE}/api/plans/compare`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            setPlanComparison(data);
+          }
+        } catch (e) {
+          console.error("Error evaluating plans:", e);
+        } finally {
+          setLoadingPlans(false);
+        }
+      };
+
+      const handleApprovePlan = async (planId) => {
+        try {
+          const res = await fetch(`${API_BASE}/api/plans/approve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ plan_id: planId }),
+          });
+          if (res.ok) {
+            setApprovedPlanId(planId);
+          }
+        } catch (e) {
+          console.error("Error approving plan:", e);
+        }
+      };
+
+      const fetchDiagnostics = async () => {
+        setLoadingDiagnostics(true);
+        try {
+          const q = snapshot?.workload ? `?job_state=${snapshot.workload.status || 'RUNNING'}` : "?job_state=PENDING&state_reason=ReqNodeNotAvail";
+          const res = await fetch(`${API_BASE}/api/diagnose${q}`);
+          if (res.ok) {
+            const data = await res.json();
+            setDiagnosticsList(data.diagnostics || []);
+          }
+        } catch (e) {
+          console.error("Error fetching diagnostics:", e);
+        } finally {
+          setLoadingDiagnostics(false);
+        }
+      };
+
+      const fetchHistory = async () => {
+        setLoadingHistory(true);
+        try {
+          const res = await fetch(`${API_BASE}/api/history`);
+          if (res.ok) {
+            const data = await res.json();
+            setHistoryRecords(data.records || []);
+          }
+        } catch (e) {
+          console.error("Error fetching history:", e);
+        } finally {
+          setLoadingHistory(false);
+        }
+      };
+
+      useEffect(() => {
+        if (activeTab === "plans" && !planComparison) fetchPlanComparison();
+        if (activeTab === "capacity" && capacityCandidates.length === 0) fetchCapacityCandidates();
+        if (activeTab === "diagnostics" && diagnosticsList.length === 0) fetchDiagnostics();
+        if (activeTab === "history" && historyRecords.length === 0) fetchHistory();
+      }, [activeTab]);
+
+
       // Support direct connection when testing locally or on cloudtop
-      const API_BASE = window.location.origin.includes("run.app") ? "" : "https://agentic-compute-agent-340107663828.us-central1.run.app";
+      const API_BASE = (window.location.origin && !window.location.origin.startsWith("file://")) ? "" : "https://agentic-compute-agent-340107663828.us-central1.run.app";
 
       // Fetch snapshot from API
       const fetchSnapshot = async () => {
@@ -350,6 +467,105 @@
             </div>
           </header>
 
+          {/* 6-Feature Navigation & Mode Bar */}
+          <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 rounded-xl p-2 shadow-lg backdrop-blur">
+            {/* Feature Tabs */}
+            <div className="flex items-center space-x-1 overflow-x-auto custom-scrollbar pb-1 md:pb-0 text-xs font-medium">
+              <button
+                onClick={() => setActiveTab("mission")}
+                className={`px-3 py-2 rounded-lg transition-all flex items-center space-x-2 whitespace-nowrap ${
+                  activeTab === "mission"
+                    ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                }`}
+              >
+                <span>⚡ Mission & Exécution</span>
+              </button>
+              <button
+                onClick={() => setActiveTab("plans")}
+                className={`px-3 py-2 rounded-lg transition-all flex items-center space-x-2 whitespace-nowrap ${
+                  activeTab === "plans"
+                    ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                }`}
+              >
+                <span>📊 Comparaison de Plans</span>
+              </button>
+              <button
+                onClick={() => setActiveTab("capacity")}
+                className={`px-3 py-2 rounded-lg transition-all flex items-center space-x-2 whitespace-nowrap ${
+                  activeTab === "capacity"
+                    ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                }`}
+              >
+                <span>🌐 Recherche de Capacité (4 Paliers)</span>
+              </button>
+              <button
+                onClick={() => setActiveTab("diagnostics")}
+                className={`px-3 py-2 rounded-lg transition-all flex items-center space-x-2 whitespace-nowrap ${
+                  activeTab === "diagnostics"
+                    ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                }`}
+              >
+                <span>🔍 Diagnostic Blocages</span>
+              </button>
+              <button
+                onClick={() => setActiveTab("history")}
+                className={`px-3 py-2 rounded-lg transition-all flex items-center space-x-2 whitespace-nowrap ${
+                  activeTab === "history"
+                    ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                }`}
+              >
+                <span>📈 Coûts Réels & Historique</span>
+              </button>
+            </div>
+
+            {/* Operator Control Mode Selector */}
+            <div className="flex items-center space-x-2 bg-slate-950/80 border border-slate-800 rounded-lg px-2.5 py-1.5 self-start md:self-auto">
+              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Mode de contrôle :</span>
+              <div className="flex items-center space-x-1">
+                <button
+                  onClick={() => setControlMode("advisory")}
+                  className={`px-2 py-1 text-xs rounded font-medium transition-colors ${
+                    controlMode === "advisory"
+                      ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                  title="Advisory: Lecture seule, aucune mutation permise"
+                >
+                  Advisory
+                </button>
+                <button
+                  onClick={() => setControlMode("validation")}
+                  className={`px-2 py-1 text-xs rounded font-medium transition-colors ${
+                    controlMode === "validation"
+                      ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                  title="Validation: Approbation humaine explicite requise pour chaque plan"
+                >
+                  Validation
+                </button>
+                <button
+                  onClick={() => setControlMode("delegation")}
+                  className={`px-2 py-1 text-xs rounded font-medium transition-colors ${
+                    controlMode === "delegation"
+                      ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                  title="Delegation: Exécution autonome sous politique de garde-fous"
+                >
+                  Délégation
+                </button>
+              </div>
+            </div>
+          </div>
+
+
+
           {/* Top Status Strip */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm">
@@ -426,7 +642,8 @@
           </div>
 
           {/* Main 2-Column Dashboard */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {activeTab === 'mission' && (
+<div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             
             {/* Left Column (5 cols): Objective Input & Slurm Verification */}
             <div className="lg:col-span-5 space-y-6">

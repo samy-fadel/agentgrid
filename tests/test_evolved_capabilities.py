@@ -1,0 +1,497 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import time
+import pytest
+from unittest.mock import MagicMock
+
+from agentic_compute.capacity_search import search_compatible_capacity
+from agentic_compute.diagnostic import diagnose_blockers
+from agentic_compute.execution_controller import ExecutionController
+from agentic_compute.history import HistoryStore
+from agentic_compute.lifecycle_manager import LifecycleManager
+from agentic_compute.models import (
+    Action,
+    DelegationPolicy,
+    ExecutionAttempt,
+    ExecutionHistoryRecord,
+    ExecutionPlan,
+    WorkloadProfile,
+)
+from agentic_compute.plan_engine import evaluate_and_compare_plans
+from agentic_compute.simulator import SimulatedRuntime
+from agentic_compute.slurm_adapter import SlurmRuntime
+
+
+def test_scenario_1_existing_regression_baseline():
+    """Scenario 1: Baseline endpoints and runtime contract remain preserved without regression."""
+    runtime = SimulatedRuntime()
+    snapshot = runtime.snapshot()
+    assert snapshot.cluster.total_cpu == 128
+    assert snapshot.workload.allocated_cpu == 32
+    assert len(snapshot.candidate_allocations) > 0
+
+    # Ensure default delegation control mode permits standard apply without regression
+    runtime.apply(Action(action="resize_workload", workload_id="mc-001", cpu=16, reason="baseline_test"))
+    updated = runtime.snapshot()
+    assert updated.workload.allocated_cpu == 16
+
+
+def test_scenario_2_nominal_end_to_end_journey():
+    """Scenario 2: Full nominal path: Profile -> Search -> 3 Plans -> Validation Approval -> Execution -> Lifecycle -> Cost Reconciliation."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        store = HistoryStore(db_path=db_path)
+        mgr = LifecycleManager(history_store=store)
+        runtime = SimulatedRuntime()
+        controller = ExecutionController(runtime)
+
+        # 1. Declare complete workload profile
+        profile = WorkloadProfile(
+            workload_id="wl-nominal-42",
+            name="genomics-batch-pipeline",
+            cpu_requested=8,
+            memory_mb_requested=32768,
+            budget_amount=25.0,
+            deadline_minutes_from_start=90.0,
+            allowed_regions=["europe-west1"],
+            allow_spot=True,
+            allow_fallback_to_standard=True,
+            supports_checkpointing=True,
+            checkpoint_location="gs://agentgrid-checkpoints/wl-nominal-42",
+        )
+        mgr.register_workload(profile)
+
+        # 2. Search capacity across 4 stages
+        candidates = search_compatible_capacity(profile=profile, demo_mode=True)
+        assert len(candidates) > 0
+        stages = {c.state_stage for c in candidates}
+        assert "capacity_estimated" in stages or "quota_authorized" in stages
+
+        # 3. Deterministically generate 3 distinct execution plans
+        plan_result = evaluate_and_compare_plans(profile=profile, cluster_total_cpu=128, demo_mode=True)
+        assert plan_result["is_feasible"] is True
+        plans = plan_result["plans"]
+        assert len(plans) == 3
+        plan_types = {p["plan_type"] for p in plans}
+        assert plan_types == {"cost_optimized", "deadline_favored", "balanced_tradeoff"}
+
+        # 4. Human validation approval
+        selected_plan_dict = plans[0]
+        selected_plan = ExecutionPlan(**selected_plan_dict)
+        store.save_execution_plan(selected_plan, workload_id=profile.workload_id)
+        store.approve_execution_plan(selected_plan.plan_id)
+
+        # 5. Execute plan under validation mode with approval
+        exec_res = controller.submit_plan(
+            profile=profile,
+            plan=selected_plan,
+            control_mode="validation",
+            is_operator_approved=True,
+            approved_plan_id=selected_plan.plan_id,
+            runtime=runtime,
+        )
+        assert exec_res["status"] == "submitted"
+        assert exec_res["verified"] is True
+
+        # 6. Lifecycle tracking: Queued -> Running -> Progress -> Completed
+        att = mgr.start_attempt(workload_id=profile.workload_id, plan=selected_plan, job_id=exec_res["job_id"])
+        assert att.attempt_number == 1
+
+        mgr.update_progress(
+            workload_id=profile.workload_id,
+            progress_percent=50.0,
+            job_state="RUNNING",
+            elapsed_minutes=15.0,
+            cost_incurred_eur=3.50,
+        )
+        rec = mgr.finish_attempt(
+            workload_id=profile.workload_id,
+            final_status="COMPLETED",
+            total_cost_eur=7.20,
+            actual_duration_minutes=31.0,
+        )
+        assert rec["state"] == "COMPLETED"
+        assert rec["progress_percent"] == 100.0
+
+        # 7. Reconcile costs & variance vs estimate
+        comp = store.reconcile_costs(profile.workload_id, billed_cost_eur=7.15)
+        assert comp["workload_id"] == profile.workload_id
+        assert comp["cost_breakdown"]["observed_calculated_cost_eur"] == 7.20
+        assert comp["cost_breakdown"]["reconciled_billed_cost_eur"] == 7.15
+        assert comp["cost_breakdown"]["reconciliation_status"] == "reconciled_billed"
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_scenario_3_capacity_shortage_and_compatible_alternatives():
+    """Scenario 3: Distinguish temporary capacity shortage (stockout) from permanent incompatible configuration."""
+    # 1. Capacity shortage (temporary stockout / preemption)
+    findings_shortage = diagnose_blockers(
+        gcp_error="ZONE_RESOURCE_POOL_EXHAUSTED: The resource pool of n2-standard-32 instances is exhausted",
+    )
+    assert len(findings_shortage) > 0
+    item1 = findings_shortage[0]
+    assert item1["category"] == "capacity_shortage"
+    assert item1["confirmed"] is True
+    assert any("alternative machine" in act["action"].lower() or "zone" in act["action"].lower() for act in item1["possible_actions"])
+
+    # 2. Incompatible configuration (permanent configuration error)
+    findings_incompat = diagnose_blockers(
+        gcp_error="INVALID_ARGUMENT: Machine type custom-999-123 is not supported in zone us-central1-a",
+    )
+    assert len(findings_incompat) > 0
+    item2 = findings_incompat[0]
+    assert item2["category"] == "incompatible_configuration"
+    assert item2["confirmed"] is True
+
+
+def test_scenario_4_quota_insufficient_vs_physical_capacity():
+    """Scenario 4: Quota insufficient clearly identified from physical capacity, with remedies and no futile submits."""
+    findings = diagnose_blockers(
+        gcp_error="QUOTA_EXCEEDED: Quota 'CPUS' exceeded. Limit: 256.0 in region us-central1",
+    )
+    assert len(findings) > 0
+    item = findings[0]
+    assert item["category"] == "quota"
+    assert item["source"] == "gcp_compute_quota"
+    assert item["confirmed"] is True
+    assert any("increase" in act["action"].lower() or "region" in act["action"].lower() for act in item["possible_actions"])
+
+    # Capacity search flags quota status
+    os.environ["GCP_PROJECT_QUOTA_CPUS"] = "64"
+    os.environ["GCP_PROJECT_QUOTA_USED"] = "60"
+    try:
+        profile = WorkloadProfile(workload_id="wl-quota", cpu_requested=16, allowed_regions=["us-central1"])
+        cands = search_compatible_capacity(profile=profile, demo_mode=True)
+        exceeded_cands = [c for c in cands if c.quota_status == "QUOTA_EXCEEDED"]
+        assert len(exceeded_cands) > 0
+        # When quota is exceeded, stage remains catalog_proposed (not quota_authorized)
+        for c in exceeded_cands:
+            assert c.state_stage == "catalog_proposed"
+    finally:
+        os.environ.pop("GCP_PROJECT_QUOTA_CPUS", None)
+        os.environ.pop("GCP_PROJECT_QUOTA_USED", None)
+
+
+def test_scenario_5_unfeasible_workload_deterministic_explanation():
+    """Scenario 5: Unfeasible workload produces deterministic explanation of blocking constraints without inventing a winner."""
+    impossible_profile = WorkloadProfile(
+        workload_id="wl-impossible",
+        budget_amount=0.01,
+        deadline_minutes_from_start=0.5,
+        cpu_requested=64,
+    )
+    result = evaluate_and_compare_plans(impossible_profile, cluster_total_cpu=128, demo_mode=True)
+    assert result["is_feasible"] is False
+    assert result["plans"] == []
+    assert result["recommended_plan_id"] is None
+    assert "unfeasible_explanation" in result
+    explanation = result["unfeasible_explanation"]
+    assert "budget constraint violated" in explanation.lower()
+    assert "deadline constraint violated" in explanation.lower()
+    assert "suggested relaxations" in explanation.lower()
+
+
+def test_scenario_6_missing_telemetry_visible_uncertainty():
+    """Scenario 6: Missing or unavailable telemetry displays explicit uncertainty without silent fallback to demo data."""
+    # When demo_mode=False and no credentials/mock, signals report unavailable/unknown explicitly
+    profile = WorkloadProfile(workload_id="wl-uncertain", cpu_requested=4, allowed_regions=["us-central1"])
+    # Pass demo_mode=False explicitly to test truthful telemetry handling
+    candidates = search_compatible_capacity(profile=profile, demo_mode=False)
+    assert len(candidates) > 0
+    # Every candidate must have explicit truthful provenance
+    for c in candidates:
+        assert c.data_provenance in ("gcp_live_api", "unavailable", "unknown")
+        assert c.data_provenance != "simulated_demo"
+
+    # Lifecycle unmeasured progress
+    mgr = LifecycleManager()
+    mgr.register_workload(profile)
+    rec = mgr.update_progress(workload_id=profile.workload_id, progress_percent=None)
+    assert rec["progress_status"] == "unavailable"
+    assert rec["progress_percent"] is None
+
+
+def test_scenario_7_human_control_modes_strict_enforcement():
+    """Scenario 7: Strict backend enforcement of Advisory, Validation, and Delegation modes."""
+    runtime = SimulatedRuntime()
+    controller = ExecutionController(runtime)
+    plan = ExecutionPlan(
+        plan_id="plan-test-7",
+        title="Test Plan",
+        plan_type="cost_optimized",
+        cpu=16,
+        machine_type="n2-standard-16",
+        provisioning_model="100% Spot",
+        estimated_cost_eur=15.0,
+    )
+    profile = WorkloadProfile(workload_id="wl-gov-7", cpu_requested=16)
+
+    # 1. Mode Conseil (Advisory): Strictly blocks mutations
+    res_advisory = controller.submit_plan(profile=profile, plan=plan, control_mode="advisory", runtime=runtime)
+    assert res_advisory["status"] == "blocked"
+    assert "advisory mode is read-only" in res_advisory["reason"].lower()
+
+    # Also at runtime adapter level
+    runtime.set_control_mode("advisory")
+    with pytest.raises(PermissionError, match="advisory.*mode"):
+        runtime.apply(Action(action="resize_workload", workload_id="mc-001", cpu=16, reason="test"))
+
+    # 2. Mode Validation: Requires explicit human approval
+    res_val_unapproved = controller.submit_plan(
+        profile=profile,
+        plan=plan,
+        control_mode="validation",
+        is_operator_approved=False,
+        runtime=runtime,
+    )
+    assert res_val_unapproved["status"] == "blocked"
+    assert "requires explicit human operator approval" in res_val_unapproved["reason"].lower()
+
+    res_val_approved = controller.submit_plan(
+        profile=profile,
+        plan=plan,
+        control_mode="validation",
+        is_operator_approved=True,
+        runtime=runtime,
+    )
+    assert res_val_approved["status"] == "submitted"
+
+    # 3. Mode Délégation: Policy-bounded autonomy
+    # Policy with 20€ budget permits 15€ plan
+    res_del_ok = controller.submit_plan(
+        profile=profile,
+        plan=plan,
+        control_mode="delegation",
+        delegation_policy=DelegationPolicy(max_budget_eur=20.0),
+        runtime=runtime,
+    )
+    assert res_del_ok["status"] in ("submitted", "already_submitted")
+
+    # Policy with 10€ budget rejects 15€ plan
+    res_del_blocked = controller.submit_plan(
+        profile=WorkloadProfile(workload_id="wl-gov-7b", cpu_requested=16),
+        plan=plan,
+        control_mode="delegation",
+        delegation_policy=DelegationPolicy(max_budget_eur=10.0),
+        runtime=runtime,
+    )
+    assert res_del_blocked["status"] == "blocked"
+    assert "exceeds delegated policy budget limit" in res_del_blocked["reason"].lower()
+
+
+def test_scenario_8_ordered_fallback_ladder_and_budget_breach():
+    """Scenario 8: Ordered fallback ladder execution and refusal when exceeding remaining budget."""
+    controller = ExecutionController()
+    spot_plan = ExecutionPlan(
+        plan_id="plan-spot",
+        title="Spot Primary",
+        plan_type="cost_optimized",
+        cpu=32,
+        machine_type="n2-standard-32",
+        provisioning_model="100% Spot",
+        estimated_cost_eur=4.0,
+        fallback_plan_id="plan-standard",
+    )
+    standard_plan = ExecutionPlan(
+        plan_id="plan-standard",
+        title="Standard Fallback",
+        plan_type="deadline_favored",
+        cpu=32,
+        machine_type="n2-standard-32",
+        provisioning_model="100% Standard",
+        estimated_cost_eur=12.0,
+    )
+
+    available_plans = [spot_plan, standard_plan]
+
+    # Case A: Remaining budget is 20€, accumulated 2€ -> Total 14€ <= 20€ -> Fallback succeeds
+    fallback_res = controller.evaluate_fallback_ladder_with_details(
+        current_plan=spot_plan,
+        available_plans=available_plans,
+        failure_category="capacity_shortage",
+        budget_limit_eur=20.0,
+        accumulated_cost_eur=2.0,
+    )
+    assert fallback_res["status"] == "selected"
+    assert fallback_res["plan"].plan_id == "plan-standard"
+
+    # Case B: Remaining budget is 10€, accumulated 2€ -> Total 14€ > 10€ -> Budget breach rejected
+    breach_res = controller.evaluate_fallback_ladder_with_details(
+        current_plan=spot_plan,
+        available_plans=available_plans,
+        failure_category="capacity_shortage",
+        budget_limit_eur=10.0,
+        accumulated_cost_eur=2.0,
+    )
+    assert breach_res["status"] == "budget_breach"
+    assert breach_res["plan"] is None
+    assert "budget" in breach_res["reason"].lower()
+
+
+def test_scenario_9_submission_timeout_and_idempotency():
+    """Scenario 9: Ambiguous network timeout recovers active state without duplicate submission."""
+    runtime = SimulatedRuntime()
+    controller = ExecutionController(runtime)
+    plan = ExecutionPlan(
+        plan_id="plan-idemp-1",
+        title="Idempotent Plan",
+        plan_type="cost_optimized",
+        cpu=16,
+        machine_type="n2-standard-16",
+        provisioning_model="100% Spot",
+        estimated_cost_eur=5.0,
+    )
+    profile = WorkloadProfile(workload_id="wl-idemp-99", cpu_requested=16)
+
+    # First submission
+    res1 = controller.submit_plan(
+        profile=profile,
+        plan=plan,
+        control_mode="delegation",
+        runtime=runtime,
+    )
+    assert res1["status"] == "submitted"
+    first_job_id = res1["job_id"]
+
+    # Second submission with same workload_id -> Reuses existing job, avoids duplicate
+    res2 = controller.submit_plan(
+        profile=profile,
+        plan=plan,
+        control_mode="delegation",
+        runtime=runtime,
+    )
+    assert res2["status"] == "already_submitted"
+    assert res2["job_id"] == first_job_id
+
+
+def test_scenario_10_interruption_checkpoint_resume_and_non_interruptible_rejection():
+    """Scenario 10: Checkpoint resume supported for interruptible workloads; rejected for non-interruptible workloads."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        store = HistoryStore(db_path=db_path)
+        mgr = LifecycleManager(history_store=store)
+        plan = ExecutionPlan(
+            plan_id="plan-ckpt",
+            title="Checkpoint Plan",
+            plan_type="balanced_tradeoff",
+            cpu=16,
+            machine_type="n2-standard-16",
+            provisioning_model="100% Spot",
+            estimated_cost_eur=8.0,
+        )
+
+        # 1. Interruptible workload with checkpointing
+        ckpt_profile = WorkloadProfile(
+            workload_id="wl-ckpt-ok",
+            is_interruptible=True,
+            supports_checkpointing=True,
+            checkpoint_location="gs://bucket/checkpoints/wl-ckpt-ok",
+        )
+        mgr.register_workload(ckpt_profile)
+        att1 = mgr.start_attempt(workload_id="wl-ckpt-ok", plan=plan, job_id="job-1")
+        mgr.finish_attempt(workload_id="wl-ckpt-ok", final_status="PREEMPTED", failure_reason="Spot preemption")
+
+        can_resume, msg = mgr.can_resume_from_checkpoint("wl-ckpt-ok")
+        assert can_resume is True
+        assert "checkpoints/wl-ckpt-ok" in msg
+
+        # Resumed attempt recovers checkpoint URI
+        att2 = mgr.start_attempt(workload_id="wl-ckpt-ok", plan=plan, job_id="job-2")
+        assert att2.checkpoint_recovered_from is not None
+        assert "checkpoints/wl-ckpt-ok" in att2.checkpoint_recovered_from
+
+        # 2. Non-interruptible workload
+        non_int_profile = WorkloadProfile(
+            workload_id="wl-non-interruptible",
+            is_interruptible=False,
+            supports_checkpointing=False,
+        )
+        mgr.register_workload(non_int_profile)
+        can_resume2, msg2 = mgr.can_resume_from_checkpoint("wl-non-interruptible")
+        assert can_resume2 is False
+        assert "non-interruptible" in msg2.lower()
+
+        with pytest.raises(ValueError, match="non-interruptible"):
+            mgr.start_attempt(
+                workload_id="wl-non-interruptible",
+                plan=plan,
+                job_id="job-bad",
+                checkpoint_recovered_from="gs://bucket/fake",
+            )
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_scenario_11_scaling_and_safe_downscaling():
+    """Scenario 11: Cluster elastic sizing and safe downscaling protecting active running compute nodes."""
+    runtime = SimulatedRuntime()
+    controller = ExecutionController(runtime)
+
+    # Workload is currently RUNNING and not done
+    runtime.workload.id = "active-job-77"
+    runtime.workload.remaining_work_units = 250.0  # Not done!
+
+    # Attempting to downscale an active running workload must be rejected to protect nodes
+    res = controller.safe_downscale(workload_id="active-job-77", runtime=runtime)
+    assert res["status"] == "rejected"
+    assert res["safe"] is False
+    assert "currently running" in res["reason"].lower()
+
+    # Complete the workload
+    runtime.workload.remaining_work_units = 0.0
+    assert runtime.is_done() is True
+
+    # Now downscaling safely succeeds
+    res_done = controller.safe_downscale(workload_id="active-job-77", runtime=runtime)
+    assert res_done["status"] == "downscaled"
+    assert res_done["safe"] is True
+
+
+def test_scenario_12_persistence_and_restart_recovery():
+    """Scenario 12: Persistent storage preserves history and cost variance across application restarts."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        # Instance 1: write record before restart
+        store1 = HistoryStore(db_path=db_path)
+        prof = WorkloadProfile(workload_id="wl-persist-88", name="climate-model", cpu_requested=32)
+        rec = ExecutionHistoryRecord(
+            workload_id="wl-persist-88",
+            workload_name="climate-model",
+            profile=prof,
+            final_status="COMPLETED",
+            initial_estimated_cost_eur=45.0,
+            final_calculated_cost_eur=48.20,
+            cost_comparison_delta_eur=3.20,
+            initial_estimated_duration_minutes=120.0,
+            final_actual_duration_minutes=128.0,
+            duration_comparison_delta_minutes=8.0,
+            reconciliation_status="calculated_from_usage",
+        )
+        store1.save_history_record(rec)
+        del store1  # Simulate process shutdown
+
+        # Instance 2: new process reopens database
+        store2 = HistoryStore(db_path=db_path)
+        recovered = store2.get_history_record("wl-persist-88")
+        assert recovered is not None
+        assert recovered.workload_id == "wl-persist-88"
+        assert recovered.final_calculated_cost_eur == 48.20
+        assert recovered.cost_comparison_delta_eur == 3.20
+
+        # Calibration metrics are accessible
+        metrics = store2.get_comparable_metrics(machine_type="n2-standard-32")
+        assert "provenance" in metrics
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
