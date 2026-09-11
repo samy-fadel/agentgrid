@@ -247,6 +247,86 @@ class ExecutionController:
 
         return (True, "Within delegated policy boundaries.")
 
+    def check_profile_constraints(
+        self,
+        profile: WorkloadProfile | dict[str, Any] | None,
+        plan: ExecutionPlan | dict[str, Any],
+        current_plan: ExecutionPlan | dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Check a plan against the constraints the *operator declared on the workload*.
+
+        ``DelegationPolicy`` was the only thing consulted before launching, and
+        it is optional and separate. So a profile that says
+        ``allowed_regions=["europe-west4"], allow_region_change=False,
+        allow_spot=False`` did not stop a SPOT plan in ``us-central1`` from being
+        submitted: the constraint had to be *duplicated* into the policy to have
+        any effect, and nothing required that. The plan engine already honours
+        these fields when it builds plans; this makes them hold for a plan that
+        arrives from anywhere else, including a fallback rung.
+
+        ``current_plan`` switches on the comparative rules, which only mean
+        something relative to what is already running: ``allow_region_change``,
+        ``allow_zone_change`` and ``allow_fallback_to_standard``.
+        """
+        if profile is None:
+            return (True, "No workload profile supplied; profile constraints not evaluated.")
+        prof = profile if isinstance(profile, WorkloadProfile) else WorkloadProfile(**profile)
+        p = plan if isinstance(plan, ExecutionPlan) else ExecutionPlan(**plan)
+
+        if prof.allowed_regions and p.region not in prof.allowed_regions:
+            return (
+                False,
+                f"Plan region '{p.region}' is not permitted by the workload profile "
+                f"(allowed_regions={prof.allowed_regions}). Widen allowed_regions to "
+                f"authorise it.",
+            )
+
+        if prof.allowed_zones and p.zone and p.zone not in prof.allowed_zones:
+            return (
+                False,
+                f"Plan zone '{p.zone}' is not permitted by the workload profile "
+                f"(allowed_zones={prof.allowed_zones}). Widen allowed_zones to authorise it.",
+            )
+
+        plan_is_spot = "spot" in (p.provisioning_model or "").lower()
+        if plan_is_spot and not prof.allow_spot:
+            return (
+                False,
+                f"Plan provisioning model '{p.provisioning_model}' uses Spot capacity, which "
+                f"the workload profile forbids (allow_spot=False).",
+            )
+
+        if current_plan is not None:
+            curr = (
+                current_plan
+                if isinstance(current_plan, ExecutionPlan)
+                else ExecutionPlan(**current_plan)
+            )
+            if not prof.allow_region_change and p.region != curr.region:
+                return (
+                    False,
+                    f"Fallback would move the workload from region '{curr.region}' to "
+                    f"'{p.region}', which the workload profile forbids "
+                    f"(allow_region_change=False).",
+                )
+            if not prof.allow_zone_change and p.zone and curr.zone and p.zone != curr.zone:
+                return (
+                    False,
+                    f"Fallback would move the workload from zone '{curr.zone}' to '{p.zone}', "
+                    f"which the workload profile forbids (allow_zone_change=False).",
+                )
+            curr_is_spot = "spot" in (curr.provisioning_model or "").lower()
+            plan_is_standard = "standard" in (p.provisioning_model or "").lower()
+            if curr_is_spot and plan_is_standard and not prof.allow_fallback_to_standard:
+                return (
+                    False,
+                    f"Fallback would switch from '{curr.provisioning_model}' to "
+                    f"'{p.provisioning_model}', which the workload profile forbids "
+                    f"(allow_fallback_to_standard=False).",
+                )
+
+        return (True, "Within the workload profile's declared constraints.")
+
     def submit_plan(
         self,
         profile: WorkloadProfile | dict[str, Any],
@@ -304,6 +384,41 @@ class ExecutionController:
                 "job_id": None,
                 "verified": False,
             }
+
+        # 3. The operator's own declared constraints bind every mode. An
+        # approval authorises *a plan*; it does not repeal the location and
+        # provisioning limits recorded on the workload.
+        #
+        # Both the profile in the request and the profile the server persisted
+        # when the plans were compared are checked, and either one can refuse.
+        # Checking only the request would repeat the mistake of the
+        # self-attested approval flags: a caller could widen `allowed_regions`
+        # at execution time and walk straight through its own constraint.
+        from .history import get_history_store
+
+        stored_profile = get_history_store().get_workload_profile(workload_id)
+        for candidate_profile, profile_source in (
+            (stored_profile, "persisted_profile"),
+            (p_profile, "request_profile"),
+        ):
+            if candidate_profile is None:
+                continue
+            compliant, constraint_reason = self.check_profile_constraints(
+                candidate_profile, p_plan
+            )
+            if not compliant:
+                return {
+                    "status": "blocked",
+                    "control_mode": mode,
+                    "control_mode_source": mode_source,
+                    "reason": f"Execution blocked: {constraint_reason}",
+                    "violated_constraint": "workload_profile",
+                    "constraint_source": profile_source,
+                    "plan_id": p_plan.plan_id,
+                    "workload_id": workload_id,
+                    "job_id": None,
+                    "verified": False,
+                }
 
         # The submission identity is needed before the policy check, because the
         # cumulative budget is derived from the ledger and this submission must
@@ -365,13 +480,36 @@ class ExecutionController:
             if existing and existing["state"] in ("failed", "uncertain"):
                 self.governance.release_submission(key)
 
-        won, existing = self.governance.claim_submission(
+        # The ceilings are re-evaluated inside the claim's own transaction. The
+        # check above gives a precise message, but only the atomic claim can
+        # decide: four concurrent submissions of four different plans do not
+        # share a submission key, so nothing else separates them.
+        won, existing, refusal = self.governance.claim_submission_within_limits(
             key=key,
             workload_id=workload_id,
             plan_id=p_plan.plan_id,
             fingerprint=fingerprint,
             estimated_cost_eur=p_plan.estimated_cost_eur,
+            max_launches=policy.max_retries if mode == "delegation" else None,
+            max_committed_cost_eur=policy.max_budget_eur if mode == "delegation" else None,
+            caller_accumulated_cost_eur=accumulated_cost_eur,
+            caller_attempts_used=attempts_used,
         )
+
+        if refusal is not None:
+            return {
+                "status": "blocked",
+                "control_mode": mode,
+                "control_mode_source": mode_source,
+                "reason": refusal,
+                "plan_id": p_plan.plan_id,
+                "workload_id": workload_id,
+                "job_id": None,
+                "verified": False,
+                "accumulated_cost_source": "server_submission_ledger",
+                "attempts_source": "server_submission_ledger",
+                "decided_atomically": True,
+            }
 
         if not won:
             return self._describe_existing_submission(existing, mode, mode_source, rt)
@@ -706,16 +844,42 @@ class ExecutionController:
         delegation_policy: DelegationPolicy | dict[str, Any] | None = None,
         workload_id: str | None = None,
         attempts_used: int = 0,
+        profile: WorkloadProfile | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Choose the next rung of the fallback ladder, subject to the same rules.
 
         A fallback is a fresh mutation, so it is bound by the same authority as
         the original submission: the cumulative budget, the delegation policy,
-        and the control mode. An unauthorised fallback stops for validation
-        instead of proceeding.
+        the control mode, *and* the constraints declared on the workload itself.
+
+        The last one was missing. The ladder never saw the profile, so a
+        "controlled" fallback happily moved a workload pinned to
+        ``europe-west4`` with ``allow_region_change=False`` over to
+        ``us-central1``, and switched a workload with
+        ``allow_fallback_to_standard=False`` onto on-demand capacity. A rung that
+        breaks a declared constraint is now skipped, with the reason recorded,
+        rather than presented as the controlled alternative.
+
+        When ``profile`` is not supplied but ``workload_id`` is, the profile is
+        read from persistent history, so existing callers gain the check without
+        changing their call sites.
         """
         curr = current_plan if isinstance(current_plan, ExecutionPlan) else ExecutionPlan(**current_plan)
         candidates = [p if isinstance(p, ExecutionPlan) else ExecutionPlan(**p) for p in available_plans]
+
+        effective_profile: WorkloadProfile | None = None
+        profile_source = "unavailable"
+        if profile is not None:
+            effective_profile = (
+                profile if isinstance(profile, WorkloadProfile) else WorkloadProfile(**profile)
+            )
+            profile_source = "caller_supplied"
+        elif workload_id:
+            from .history import get_history_store
+
+            effective_profile = get_history_store().get_workload_profile(workload_id)
+            if effective_profile is not None:
+                profile_source = "persisted_profile"
 
         # Resolve governing mode when a workload is named, so that a fallback
         # cannot execute in a mode the operator did not grant.
@@ -756,7 +920,19 @@ class ExecutionController:
             if cand.plan_id != curr.plan_id and cand not in ordered_ladder:
                 ordered_ladder.append(cand)
 
+        skipped: list[dict[str, str]] = []
         for cand in ordered_ladder:
+            # A rung that breaks a constraint the operator declared on the
+            # workload is not a fallback, it is an unauthorised move. Skip it and
+            # keep looking rather than failing the whole ladder: a compliant rung
+            # further down is exactly what the operator asked for.
+            compliant, constraint_reason = self.check_profile_constraints(
+                effective_profile, cand, current_plan=curr
+            )
+            if not compliant:
+                skipped.append({"plan_id": cand.plan_id, "reason": constraint_reason})
+                continue
+
             projected_total = accumulated_cost_eur + cand.estimated_cost_eur
             if budget_limit_eur is not None and projected_total > budget_limit_eur:
                 return {
@@ -767,6 +943,8 @@ class ExecutionController:
                     "budget_limit_eur": budget_limit_eur,
                     "accumulated_cost_eur": accumulated_cost_eur,
                     "accumulated_cost_source": accumulated_source,
+                    "skipped_candidates": skipped,
+                    "profile_constraints_source": profile_source,
                     "reason": (
                         f"Fallback plan '{cand.plan_id}' ({cand.title}) rejected: "
                         f"projected total cost {projected_total:.2f}EUR exceeds remaining budget "
@@ -792,12 +970,27 @@ class ExecutionController:
                         "budget_limit_eur": budget_limit_eur,
                         "accumulated_cost_eur": accumulated_cost_eur,
                         "accumulated_cost_source": accumulated_source,
+                        "skipped_candidates": skipped,
+                        "profile_constraints_source": profile_source,
                         "reason": (
                             f"Fallback plan '{cand.plan_id}' is not authorised by the delegated "
                             f"policy: {policy_reason} Stopping for human validation."
                         ),
                     }
 
+            # Selecting a rung is not the same as being allowed to launch it.
+            # Outside delegation the operator still has to approve this exact
+            # plan, and saying so here stops "selected" from reading as "done".
+            normalized_mode = (
+                normalize_control_mode(effective_mode) if effective_mode is not None else None
+            )
+            requires_approval = normalized_mode != "delegation"
+            reason = f"Fallback to plan '{cand.plan_id}' within remaining budget and policy."
+            if requires_approval:
+                reason += (
+                    " This is a proposal: the plan must still be registered and approved "
+                    "before it can be submitted."
+                )
             return {
                 "status": "selected",
                 "plan": cand,
@@ -805,12 +998,30 @@ class ExecutionController:
                 "budget_limit_eur": budget_limit_eur,
                 "accumulated_cost_eur": accumulated_cost_eur,
                 "accumulated_cost_source": accumulated_source,
-                "reason": f"Fallback to plan '{cand.plan_id}' within remaining budget and policy.",
+                "control_mode": normalized_mode,
+                "requires_approval": requires_approval,
+                "skipped_candidates": skipped,
+                "profile_constraints_source": profile_source,
+                "reason": reason,
+            }
+
+        if skipped:
+            return {
+                "status": "constraint_breach",
+                "plan": None,
+                "skipped_candidates": skipped,
+                "profile_constraints_source": profile_source,
+                "reason": (
+                    "No fallback plan respects the constraints declared on the workload: "
+                    + " ".join(f"{s['plan_id']}: {s['reason']}" for s in skipped)
+                ),
             }
 
         return {
             "status": "no_plan_available",
             "plan": None,
+            "skipped_candidates": skipped,
+            "profile_constraints_source": profile_source,
             "reason": "No fallback plan available in ladder.",
         }
 

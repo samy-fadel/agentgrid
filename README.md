@@ -218,6 +218,30 @@ Structured taxonomy classifying execution impediments into:
   and runs forever. A released `submitted` or `uncertain` claim also keeps its cost charged: a
   job existed, or may have, and authorising another try is not a refund. A released `failed`
   claim created nothing and is refunded.
+* **The constraints declared on the workload bind execution, not just planning.**
+  `allowed_regions`, `allowed_zones`, `allow_spot`, `allow_region_change`, `allow_zone_change`
+  and `allow_fallback_to_standard` used to be honoured only by the plan engine. `DelegationPolicy`
+  was the sole thing consulted before launching, it is optional, and nothing forced the operator
+  to restate their constraints in it — so a workload pinned to `europe-west4` with
+  `allow_spot=False` could be submitted onto Spot capacity in `us-central1`. They are now checked
+  on every submission, in every mode: an approval authorises *a plan*, it does not repeal a
+  location limit. They are also checked against the profile the server persisted when the plans
+  were compared, so a caller cannot widen its own constraints in the execution request; the
+  refusal names which profile refused (`constraint_source`).
+* **A fallback rung is subject to the same constraints.** The ladder never received the profile,
+  which made the step meant to be the most controlled the least controlled one: it would move a
+  region-pinned workload to another region, or switch a Spot-only workload to on-demand. A
+  non-compliant rung is now skipped with its reason recorded in `skipped_candidates`, a compliant
+  rung further down is still selected, and `constraint_breach` is returned when none survives.
+  When no profile can be read at all, `profile_constraints_source: unavailable` says so instead
+  of implying the rung was checked. Outside delegation the verdict carries
+  `requires_approval: true`: selecting a rung is a proposal, not a licence to launch.
+* **Both ceilings are evaluated inside the claim's own transaction.** Checking on one
+  connection and inserting on another is a time-of-check/time-of-use race, and it is not
+  theoretical: four *different* plans submitted concurrently do not share a submission key, so
+  the primary key does not separate them, and all four were accepted under `max_retries: 1`.
+  `claim_submission_within_limits` takes the write lock with `BEGIN IMMEDIATE` before counting.
+  `tests/test_concurrent_submission.py` runs real threads against one database file.
 * **Execution Safety**:
   * **Ordered Fallback Ladder**: Automatic failover (e.g., Spot → Standard On-Demand) when stockouts occur, staying within remaining budget.
   * **Idempotent Anti-Duplicate Submission**: A submission is claimed in a persistent SQLite
@@ -246,7 +270,15 @@ Structured taxonomy classifying execution impediments into:
 * **3-Tier Cost Model**:
   1. `initial_estimated_cost_eur`: Pre-execution deterministic estimate.
   2. `calculated_from_usage_eur`: Actual elapsed node-hours × verified VM rates.
-  3. `reconciled_billed_cost_eur`: Verified GCP Cloud Billing export (explicitly flagged when not integrated).
+  3. `reconciled_billed_cost_eur`: only labelled `reconciled_billed` when the caller names
+     `billed_cost_source="gcp_billing_export"`. There is no billing integration in this project,
+     so a figure simply handed to the API is reported as `caller_supplied_unverified`, and the
+     absence of any figure as `source_not_integrated`.
+
+  Tier 2 counts **only** attempts whose `cost_status` is `calculated_from_usage`. A figure a
+  caller merely stated (`cost_status="estimated"`, which is what the MCP tool records) is
+  reported separately as `declared_unverified_cost_eur`; `total_recorded_cost_eur` still holds
+  everything, and the variance against the estimate is computed on that total.
 * **Continuous Benchmark Calibration**: Aggregates verified work-unit execution rates and interruption frequencies into a self-calibrating benchmark table.
 
 
@@ -258,10 +290,14 @@ Being precise about this matters more than the feature list. As of the current c
 | :--- | :--- | :--- |
 | Governance (advisory / validation / delegation), plan registration, fingerprint-bound approval, idempotent submission | **Verified** | `tests/test_http_journey.py`, `tests/test_mcp_http_governance.py`, plus a full journey run with `curl` against a live server |
 | Cumulative delegated budget ceiling (server-derived, caller cannot understate it) | **Verified** | `tests/test_delegation_budget_ceiling.py` — 9 of its 10 controller tests fail against the previous code |
+| Idempotency and delegated ceilings under real concurrency | **Verified** | `tests/test_concurrent_submission.py` — 8 racing threads yield one job and one charge |
 | Plan comparison, infeasibility explanations, constraint rejection | **Verified** | `tests/test_evolved_capabilities.py`, `tests/test_agentgrid_evolutions.py` |
 | Location constraints and quota staging | **Verified** | `tests/test_capacity_location_constraints.py` |
 | Lifecycle, checkpoint verification, cost accounting across attempts and restarts | **Verified** | `tests/test_checkpoint_verification.py`, `tests/test_cost_accounting_journey.py` |
-| GCP quota read | **Exercised against the real API** | a live `/api/capacity-search` returned `data_provenance: gcp_live_api` with a genuine `QUOTA_EXCEEDED` |
+| GCP quota read (regional `CPUS` / `NVIDIA_*_GPUS` **and** the project-wide `GPUS_ALL_REGIONS` ceiling) | **Exercised against the real API** | a live `/api/capacity-search` returned `data_provenance: gcp_live_api` with a genuine `QUOTA_EXCEEDED`; response shapes pinned in `tests/test_quota_api_contract.py` against the published [`regions.get`](https://cloud.google.com/compute/docs/reference/rest/v1/regions/get) and [`projects.get`](https://cloud.google.com/compute/docs/reference/rest/v1/projects/get) contracts |
+| Separation of measured cost from declared cost, and refusal to call an unsourced figure "reconciled billing" | **Verified** | `tests/test_cost_reconciliation_honesty.py` — 10 of its 11 tests fail against the previous code |
+| The workload's own constraints (region, zone, Spot, fallback to Standard) bind submission *and* every fallback rung | **Verified** | `tests/test_profile_constraints.py` — before the fix a plan in a forbidden region was submitted with a real job id |
+| A caller cannot widen its own constraints at execution time | **Verified** | `tests/test_profile_constraints.py` — the profile persisted at plan-comparison time refuses first; `constraint_source` names which profile refused |
 | Execution | **Simulator only** | no VM has been provisioned by this project's test runs |
 | Slurm adapter | **Mocked HTTP only** | `tests/test_slurm.py`, `tests/test_slurm_telemetry_defects.py` drive stubbed `slurmrestd` responses. **Not validated against a real cluster.** |
 | Dashboard | **Compiled and rendered offline, not opened in a browser** | `tools/check_jsx.py`, `tools/render_check.py`. CSS, layout and real event dispatch are **not** covered. |

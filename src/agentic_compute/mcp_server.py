@@ -223,6 +223,18 @@ async def compare_plans_route(request):
 
     workload_id = profile["workload_id"]
     command = profile.get("command") or profile.get("script")
+
+    # Persist the profile the plans were built from, so its declared constraints
+    # remain enforceable against a submission that arrives with a wider profile.
+    try:
+        from .models import WorkloadProfile as _WorkloadProfile
+
+        _history_store.save_workload_profile(_WorkloadProfile(**profile))
+        result["profile_persisted"] = True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not persist workload profile %s: %s", workload_id, exc)
+        result["profile_persisted"] = False
+
     if result.get("plans"):
         gov = get_governance_store()
         for plan_dict in result["plans"]:
@@ -699,14 +711,29 @@ def get_cost_history(
     - estimated_cost
     - calculated_from_usage
     - reconciled_billed (explicitly distinguished from calculated)
+
+    A figure passed as ``reconcile_billed_eur`` arrives from whoever called this
+    tool, which includes the language model. It is recorded as
+    ``caller_supplied_unverified``, never as a reconciliation: there is no
+    billing export integration behind it.
     """
     if workload_id:
         rec = _history_store.get_history_record(workload_id)
-        comp = _history_store.reconcile_costs(workload_id, billed_cost_eur=reconcile_billed_eur)
-        return {
+        comp = _history_store.reconcile_costs(
+            workload_id,
+            billed_cost_eur=reconcile_billed_eur,
+            billed_cost_source="caller_supplied" if reconcile_billed_eur is not None else None,
+        )
+        result = {
             "record": rec.model_dump() if rec else None,
             "reconciliation": comp,
         }
+        if reconcile_billed_eur is not None:
+            result["billed_figure_caveat"] = (
+                "The billed figure was supplied by the caller and has not been checked "
+                "against any billing export."
+            )
+        return result
     records = _history_store.list_history_records()
     return {"records": [r.model_dump() for r in records]}
 

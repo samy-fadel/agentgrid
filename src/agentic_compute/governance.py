@@ -509,10 +509,97 @@ class GovernanceStore:
         can rebuild the cumulative committed spend from the server's own records
         instead of trusting a figure supplied by the caller.
         """
+        won, row, _refusal = self.claim_submission_within_limits(
+            key=key,
+            workload_id=workload_id,
+            plan_id=plan_id,
+            fingerprint=fingerprint,
+            estimated_cost_eur=estimated_cost_eur,
+        )
+        return won, row
+
+    def claim_submission_within_limits(
+        self,
+        key: str,
+        workload_id: str,
+        plan_id: str,
+        fingerprint: str,
+        estimated_cost_eur: float | None = None,
+        max_launches: int | None = None,
+        max_committed_cost_eur: float | None = None,
+        caller_accumulated_cost_eur: float = 0.0,
+        caller_attempts_used: int = 0,
+    ) -> tuple[bool, dict[str, Any], Optional[str]]:
+        """Check the cumulative ceilings and claim, in a single transaction.
+
+        Returns ``(won, row, refusal)``. ``refusal`` is a sentence when a
+        delegated ceiling forbids the claim, and ``None`` otherwise.
+
+        Checking the ceilings on one connection and inserting on another is a
+        time-of-check/time-of-use race, and it is not theoretical: four
+        concurrent submissions of four *different* plans do not share a
+        submission key, so the primary key does not separate them. They all read
+        "0 launches used" and all four were accepted under ``max_retries: 1``.
+        ``BEGIN IMMEDIATE`` takes the write lock before the count, so the
+        ceilings are evaluated against a state nobody else can be changing.
+        """
         now = time.time()
         if estimated_cost_eur is None:
             estimated_cost_eur = self._registered_plan_cost(plan_id)
-        with self._connect() as conn:
+        plan_cost = float(estimated_cost_eur or 0.0)
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            existing = conn.execute(
+                "SELECT * FROM submission_ledger WHERE submission_key = ?", (key,)
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return False, dict(existing), None
+
+            if max_launches is not None or max_committed_cost_eur is not None:
+                commitments = self._commitments_on(conn, workload_id, exclude_key=key)
+
+                if max_launches is not None:
+                    attempts = max(caller_attempts_used, commitments["launched_attempts"])
+                    if attempts >= max_launches:
+                        conn.rollback()
+                        return (
+                            False,
+                            {},
+                            (
+                                f"Execution blocked: delegated retry budget exhausted "
+                                f"({attempts}/{max_launches} attempts used). "
+                                f"Human validation required."
+                            ),
+                        )
+
+                if max_committed_cost_eur is not None:
+                    spent = max(
+                        caller_accumulated_cost_eur, commitments["committed_cost_eur"]
+                    )
+                    projected = spent + plan_cost
+                    if projected > max_committed_cost_eur:
+                        detail = (
+                            f"cumulative {projected:.2f}EUR (already spent {spent:.2f}EUR "
+                            f"+ plan {plan_cost:.2f}EUR)"
+                            if spent
+                            else f"{plan_cost:.2f}EUR"
+                        )
+                        conn.rollback()
+                        return (
+                            False,
+                            {},
+                            (
+                                f"Execution blocked: Plan estimated cost {detail} exceeds "
+                                f"delegated policy budget limit "
+                                f"({max_committed_cost_eur:.2f}EUR). "
+                                f"Human validation required."
+                            ),
+                        )
+
             try:
                 conn.execute(
                     """
@@ -527,13 +614,15 @@ class GovernanceStore:
                 conn.commit()
                 won = True
             except sqlite3.IntegrityError:
+                conn.rollback()
                 won = False
 
             row = conn.execute(
                 "SELECT * FROM submission_ledger WHERE submission_key = ?", (key,)
             ).fetchone()
-
-        return won, dict(row) if row else {}
+            return won, (dict(row) if row else {}), None
+        finally:
+            conn.close()
 
     def _registered_plan_cost(self, plan_id: str) -> Optional[float]:
         """Best-effort price for a plan that was registered before submission."""
@@ -572,6 +661,19 @@ class GovernanceStore:
         ``exclude_key`` omits one submission key, which is what makes a replay
         of an already-claimed submission avoid counting itself twice.
         """
+        with self._connect() as conn:
+            return self._commitments_on(conn, workload_id, exclude_key)
+
+    def _commitments_on(
+        self, conn: sqlite3.Connection, workload_id: str, exclude_key: str | None = None
+    ) -> dict[str, Any]:
+        """Aggregate commitments on an existing connection.
+
+        Split out so the atomic claim can evaluate the ceilings inside the very
+        transaction that inserts the claim. Evaluating them on a separate
+        connection first is a time-of-check/time-of-use race: four concurrent
+        submissions all read "0 launches" and all proceed.
+        """
         placeholders = ", ".join("?" for _ in self.COMMITTING_STATES)
         sql = (
             f"SELECT submission_key, plan_id, state, estimated_cost_eur "
@@ -589,17 +691,16 @@ class GovernanceStore:
             launched_sql += " AND submission_key != ?"
             launched_params.append(exclude_key)
 
-        with self._connect() as conn:
-            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
-            live_launches = conn.execute(launched_sql, launched_params).fetchone()["n"]
-            archived = [
-                dict(r)
-                for r in conn.execute(
-                    "SELECT submission_key, plan_id, state, estimated_cost_eur "
-                    "FROM submission_archive WHERE workload_id = ?",
-                    (workload_id,),
-                ).fetchall()
-            ]
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        live_launches = conn.execute(launched_sql, launched_params).fetchone()["n"]
+        archived = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT submission_key, plan_id, state, estimated_cost_eur "
+                "FROM submission_archive WHERE workload_id = ?",
+                (workload_id,),
+            ).fetchall()
+        ]
 
         committed = 0.0
         unpriced = 0

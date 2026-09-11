@@ -494,7 +494,11 @@ def test_feature6_history_persistence_and_three_tier_reconciliation():
         # Tier 1: Initial estimated
         # Tier 2: Calculated from usage
         # Tier 3: Reconciled billed (external billing)
-        reconciled = store2.reconcile_costs("wl-p1", billed_cost_eur=3.25)
+        # Tier 3 is only a reconciliation when the figure is attributed to a
+        # billing export; an unqualified figure is caller_supplied_unverified.
+        reconciled = store2.reconcile_costs(
+            "wl-p1", billed_cost_eur=3.25, billed_cost_source="gcp_billing_export"
+        )
         assert reconciled["cost_tiers"]["tier1_estimated_cost_eur"] == 3.50
         assert reconciled["cost_tiers"]["tier2_calculated_from_usage_eur"] == 3.10
         assert reconciled["cost_tiers"]["tier3_reconciled_billed_eur"] == 3.25

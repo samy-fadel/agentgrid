@@ -312,48 +312,105 @@ class HistoryStore:
             return [ExecutionHistoryRecord.model_validate(json.loads(r["record_json"])) for r in rows]
 
     def reconcile_costs(
-        self, workload_id: str, billed_cost_eur: Optional[float] = None
+        self,
+        workload_id: str,
+        billed_cost_eur: Optional[float] = None,
+        billed_cost_source: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Perform 3-tier cost and duration comparison distinguishing estimates, observed usage, and billed figures."""
+        """Perform 3-tier cost and duration comparison distinguishing estimates, observed usage, and billed figures.
+
+        Costs are separated by *how they were obtained*. Summing every attempt
+        into one number and calling it "calculated from usage" hid the
+        difference: a figure the language model stated through the MCP tool
+        (``cost_status="estimated"``) landed in the same total as a figure read
+        from the runtime, under a note asserting it came from authoritative
+        node-hours.
+
+        ``billed_cost_source`` distinguishes a real billing export from a figure
+        a caller simply supplied. There is no billing integration in this
+        project, so an unqualified figure is reported as caller-supplied and
+        unverified rather than as reconciled billing.
+        """
         record = self.get_history_record(workload_id)
         attempts = self.get_attempts(workload_id)
         profile = self.get_workload_profile(workload_id)
 
-        total_observed_cost = sum(a.cost_calculated_eur for a in attempts)
+        measured_cost = sum(
+            a.cost_calculated_eur for a in attempts if a.cost_status == "calculated_from_usage"
+        )
+        declared_cost = sum(
+            a.cost_calculated_eur for a in attempts if a.cost_status == "estimated"
+        )
+        billed_attempt_cost = sum(
+            a.cost_calculated_eur for a in attempts if a.cost_status == "reconciled_billed"
+        )
+        total_recorded_cost = measured_cost + declared_cost + billed_attempt_cost
+        declared_attempts = [a for a in attempts if a.cost_status == "estimated"]
+
         total_observed_duration = sum(a.elapsed_minutes for a in attempts)
 
         estimated_cost = record.initial_estimated_cost_eur if record else 0.0
         estimated_duration = record.initial_estimated_duration_minutes if record else 0.0
 
-        if billed_cost_eur is not None:
-            billed_status = "reconciled_billed"
-            billed_val = billed_cost_eur
-        else:
+        if billed_cost_eur is None:
             billed_status = "source_not_integrated"
             billed_val = None
+            billed_source = None
+        elif billed_cost_source == "gcp_billing_export":
+            billed_status = "reconciled_billed"
+            billed_val = billed_cost_eur
+            billed_source = billed_cost_source
+        else:
+            # Somebody handed us a number. That is not a reconciliation.
+            billed_status = "caller_supplied_unverified"
+            billed_val = billed_cost_eur
+            billed_source = billed_cost_source or "caller_supplied"
 
-        cost_delta = round(total_observed_cost - estimated_cost, 4)
+        cost_delta = round(total_recorded_cost - estimated_cost, 4)
         duration_delta = round(total_observed_duration - estimated_duration, 2)
+
+        if declared_cost and measured_cost:
+            basis_note = (
+                f"Mixed basis: {measured_cost:.2f}EUR calculated from observed node-hours "
+                f"and {declared_cost:.2f}EUR declared by a caller and never verified. "
+                f"Reconciled billing requires an external GCP Cloud Billing export, "
+                f"which is not integrated."
+            )
+        elif declared_cost:
+            basis_note = (
+                f"All {declared_cost:.2f}EUR was declared by a caller and never verified "
+                f"against the runtime. Reconciled billing requires an external GCP Cloud "
+                f"Billing export, which is not integrated."
+            )
+        else:
+            basis_note = (
+                "Observed cost is calculated from active node-hours and a known rate; "
+                "reconciled billing requires external GCP Cloud Billing export integration."
+            )
 
         return {
             "workload_id": workload_id,
             "cost_tiers": {
                 "tier1_estimated_cost_eur": estimated_cost,
-                "tier2_calculated_from_usage_eur": round(total_observed_cost, 4),
+                "tier2_calculated_from_usage_eur": round(measured_cost, 4),
                 "tier3_reconciled_billed_eur": billed_val,
             },
+            "tier3_source": billed_source,
+            "declared_unverified_cost_eur": round(declared_cost, 4),
+            "total_recorded_cost_eur": round(total_recorded_cost, 4),
+            "declared_attempt_ids": [a.attempt_id for a in declared_attempts],
             "billed_reconciliation_status": billed_status,
             "workload_name": profile.name if profile else (record.workload_name if record else "unknown"),
             "cost_breakdown": {
                 "initial_estimated_cost_eur": estimated_cost,
-                "observed_calculated_cost_eur": round(total_observed_cost, 4),
+                "observed_calculated_cost_eur": round(measured_cost, 4),
+                "declared_unverified_cost_eur": round(declared_cost, 4),
+                "total_recorded_cost_eur": round(total_recorded_cost, 4),
                 "cost_delta_eur": cost_delta,
+                "cost_delta_basis": "total_recorded_cost_eur",
                 "reconciled_billed_cost_eur": billed_val,
                 "reconciliation_status": billed_status,
-                "cost_basis_note": (
-                    "Observed cost is calculated from authoritative active node-hours and known rate; "
-                    "reconciled billing requires external GCP Cloud Billing export integration."
-                ),
+                "cost_basis_note": basis_note,
                 "known_exclusions": [
                     "network_egress",
                     "persistent_disk_storage",

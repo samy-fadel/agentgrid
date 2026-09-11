@@ -39,6 +39,12 @@ def _profile(workload_id: str = WORKLOAD) -> dict:
         "name": "budget ceiling probe",
         "cpu_requested": 4,
         "command": "echo hi",
+        # These plans deliberately span several regions to obtain distinct
+        # fingerprints. The operator has to actually allow them: submission now
+        # enforces the profile's own `allowed_regions`, whose default is
+        # ["us-central1"], and a budget test must not accidentally become a
+        # location test.
+        "allowed_regions": REGIONS,
     }
 
 

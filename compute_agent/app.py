@@ -390,6 +390,21 @@ async def compare_plans_endpoint(request: Request) -> dict[str, Any]:
 
     workload_id = profile["workload_id"]
     command = profile.get("command") or profile.get("script")
+
+    # Persist the profile the plans were built from. The constraints it carries
+    # (allowed regions and zones, Spot, fallback to Standard) have to be
+    # enforceable later against a plan submitted with a *different*, wider
+    # profile in the request body.
+    try:
+        from agentic_compute.history import get_history_store
+        from agentic_compute.models import WorkloadProfile as _WorkloadProfile
+
+        get_history_store().save_workload_profile(_WorkloadProfile(**profile))
+        res["profile_persisted"] = True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not persist workload profile %s: %s", workload_id, exc)
+        res["profile_persisted"] = False
+
     if res.get("plans"):
         gov = get_governance_store()
         for plan_dict in res["plans"]:

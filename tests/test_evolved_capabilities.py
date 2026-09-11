@@ -138,7 +138,13 @@ def test_scenario_2_nominal_end_to_end_journey():
         assert rec["progress_percent"] == 100.0
 
         # 7. Reconcile costs & variance vs estimate
-        comp = store.reconcile_costs(profile.workload_id, billed_cost_eur=7.15)
+        # A billed figure only counts as a reconciliation when it comes from a
+        # billing export.  This scenario asserts that path, so it names the
+        # source explicitly; an unqualified figure is now reported as
+        # caller_supplied_unverified (see test_cost_reconciliation_honesty.py).
+        comp = store.reconcile_costs(
+            profile.workload_id, billed_cost_eur=7.15, billed_cost_source="gcp_billing_export"
+        )
         assert comp["workload_id"] == profile.workload_id
         assert comp["cost_breakdown"]["observed_calculated_cost_eur"] == 7.20
         assert comp["cost_breakdown"]["reconciled_billed_cost_eur"] == 7.15

@@ -376,32 +376,43 @@ GCP_MACHINE_CATALOG = {
 
 #: Compute Engine regional quota metric names, per
 #: https://cloud.google.com/compute/docs/reference/rest/v1/regions/get
-#: The response carries ``quotas[]`` entries shaped ``{metric, limit, usage}``.
+#: The response carries ``quotas[]`` entries shaped
+#: ``{metric (enum), limit (number), usage (number), owner (string)}``.
 _CPU_QUOTA_METRIC = "CPUS"
 _PREEMPTIBLE_CPU_QUOTA_METRIC = "PREEMPTIBLE_CPUS"
 _GPU_QUOTA_METRICS = (
     "NVIDIA_A100_GPUS",
     "NVIDIA_L4_GPUS",
     "NVIDIA_T4_GPUS",
-    "GPUS_ALL_REGIONS",
 )
 
+#: ``GPUS_ALL_REGIONS`` is a *project-wide* ceiling on the total number of GPUs
+#: of every type, and it is not returned by ``regions.get``. It was listed among
+#: the regional metrics, where it could never match, so the project-wide ceiling
+#: was simply never checked. It is commonly 0 on a new project: a request can fit
+#: the regional NVIDIA_L4_GPUS quota perfectly and still fail every single VM
+#: creation. Read from
+#: https://cloud.google.com/compute/docs/reference/rest/v1/projects/get
+#: whose ``quotas[]`` entries have the same shape.
+_GLOBAL_GPU_QUOTA_METRIC = "GPUS_ALL_REGIONS"
 
-def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
-    """Read live regional quotas from the Compute Engine API.
+
+def _fetch_quotas(url: str, what: str) -> dict[str, Any]:
+    """Read a ``quotas[]`` collection from the Compute Engine API.
 
     Returns ``{"status": "ok", "quotas": {METRIC: {"limit": x, "usage": y}}}``
     or ``{"status": "unavailable", "reason": ...}``. Never invents numbers:
-    when the call cannot be made or the region reports no quota data, the
+    when the call cannot be made or the resource reports no quota data, the
     caller must surface uncertainty instead of a default.
+
+    Both ``regions.get`` and ``projects.get`` return the same
+    ``{metric, limit, usage, owner}`` shape, so one reader serves both.
     """
     if not HAVE_GOOGLE_AUTH:
         return {
             "status": "unavailable",
             "reason": "google-auth is not installed; no credentials path available.",
         }
-    if not project_id:
-        return {"status": "unavailable", "reason": "No GCP project id configured."}
 
     try:
         credentials, _ = google.auth.default(
@@ -416,10 +427,6 @@ def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
             "reason": f"Could not obtain GCP credentials: {type(exc).__name__}: {exc}",
         }
 
-    url = (
-        f"https://compute.googleapis.com/compute/v1/projects/{project_id}"
-        f"/regions/{region}?fields=quotas,quotaStatusWarning"
-    )
     try:
         resp = requests.get(
             url, headers={"Authorization": f"Bearer {token}"}, timeout=10.0
@@ -427,15 +434,14 @@ def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
     except Exception as exc:
         return {
             "status": "unavailable",
-            "reason": f"Compute Engine regions.get call failed: {type(exc).__name__}: {exc}",
+            "reason": f"Compute Engine {what} call failed: {type(exc).__name__}: {exc}",
         }
 
     if resp.status_code != 200:
         return {
             "status": "unavailable",
             "reason": (
-                f"Compute Engine regions.get returned HTTP {resp.status_code} "
-                f"for project '{project_id}' region '{region}'."
+                f"Compute Engine {what} returned HTTP {resp.status_code}."
             ),
         }
 
@@ -445,14 +451,17 @@ def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
         return {"status": "unavailable", "reason": f"Malformed quota response: {exc}"}
 
     entries = payload.get("quotas") or []
+    warning = _describe_quota_warning(payload.get("quotaStatusWarning"))
+
     if not entries:
-        # The API documents a fail-open behaviour where quota data may simply be
-        # missing for a region. That is not the same as "quota is fine".
-        warning = payload.get("quotaStatusWarning")
+        # regions.get fails *open* by default: it returns 200 with no quotas
+        # field when quota data is unavailable, unless the organisation policy
+        # constraint compute.requireBasicQuotaInResponse is enforced. Absent
+        # quota data is not the same as "quota is fine".
         return {
             "status": "unavailable",
             "reason": (
-                f"Region '{region}' returned no quota data"
+                f"Compute Engine {what} returned no quota data"
                 + (f" ({warning})" if warning else "")
                 + "."
             ),
@@ -466,7 +475,47 @@ def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
         for e in entries
         if e.get("metric")
     }
-    return {"status": "ok", "quotas": quotas}
+    # quotaStatusWarning is documented as being populated *only* when fetching
+    # the quotas field failed, so its presence alongside data means the data is
+    # partial. Passing it up beats silently trusting an incomplete read.
+    return {"status": "ok", "quotas": quotas, "warning": warning}
+
+
+def _describe_quota_warning(warning: Any) -> str | None:
+    """Render ``quotaStatusWarning``, which is an object, not a string.
+
+    Shape per the API reference: ``{code, message, data[{key, value}]}``.
+    Interpolating it directly printed a Python dict repr into an operator-facing
+    explanation.
+    """
+    if not isinstance(warning, dict):
+        return str(warning) if warning else None
+    code = warning.get("code")
+    message = warning.get("message")
+    parts = [str(p) for p in (code, message) if p]
+    return ": ".join(parts) if parts else None
+
+
+def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
+    """Regional quotas (CPUS, PREEMPTIBLE_CPUS, NVIDIA_*_GPUS, ...)."""
+    if not project_id:
+        return {"status": "unavailable", "reason": "No GCP project id configured."}
+    return _fetch_quotas(
+        f"https://compute.googleapis.com/compute/v1/projects/{project_id}"
+        f"/regions/{region}?fields=quotas,quotaStatusWarning",
+        what=f"regions.get for project '{project_id}' region '{region}'",
+    )
+
+
+def _fetch_global_quotas(project_id: str) -> dict[str, Any]:
+    """Project-wide quotas, which is where GPUS_ALL_REGIONS lives."""
+    if not project_id:
+        return {"status": "unavailable", "reason": "No GCP project id configured."}
+    return _fetch_quotas(
+        f"https://compute.googleapis.com/compute/v1/projects/{project_id}"
+        f"?fields=quotas",
+        what=f"projects.get for project '{project_id}'",
+    )
 
 
 def check_quota_availability(
@@ -568,11 +617,21 @@ def check_quota_availability(
                 best = max(gpu_entries, key=lambda q: q["limit"] - q["usage"])
                 gpu_limit, gpu_usage = best["limit"], best["usage"]
 
-            return _evaluate_quota_numbers(
+                # A GPU request must clear *two* ceilings. Checking only the
+                # regional one authorised requests that every VM creation would
+                # then reject, because GPUS_ALL_REGIONS is frequently 0.
+                global_verdict = _check_global_gpu_ceiling(project_id, gpu_needed)
+                if global_verdict is not None:
+                    return global_verdict
+
+            verdict = _evaluate_quota_numbers(
                 int(cpu_q["limit"]), int(cpu_q["usage"]),
                 int(gpu_limit), int(gpu_usage),
                 cpu_needed, gpu_needed, provenance="gcp_live_api",
             )
+            if live.get("warning"):
+                verdict["quota_status_warning"] = live["warning"]
+            return verdict
 
         # 3. No access and not a demo: say so.
         return {
@@ -592,6 +651,68 @@ def check_quota_availability(
     return _evaluate_quota_numbers(
         256, 0, 8, 0, cpu_needed, gpu_needed, provenance="simulated_demo",
     )
+
+
+def _check_global_gpu_ceiling(project_id: str, gpu_needed: int) -> dict[str, Any] | None:
+    """Verify the project-wide GPU ceiling, or admit it could not be verified.
+
+    Returns ``None`` when the ceiling is known and the request fits, so the
+    caller carries on with the regional verdict. Returns a verdict dict when the
+    request is refused or when the ceiling could not be read -- because
+    "we could not check the global ceiling" must never be reported as
+    "quota is available".
+    """
+    glob = _fetch_global_quotas(project_id)
+    if glob["status"] != "ok":
+        return {
+            "status": "QUOTA_UNKNOWN",
+            "is_exceeded": False,
+            "is_known": False,
+            "quota_limit": None,
+            "quota_usage": None,
+            "data_provenance": "gcp_live_api",
+            "reason": (
+                f"Regional GPU quota fits, but the project-wide "
+                f"'{_GLOBAL_GPU_QUOTA_METRIC}' ceiling could not be read: "
+                f"{glob['reason']} A GPU request must clear both, so this is "
+                f"reported as unknown rather than authorised."
+            ),
+        }
+
+    entry = glob["quotas"].get(_GLOBAL_GPU_QUOTA_METRIC)
+    if entry is None:
+        return {
+            "status": "QUOTA_UNKNOWN",
+            "is_exceeded": False,
+            "is_known": False,
+            "quota_limit": None,
+            "quota_usage": None,
+            "data_provenance": "gcp_live_api",
+            "reason": (
+                f"Project '{project_id}' reported no '{_GLOBAL_GPU_QUOTA_METRIC}' "
+                f"metric, so the project-wide GPU ceiling is unknown."
+            ),
+        }
+
+    available = max(0.0, entry["limit"] - entry["usage"])
+    if gpu_needed > available:
+        return {
+            "status": "QUOTA_EXCEEDED",
+            "is_exceeded": True,
+            "is_known": True,
+            "quota_limit": entry["limit"],
+            "quota_usage": entry["usage"],
+            "data_provenance": "gcp_live_api",
+            "reason": (
+                f"Project-wide GPU quota exceeded: requested {gpu_needed} GPUs, "
+                f"available {available:.0f}/{entry['limit']:.0f} under "
+                f"'{_GLOBAL_GPU_QUOTA_METRIC}'. Regional quota is irrelevant "
+                f"while this ceiling is reached (verified against live Compute "
+                f"Engine project quota)."
+            ),
+        }
+
+    return None
 
 
 def _evaluate_quota_numbers(
