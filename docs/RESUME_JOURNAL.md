@@ -67,14 +67,39 @@
 - [ ] 6. Perte d'observation => observed_cpu inconnu
 - [ ] 7. MCP indisponible => erreur explicite, pas de simulateur silencieux
 
+## Défauts reproduits (preuves)
+
+Tous reproduits sur le SHA de départ `26bc86c` avant toute correction.
+
+| Réf | Défaut | Preuve observée |
+|---|---|---|
+| §2 | JSX ne compile pas | `TS1005: ')' expected` ligne 1081 du bloc babel (~1155 du fichier) |
+| §4-A | `machine_type` non supporté par le simulateur | `TypeError: SimulatedRuntime.submit_job() got an unexpected keyword argument 'machine_type'` |
+| §4-B | Faux succès | TypeError avalée -> traitée comme timeout -> `_discover_active_job()` renvoie `mc-001` -> `status=submitted, verified=True, recovered_after_timeout=True`, aucun job créé |
+| §4-C | Vérification laxiste | `active_job is not None` suffit -> n'importe quel job vérifie n'importe quelle soumission |
+| §3-D | Approbation auto-déclarée | `is_operator_approved=True` et `approved_plan_id=<son propre id>` ouvrent la porte sans approbation serveur |
+| §5-A | Plans incompatibles | demande 10000 CPU / 8 GPU / 10 000 000 Mo -> `is_feasible=True`, plans 2/88/16 CPU et 0 GPU |
+| §5-B | Budget zéro | budget 0.0 -> 3 plans payants acceptés |
+| §5-C | Crash | `cluster_total_cpu=1` -> `ValueError: min() iterable argument is empty` |
+| §5-D | Quota malhonnête | projet `totally-fake-project-xyz` / région `mars-north9` -> `QUOTA_AVAILABLE`, "Quota verified" (défauts 256/8) |
+| §6 | Historique absent | parcours complet -> `/api/history?workload_id=...` renvoie **404** |
+| §6-bis | plan_id non unique | comparateur renvoie `plan-cost-optimized` (collision inter-workloads) |
+| §6-ter | approbation fantôme | `/api/plans/approve` renvoie HTTP 200 avec `status: not_found` |
+
 ## Décisions
-(à compléter)
+- **D1** : Node.js absent de l'environnement. La compilation JSX est vérifiée hors-ligne via le
+  compilateur TypeScript 5.7.3 embarqué dans `dukpy` (`tools/check_jsx.py`), qui détecte la
+  classe d'erreur exacte (TS2657 = "JSX expressions must have one parent element", équivalent
+  Babel "Adjacent JSX elements..."). Le Babel embarqué de dukpy (6.26) a été écarté : trop
+  ancien, faux positifs sur l'optional chaining. Tests de contrôle négatif inclus.
 
 ## Tests et résultats
-(à compléter)
+- `tests/test_dashboard_jsx.py` : 5 passed (dont 2 contrôles négatifs + 1 anti-faux-positif).
 
 ## Blocages
-(à compléter)
+- **B1** : pas de Node.js/npm -> pas de Babel réel ni de navigateur headless. La validation
+  visuelle en navigateur est donc **non réalisée** ; seule la compilation JSX est prouvée.
 
 ## Prochaine action exacte
-Reproduire les défauts §2 (JSX) et §4 (faux succès simulateur).
+Corriger §3/§4 : source de vérité serveur (mode, plan, approbation, empreinte),
+harmonisation des contrats runtime, idempotence persistante.
