@@ -247,6 +247,17 @@ class ExecutionPlan(BaseModel):
     cost_basis_detail: str | None = None
     # False when the currently attached runtime cannot actually run the plan.
     executable_on_runtime: bool = True
+
+    # The capacity dimension of "cost / delay / capacity". This class claimed to
+    # compare capacity and carried no field for it: two plans could differ by 80
+    # vCPUs and be presented as equally obtainable. NOT_CHECKED is the honest
+    # default -- the verdict is only filled in when a quota source was actually
+    # consulted, and QUOTA_UNKNOWN is kept distinct from QUOTA_AVAILABLE.
+    capacity_status: Literal[
+        "QUOTA_AVAILABLE", "QUOTA_EXCEEDED", "QUOTA_UNKNOWN", "NOT_CHECKED"
+    ] = "NOT_CHECKED"
+    capacity_detail: str | None = None
+    capacity_source: str = "not_checked"
     
     estimated_wait_minutes: float = 0.0
     estimated_prep_minutes: float = 0.0

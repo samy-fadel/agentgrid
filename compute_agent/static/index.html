@@ -1470,7 +1470,34 @@
                               <dd className="font-mono text-amber-300">{plan.cost_basis}</dd>
                             </div>
                           )}
+                          <div className="flex justify-between">
+                            <dt>Capacité</dt>
+                            <dd
+                              className={`font-mono ${
+                                plan.capacity_status === "QUOTA_AVAILABLE"
+                                  ? "text-emerald-300"
+                                  : plan.capacity_status === "QUOTA_EXCEEDED"
+                                  ? "text-rose-300"
+                                  : "text-slate-400"
+                              }`}
+                              title={plan.capacity_detail || "Aucun quota consulté pour ce plan."}
+                            >
+                              {plan.capacity_status || "NOT_CHECKED"}
+                            </dd>
+                          </div>
                         </dl>
+                        {plan.capacity_status === "QUOTA_EXCEEDED" && (
+                          <p className="text-xs text-rose-300/90 pt-1">
+                            {plan.capacity_detail}
+                          </p>
+                        )}
+                        {(plan.capacity_status === "QUOTA_UNKNOWN" ||
+                          plan.capacity_status === "NOT_CHECKED") && (
+                          <p className="text-xs text-slate-500 pt-1">
+                            Quota non vérifié pour ce plan — ce n'est pas une garantie de
+                            disponibilité.
+                          </p>
+                        )}
                         <p className="text-xs text-slate-400 pt-1">{plan.ranking_rationale}</p>
                         <div className="flex items-center space-x-2 pt-2">
                           <button

@@ -191,6 +191,15 @@ Structured taxonomy classifying execution impediments into:
 * **Cost & Time Transparency**:
   * Cost inclusions (`vm_compute_hourly`) and known exclusions (`network_egress`, `persistent_disk_storage`).
   * Time breakdown: Wait/Boot, Environment Prep, Active Execution (Amdahl scaling model), Checkpoint Recovery.
+* **Capacity is the third axis, not a slogan.** Every plan carries
+  `capacity_status` (`QUOTA_AVAILABLE` / `QUOTA_EXCEEDED` / `QUOTA_UNKNOWN` / `NOT_CHECKED`),
+  `capacity_detail` and `capacity_source`, read from the Compute Engine quota API when a project
+  is configured. Before this, the comparison was cost and delay only: a 64 vCPU request returned
+  two 88 vCPU plans with nothing said about whether 88 vCPUs could be obtained. An unreadable
+  quota stays `QUOTA_UNKNOWN` — deliberately not the same statement as available — and an
+  exceeded quota is also folded into the plan's `unverified_points`. Set
+  `AGENTGRID_PLAN_CAPACITY_CHECK=false` to skip the lookup; the plans then report `NOT_CHECKED`
+  rather than an assumed availability.
 * **Unfeasible Handling**: Zero hallucinated winning plans. If constraints conflict, returns an empty plan set with an explicit explanation of blocking constraints and suggested relaxations.
 
 ### 4. Exécution et repli contrôlés (Operator Governance & Fallback)
@@ -298,6 +307,7 @@ Being precise about this matters more than the feature list. As of the current c
 | Separation of measured cost from declared cost, and refusal to call an unsourced figure "reconciled billing" | **Verified** | `tests/test_cost_reconciliation_honesty.py` — 10 of its 11 tests fail against the previous code |
 | The workload's own constraints (region, zone, Spot, fallback to Standard) bind submission *and* every fallback rung | **Verified** | `tests/test_profile_constraints.py` — before the fix a plan in a forbidden region was submitted with a real job id |
 | A caller cannot widen its own constraints at execution time | **Verified** | `tests/test_profile_constraints.py` — the profile persisted at plan-comparison time refuses first; `constraint_source` names which profile refused |
+| The capacity axis of the cost / delay / capacity comparison | **Verified, and exercised against the real API** | `tests/test_plan_capacity_dimension.py` for the contract; against the live project the same 88 vCPU plans answered `QUOTA_EXCEEDED ... available 0/0` with `data_provenance: gcp_live_api` |
 | Execution | **Simulator only** | no VM has been provisioned by this project's test runs |
 | Slurm adapter | **Mocked HTTP only** | `tests/test_slurm.py`, `tests/test_slurm_telemetry_defects.py` drive stubbed `slurmrestd` responses. **Not validated against a real cluster.** |
 | Dashboard | **Compiled and rendered offline, not opened in a browser** | `tools/check_jsx.py`, `tools/render_check.py`. CSS, layout and real event dispatch are **not** covered. |

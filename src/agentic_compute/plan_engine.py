@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from typing import Any
 
@@ -139,6 +140,82 @@ def _provisioning_options(workload: WorkloadProfile) -> list[str]:
     return ordered
 
 
+def _capacity_check_enabled(explicit: bool | None) -> bool:
+    """Whether to consult a quota source while comparing plans.
+
+    The check calls the Compute Engine API, so it is switched off in the test
+    suite (``tests/conftest.py``) the same way ``MOCK_SLURM`` switches off the
+    real controller. Production keeps it on: a comparison that omits the
+    capacity axis is a comparison of two of the three declared dimensions.
+    """
+    if explicit is not None:
+        return explicit
+    return os.getenv("AGENTGRID_PLAN_CAPACITY_CHECK", "true").lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+
+
+def annotate_plans_with_capacity(
+    plans: list[ExecutionPlan],
+    project_id: str | None = None,
+    demo_mode: bool | None = None,
+) -> list[ExecutionPlan]:
+    """Attach a quota verdict to each plan, one lookup per distinct request.
+
+    Never invents a verdict: an unreachable or silent quota source leaves
+    ``QUOTA_UNKNOWN`` with the reason attached, which is a different statement
+    from ``QUOTA_AVAILABLE``.
+    """
+    from .capacity_advisor import check_quota_availability
+
+    project = project_id or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+    if not project:
+        for plan in plans:
+            plan.capacity_status = "QUOTA_UNKNOWN"
+            plan.capacity_source = "no_project_configured"
+            plan.capacity_detail = (
+                "No GCP project is configured (GOOGLE_CLOUD_PROJECT / PROJECT_ID), "
+                "so no quota could be read for this plan."
+            )
+        return plans
+
+    cache: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for plan in plans:
+        total_cpu = plan.cpu * max(plan.quantity, 1)
+        total_gpu = plan.gpu * max(plan.quantity, 1)
+        model = "SPOT" if "spot" in (plan.provisioning_model or "").lower() else "STANDARD"
+        key = (plan.region, total_cpu, total_gpu, model)
+        if key not in cache:
+            try:
+                cache[key] = check_quota_availability(
+                    project_id=project,
+                    region=plan.region,
+                    cpu_needed=total_cpu,
+                    gpu_needed=total_gpu,
+                    provisioning_model=model,
+                    demo_mode=demo_mode,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                cache[key] = {
+                    "status": "QUOTA_UNKNOWN",
+                    "reason": f"Quota lookup failed: {type(exc).__name__}: {exc}",
+                    "data_provenance": "unavailable",
+                }
+        verdict = cache[key]
+        plan.capacity_status = verdict.get("status", "QUOTA_UNKNOWN")
+        plan.capacity_detail = verdict.get("reason")
+        plan.capacity_source = verdict.get("data_provenance", "unknown")
+        if plan.capacity_status == "QUOTA_EXCEEDED":
+            plan.unverified_points = list(plan.unverified_points) + [
+                f"Project quota does not currently authorise {total_cpu} vCPU"
+                + (f" and {total_gpu} GPU" if total_gpu else "")
+                + f" in {plan.region}."
+            ]
+    return plans
+
+
 def evaluate_and_compare_plans(
     profile: WorkloadProfile | dict,
     cluster_total_cpu: int = 128,
@@ -146,6 +223,7 @@ def evaluate_and_compare_plans(
     base_work_units: float = 500.0,
     demo_mode: bool | None = None,
     runtime_kind: str | None = None,
+    check_capacity: bool | None = None,
 ) -> dict[str, Any]:
     """Deterministically evaluate, price and compare execution plans.
 
@@ -487,6 +565,11 @@ def evaluate_and_compare_plans(
             )
         )
 
+    # Third comparison dimension: can this capacity actually be obtained?
+    capacity_checked = _capacity_check_enabled(check_capacity)
+    if capacity_checked:
+        annotate_plans_with_capacity(plans_list, demo_mode=demo_mode)
+
     # Wire the fallback ladder using the real generated ids.
     by_type = {p.plan_type: p for p in plans_list}
     for plan in plans_list:
@@ -508,4 +591,12 @@ def evaluate_and_compare_plans(
         "incompatible_candidates": incompatible,
         "cost_basis": cost_basis,
         "cost_basis_detail": cost_basis_detail,
+        "capacity_checked": capacity_checked,
+        "capacity_note": (
+            "Each plan carries a quota verdict read from the Compute Engine API; "
+            "QUOTA_UNKNOWN means the source could not be consulted, not that capacity is free."
+            if capacity_checked
+            else "Quota was not consulted for these plans (capacity check disabled), so every "
+            "plan reports NOT_CHECKED rather than an assumed availability."
+        ),
     }

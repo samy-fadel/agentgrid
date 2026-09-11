@@ -25,6 +25,14 @@ def isolated_agentgrid_state(tmp_path, monkeypatch):
     db_path = tmp_path / "agentgrid_test.db"
     monkeypatch.setenv("AGENTGRID_DB_PATH", str(db_path))
 
+    # Plan comparison consults the Compute Engine quota API for its capacity
+    # dimension. Credentials exist on some developer machines, so left enabled
+    # the suite would make live calls and its results would depend on a real
+    # project's quota. Switched off here the same way MOCK_SLURM switches off
+    # the real controller; the tests that exercise the capacity dimension turn
+    # it back on explicitly and stub the quota reader.
+    monkeypatch.setenv("AGENTGRID_PLAN_CAPACITY_CHECK", "false")
+
     history = importlib.import_module("agentic_compute.history")
     governance = importlib.import_module("agentic_compute.governance")
     lifecycle = importlib.import_module("agentic_compute.lifecycle_manager")
