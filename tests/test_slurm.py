@@ -159,7 +159,12 @@ def test_slurm_adapter_truthful_job_lifecycle(monkeypatch):
     assert runtime.snapshot().workload.remaining_work_units == 0.0
 
 
-def test_slurm_deadline_change_does_not_alter_workload_eta():
+def test_slurm_deadline_change_does_not_alter_workload_eta(monkeypatch):
+    # Offline unit test: no Slurm controller is reachable here. The adapter now
+    # refuses to invent cluster state when it cannot talk to the controller
+    # (silent local simulation was an audited defect), so mock mode must be
+    # declared explicitly rather than relied upon implicitly.
+    monkeypatch.setenv("MOCK_SLURM", "true")
     runtime = SlurmRuntime()
     snap1 = runtime.snapshot()
     initial_eta = snap1.workload.estimated_remaining_minutes
@@ -479,6 +484,11 @@ def test_slurm_pending_job_http_200_remains_pending_verification(monkeypatch):
 
 
 def test_slurm_observed_change_transitions_to_applied_and_verified(monkeypatch):
+    # Offline unit test: no Slurm controller is reachable here. The adapter now
+    # refuses to invent cluster state when it cannot talk to the controller
+    # (silent local simulation was an audited defect), so mock mode must be
+    # declared explicitly rather than relied upon implicitly.
+    monkeypatch.setenv("MOCK_SLURM", "true")
     monkeypatch.setattr(
         "requests.post",
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
@@ -512,6 +522,11 @@ def test_slurm_observed_change_transitions_to_applied_and_verified(monkeypatch):
 
 
 def test_slurm_cost_accrual_strictly_depends_on_observed_allocation(monkeypatch):
+    # Offline unit test: no Slurm controller is reachable here. The adapter now
+    # refuses to invent cluster state when it cannot talk to the controller
+    # (silent local simulation was an audited defect), so mock mode must be
+    # declared explicitly rather than relied upon implicitly.
+    monkeypatch.setenv("MOCK_SLURM", "true")
     runtime = SlurmRuntime(job_id="905")
     runtime.job_status = "PENDING"
     runtime.allocated_cpu = 4
@@ -569,6 +584,11 @@ def test_slurm_initial_startup_is_unverified_with_unknown_properties(monkeypatch
 
 
 def test_slurm_machine_type_mismatch_detected_and_never_overwrites_observed(monkeypatch):
+    # Offline unit test: no Slurm controller is reachable here. The adapter now
+    # refuses to invent cluster state when it cannot talk to the controller
+    # (silent local simulation was an audited defect), so mock mode must be
+    # declared explicitly rather than relied upon implicitly.
+    monkeypatch.setenv("MOCK_SLURM", "true")
     monkeypatch.setattr(
         "requests.post",
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),
@@ -746,6 +766,11 @@ def test_slurm_rejected_action_remains_failed_and_never_becomes_applied(monkeypa
 
 
 def test_slurm_verification_timeout_transitions_to_failed(monkeypatch):
+    # Offline unit test: no Slurm controller is reachable here. The adapter now
+    # refuses to invent cluster state when it cannot talk to the controller
+    # (silent local simulation was an audited defect), so mock mode must be
+    # declared explicitly rather than relied upon implicitly.
+    monkeypatch.setenv("MOCK_SLURM", "true")
     monkeypatch.setattr(
         "requests.post",
         lambda *args, **kwargs: type("MockResponse", (), {"status_code": 200, "text": "ok", "json": lambda self: {}})(),

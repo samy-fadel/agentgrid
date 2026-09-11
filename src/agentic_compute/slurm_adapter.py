@@ -28,6 +28,47 @@ SUPPORTED_SLURM_MACHINE_TYPES = {"n2-standard-2", "c2-standard-60", "h3-standard
 SUPPORTED_SLURM_PROVISIONING = {"100% Standard", "STANDARD"}
 
 
+#: Provisioning-model spellings that all mean the same thing on this cluster.
+#: Operators, plan engines and the Slurm partitions each write it differently;
+#: comparing the raw strings produced spurious "mismatch" verdicts.
+_SLURM_PROVISIONING_ALIASES: dict[str, str] = {
+    "standard": "100% Standard",
+    "100% standard": "100% Standard",
+    "100%standard": "100% Standard",
+    "on-demand": "100% Standard",
+    "ondemand": "100% Standard",
+    "spot": "100% Spot",
+    "100% spot": "100% Spot",
+    "100%spot": "100% Spot",
+    "preemptible": "100% Spot",
+    "80% spot / 20% standard": "80% Spot / 20% Standard",
+    "80% spot/20% standard": "80% Spot / 20% Standard",
+    "hedged": "80% Spot / 20% Standard",
+}
+
+
+def normalize_slurm_provisioning(value: str | None) -> str | None:
+    """Return the canonical spelling of a provisioning model.
+
+    ``None`` and the empty string mean "unspecified" and are passed through.
+    A genuinely unrecognised value raises :class:`ValueError` so a typo such as
+    ``BANANA`` is refused rather than stored and later compared against real
+    telemetry.
+    """
+    if value is None:
+        return None
+    key = str(value).strip()
+    if key == "":
+        return None
+    canonical = _SLURM_PROVISIONING_ALIASES.get(key.lower())
+    if canonical is None:
+        raise ValueError(
+            f"unknown provisioning model '{value}'; supported values are "
+            f"{', '.join(sorted(set(_SLURM_PROVISIONING_ALIASES.values())))}"
+        )
+    return canonical
+
+
 def generate_candidate_cpus(total_cpu: int) -> list[int]:
     """Generate elastic candidate CPU allocations up to cluster capacity."""
     env_override = os.getenv("CANDIDATE_CPUS")
@@ -98,6 +139,38 @@ class SlurmRuntime(RuntimeAdapter):
             self.requested_provisioning_mix = None
             self.pending_verification_start_time = None
 
+    def _is_mock_mode(self) -> bool:
+        """True when the caller explicitly asked for offline/mock behaviour.
+
+        Outside mock mode, an unreachable controller is an error: substituting
+        locally simulated values for real telemetry is exactly the silent
+        fallback the audit flagged.
+        """
+        return os.getenv("MOCK_SLURM", "").lower() in ("true", "1", "yes") or str(
+            self.active_job_id
+        ).startswith("mock-")
+
+    def _reject(self, action_name: str, detail: str, cpu: int | None = None) -> None:
+        """Record a refusal and clear any pending request state."""
+        self.verification_status = "unsupported"
+        self.verification_detail = detail
+        self.requested_cpu = None
+        self.requested_machine_type = None
+        self.requested_provisioning_mix = None
+        self.pending_verification_start_time = None
+        self.last_slurm_action = {
+            "action": action_name,
+            "job_id": self.active_job_id,
+            "requested_cpu": cpu,
+            "observed_cpu": self.observed_cpu,
+            "observed_machine_type": self.observed_machine_type,
+            "observed_provisioning_mix": self.observed_provisioning_mix,
+            "status": "unsupported",
+            "verification_status": "unsupported",
+            "error": detail,
+            "timestamp": time.time(),
+        }
+
     def _validate_cluster_capabilities(
         self,
         machine_type: str | None,
@@ -106,6 +179,40 @@ class SlurmRuntime(RuntimeAdapter):
         cpu: int | None = None,
     ) -> None:
         """Shared capability validation for job submission and workload resizing."""
+        # 0. Capacity: a request the cluster physically cannot satisfy is refused
+        #    here, before any API call. This used to be accepted and forwarded.
+        if cpu is not None:
+            try:
+                cpu_int = int(cpu)
+            except (TypeError, ValueError):
+                cpu_int = None
+            if cpu_int is not None:
+                if cpu_int <= 0:
+                    detail = (
+                        f"Invalid CPU request ({cpu_int}) for {action_name}: a workload "
+                        f"needs at least 1 CPU."
+                    )
+                    self._reject(action_name, detail, cpu=cpu_int)
+                    raise RuntimeError(detail)
+                if cpu_int > self.total_cpu:
+                    detail = (
+                        f"Requested {cpu_int} CPUs but the cluster only has {self.total_cpu} "
+                        f"in total; {action_name} refused before contacting the controller."
+                    )
+                    self._reject(action_name, detail, cpu=cpu_int)
+                    raise RuntimeError(detail)
+
+        # 1. Provisioning model: normalise the spelling first so 'STANDARD' and
+        #    '100% Standard' are treated as the same thing, and reject anything
+        #    genuinely unknown instead of storing it.
+        if provisioning_model is not None and str(provisioning_model).strip() != "":
+            try:
+                provisioning_model = normalize_slurm_provisioning(provisioning_model)
+            except ValueError as exc:
+                detail = f"Unsupported configuration on Slurm cluster: {exc}"
+                self._reject(action_name, detail, cpu=cpu)
+                raise RuntimeError(detail) from exc
+
         is_spot_requested = provisioning_model and (
             "spot" in provisioning_model.lower() or "80%" in provisioning_model
         )
@@ -156,6 +263,11 @@ class SlurmRuntime(RuntimeAdapter):
         self.allocated_gpu = 0
         self.remaining_work_units = 100.0
         self.accrued_cost_eur = 0.0
+        #: Elapsed minutes that could not be priced because no allocation was
+        #: observed. Kept visible instead of being billed at a local default.
+        self.unpriced_elapsed_minutes = 0.0
+        #: How free_cpu was derived: "node_telemetry" or "own_allocation_only".
+        self.free_cpu_basis = "unknown"
         self.job_done = False
         self.job_status = "PENDING"
         self.job_failed = False
@@ -189,26 +301,30 @@ class SlurmRuntime(RuntimeAdapter):
         if minimize_cost is not None:
             self.minimize_cost = bool(minimize_cost)
 
-    def _discover_active_job(self) -> str | None:
-        try:
-            resp = requests.get(f"{self.base_url}/jobs", headers=self._headers(), timeout=2.0)
-            if resp.status_code == 200:
-                jobs = resp.json().get("jobs", [])
-                for j in jobs:
-                    state = j.get("job_state", ["RUNNING"])
-                    state_str = state[0] if isinstance(state, list) and state else str(state)
-                    if state_str in ("RUNNING", "PENDING"):
-                        return str(j.get("job_id", ""))
-        except Exception:
-            pass
-        return None
-
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.jwt_token:
             headers["X-SLURM-USER-TOKEN"] = self.jwt_token
             headers["X-SLURM-USER-NAME"] = self.user_name
         return headers
+
+    def _controller_reachable(self) -> bool:
+        """True when the Slurm controller answers at all.
+
+        Distinguishes "the cluster says there is no such job" from "we cannot
+        talk to the cluster". Only the first is safe to report as state.
+        """
+        try:
+            resp = requests.get(f"{self.base_url}/ping", headers=self._headers(), timeout=2.0)
+            if resp.status_code < 500:
+                return True
+        except Exception:
+            pass
+        try:
+            resp = requests.get(f"{self.base_url}/nodes", headers=self._headers(), timeout=2.0)
+            return resp.status_code < 500
+        except Exception:
+            return False
 
     def _get_nodes(self) -> dict[str, Any]:
         try:
@@ -220,10 +336,12 @@ class SlurmRuntime(RuntimeAdapter):
         return {"nodes": []}
 
     def _get_job(self) -> dict[str, Any]:
-        if not self.active_job_id or self.active_job_id == "1":
-            discovered = self._discover_active_job()
-            if discovered:
-                self.active_job_id = discovered
+        # Note: no name-less discovery here. There used to be two
+        # _discover_active_job definitions, the second shadowing the first, so
+        # this call resolved to the name-matching variant invoked with
+        # ``name=None`` -- which matched any job whose name was absent. Job
+        # identity is never guessed: the caller must know which job it means.
+        pass
         try:
             resp = requests.get(
                 f"{self.base_url}/job/{self.active_job_id}",
@@ -237,16 +355,32 @@ class SlurmRuntime(RuntimeAdapter):
         return {"jobs": []}
 
     def _discover_active_job(self, name: str | None = None) -> str | None:
-        """Query Slurm controller to discover active job matching name for ambiguous timeout recovery."""
+        """Find the job created under a specific submission name.
+
+        Used to resolve an ambiguous submission timeout. ``name`` is mandatory
+        in practice: without it there is no identity to match, and returning
+        "some active job" is how a timeout used to be reported as a success on
+        a job the caller never submitted.
+
+        ``job_state`` is a list in recent slurmrestd versions and a bare string
+        in older ones; both are handled.
+        """
+        if not name:
+            return None
         try:
             resp = requests.get(f"{self.base_url}/jobs", headers=self._headers(), timeout=5.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                for j in data.get("jobs", []):
-                    if j.get("name") == name and j.get("job_state") in ("PENDING", "RUNNING"):
-                        return str(j.get("job_id"))
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            for j in data.get("jobs", []):
+                if j.get("name") != name:
+                    continue
+                state = j.get("job_state")
+                state_str = state[0] if isinstance(state, list) and state else str(state)
+                if state_str in ("PENDING", "RUNNING", "CONFIGURING", "COMPLETING"):
+                    return str(j.get("job_id"))
         except Exception:
-            pass
+            return None
         return None
 
     def submit_job(
@@ -495,14 +629,20 @@ class SlurmRuntime(RuntimeAdapter):
                         f"machine type mismatch (requested '{self.requested_machine_type}', "
                         f"observed '{self.machine_type}' from partition '{job_part}')"
                     )
-                if (
-                    self.requested_provisioning_mix is not None
-                    and self.provisioning_mix != self.requested_provisioning_mix
-                ):
-                    mismatches.append(
-                        f"provisioning mix mismatch (requested '{self.requested_provisioning_mix}', "
-                        f"observed '{self.provisioning_mix}')"
-                    )
+                if self.requested_provisioning_mix is not None:
+                    # Compare canonical forms: "STANDARD" and "100% Standard"
+                    # are the same allocation, not a mismatch.
+                    def _canon(value):
+                        try:
+                            return normalize_slurm_provisioning(value)
+                        except ValueError:
+                            return value
+
+                    if _canon(self.provisioning_mix) != _canon(self.requested_provisioning_mix):
+                        mismatches.append(
+                            f"provisioning mix mismatch (requested '{self.requested_provisioning_mix}', "
+                            f"observed '{self.provisioning_mix}')"
+                        )
 
                 if not mismatches:
                     self.verification_status = "verified"
@@ -565,12 +705,19 @@ class SlurmRuntime(RuntimeAdapter):
 
             cost_factor = self._get_cost_factor()
             if delta_secs > 0:
-                self.accrued_cost_eur += (
-                    self.allocated_cpu
-                    * self.cpu_cost_per_hour_eur
-                    * cost_factor
-                    * (delta_secs / 3600.0)
-                )
+                if has_genuine_allocation and self.observed_cpu:
+                    self.accrued_cost_eur += (
+                        self.observed_cpu
+                        * self.cpu_cost_per_hour_eur
+                        * cost_factor
+                        * (delta_secs / 3600.0)
+                    )
+                else:
+                    # No allocation was observed, so there is no basis for a
+                    # price. Booking elapsed time against a local default CPU
+                    # count invented a cost for compute nobody confirmed. The
+                    # time is recorded separately so the gap stays visible.
+                    self.unpriced_elapsed_minutes += delta_secs / 60.0
 
         # 3. Synchronize lifecycle status
         state = job.get("job_state", ["RUNNING"])
@@ -603,15 +750,46 @@ class SlurmRuntime(RuntimeAdapter):
         if "jobs" in job_info and job_info["jobs"]:
             self.is_real_slurm_job = True
             self._sync_job_state(job_info["jobs"][0])
+        elif not self._is_mock_mode() and not self._controller_reachable():
+            # ``tick`` already refused to simulate a silently unreachable
+            # cluster; ``snapshot`` used to return locally invented numbers,
+            # which is the same fault in read-only clothing.
+            raise RuntimeError(
+                f"Slurm cluster is unreachable at {self.base_url}: cannot read cluster "
+                f"state for job {self.active_job_id}, and MOCK_SLURM is not enabled. "
+                f"No locally simulated values are substituted."
+            )
 
         # Dynamic discovery of cluster nodes, total CPU, and GPUs from Slurm
         nodes_info = self._get_nodes()
-        nodes_list = nodes_info.get("nodes", [])
+        nodes_list = [n for n in nodes_info.get("nodes", []) if isinstance(n, dict)]
         cluster_total_cpu = (
-            sum(n.get("cpus", 0) for n in nodes_list if isinstance(n, dict))
+            sum(n.get("cpus", 0) for n in nodes_list)
             if nodes_list
             else self.total_cpu
         )
+
+        # Free CPU must account for *every* job on the cluster. Subtracting only
+        # our own allocation reported a fully busy 128-CPU cluster as having 124
+        # CPUs available. slurmrestd exposes per-node ``idle_cpus`` and
+        # ``alloc_cpus``; use them when present and say so when they are not.
+        cluster_free_cpu: int | None = None
+        if nodes_list:
+            if all(n.get("idle_cpus") is not None for n in nodes_list):
+                cluster_free_cpu = sum(int(n.get("idle_cpus", 0)) for n in nodes_list)
+            elif all(n.get("alloc_cpus") is not None for n in nodes_list):
+                cluster_free_cpu = sum(
+                    max(0, int(n.get("cpus", 0)) - int(n.get("alloc_cpus", 0)))
+                    for n in nodes_list
+                )
+        if cluster_free_cpu is None:
+            # No per-node occupancy telemetry: the only defensible statement is
+            # what our own job holds, so report that and nothing better.
+            cluster_free_cpu = max(0, cluster_total_cpu - self.allocated_cpu)
+            self.free_cpu_basis = "own_allocation_only"
+        else:
+            cluster_free_cpu = max(0, min(cluster_free_cpu, cluster_total_cpu))
+            self.free_cpu_basis = "node_telemetry"
 
         cluster_total_gpu = 0
         for n in nodes_list:
@@ -684,7 +862,7 @@ class SlurmRuntime(RuntimeAdapter):
             cluster=ClusterState(
                 current_time_minutes=round(self.elapsed_minutes, 2),
                 total_cpu=cluster_total_cpu,
-                free_cpu=max(0, cluster_total_cpu - self.allocated_cpu),
+                free_cpu=cluster_free_cpu,
                 total_gpu=cluster_total_gpu,
                 free_gpu=max(0, cluster_total_gpu - self.allocated_gpu),
             ),
@@ -724,6 +902,19 @@ class SlurmRuntime(RuntimeAdapter):
             return
         if not action.cpu:
             return
+
+        # Identity first: a request aimed at another workload must be refused
+        # before any permission check, any validation and any API call. The
+        # adapter previously ignored action.workload_id and mutated whatever job
+        # it happened to track, so a typo silently resized the wrong thing.
+        if action.workload_id and str(action.workload_id) != str(self.active_job_id):
+            detail = (
+                f"Refusing '{action.action}': it targets workload "
+                f"'{action.workload_id}' but this runtime tracks job "
+                f"'{self.active_job_id}'. No mutation was attempted."
+            )
+            raise ValueError(detail)
+
         self.check_execution_permission(action, approved_by_operator=approved_by_operator)
 
         target_cpu = action.cpu
@@ -775,10 +966,15 @@ class SlurmRuntime(RuntimeAdapter):
             }
             raise RuntimeError(detail)
 
-        # 3. Job is PENDING: Submit resize to Slurm API
+        # 3. Job is PENDING: Submit resize to Slurm API.
+        #    Store the canonical provisioning spelling so the later comparison
+        #    against partition telemetry cannot produce a spurious mismatch.
         self.requested_cpu = target_cpu
         self.requested_machine_type = target_machine_type
-        self.requested_provisioning_mix = target_provisioning_mix
+        self.requested_provisioning_mix = (
+            normalize_slurm_provisioning(target_provisioning_mix) or target_provisioning_mix
+        )
+        target_provisioning_mix = self.requested_provisioning_mix
         self.verification_status = "pending_verification"
         self.pending_verification_start_time = time.time()
         self.verification_detail = (

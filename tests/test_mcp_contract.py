@@ -45,6 +45,20 @@ def test_get_capacity_advice_tool():
 
 
 def test_mcp_server_tools_workflow():
+    """Nominal tool workflow, with the operator having delegated this workload.
+
+    The delegation is now set explicitly: mutating MCP tools go through the
+    governance choke point, whose default is validation. Previously the tools
+    honoured only the runtime adapter's own mode, which both adapters set to
+    delegation, so the operator's choice had no effect at this entry point.
+    """
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.models import DelegationPolicy
+
+    get_governance_store().set_workload_control(
+        "mc-001", "delegation", DelegationPolicy(max_budget_eur=100.0)
+    )
+
     reset_runtime()
     snap = get_runtime_snapshot()
     assert snap["workload"]["allocated_cpu"] == 32
@@ -52,6 +66,7 @@ def test_mcp_server_tools_workflow():
     resized = resize_workload("mc-001", 64)
     assert resized["status"] == "applied"
     assert resized["cpu"] == 64
+    assert resized["control_mode"] == "delegation"
 
     advanced = advance_time(5.0)
     assert advanced["cluster"]["current_time_minutes"] == 5.0
@@ -260,6 +275,13 @@ def test_mcp_resize_workload_reports_truthful_status(monkeypatch):
     import agentic_compute.mcp_server as mcp_mod
     from agentic_compute.slurm_adapter import SlurmRuntime
 
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.models import DelegationPolicy
+
+    get_governance_store().set_workload_control(
+        "mcp-test", "delegation", DelegationPolicy(max_budget_eur=100.0)
+    )
+
     slurm_rt = SlurmRuntime(job_id="mcp-test")
     slurm_rt.job_status = "PENDING"
     monkeypatch.setattr(mcp_mod, "_runtime", slurm_rt)
@@ -283,3 +305,85 @@ def test_mcp_resize_workload_reports_truthful_status(monkeypatch):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Legacy tools must not be a way around the operator's control mode
+# ---------------------------------------------------------------------------
+
+def test_legacy_mcp_tools_cannot_bypass_advisory_mode():
+    """The older mutating tools are subject to the same gate as execute_plan_controlled.
+
+    Before this, an agent that wanted to act despite advisory mode only had to
+    call ``resize_workload`` or ``submit_job`` instead of the controlled path.
+    """
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.mcp_server import reset_runtime, resize_workload, submit_job, get_runtime_snapshot
+
+    reset_runtime()
+    gov = get_governance_store()
+    gov.set_workload_control("mc-001", "advisory")
+    gov.set_workload_control("wl-legacy-submit", "advisory")
+
+    before = get_runtime_snapshot()["workload"]["allocated_cpu"]
+
+    resized = resize_workload("mc-001", 64)
+    assert resized["status"] == "blocked", resized
+    assert resized["control_mode"] == "advisory"
+    assert "read-only" in resized["reason"].lower()
+
+    # The cluster must be untouched, not merely reported as blocked.
+    assert get_runtime_snapshot()["workload"]["allocated_cpu"] == before
+
+    submitted = submit_job(name="wl-legacy-submit", cpu=8, workload_id="wl-legacy-submit")
+    assert submitted["status"] == "blocked", submitted
+    assert submitted["control_mode"] == "advisory"
+
+
+def test_legacy_mcp_tools_require_an_approved_plan_in_validation_mode():
+    """Validation mode is the server default, so an unqualified tool call is refused."""
+    from agentic_compute.governance import get_governance_store, plan_fingerprint
+    from agentic_compute.models import ExecutionPlan
+    from agentic_compute.mcp_server import reset_runtime, resize_workload, get_runtime_snapshot
+
+    reset_runtime()
+    gov = get_governance_store()
+    # No explicit configuration: the server default (validation) applies.
+    assert gov.get_workload_control("mc-001")["control_mode"] == "validation"
+
+    before = get_runtime_snapshot()["workload"]["allocated_cpu"]
+
+    no_plan = resize_workload("mc-001", 64)
+    assert no_plan["status"] == "blocked", no_plan
+    assert "approved plan" in no_plan["reason"].lower()
+    assert get_runtime_snapshot()["workload"]["allocated_cpu"] == before
+
+    # An unregistered plan id is not evidence either.
+    invented = resize_workload("mc-001", 64, plan_id="plan-i-made-this-up")
+    assert invented["status"] == "blocked", invented
+    assert "not registered" in invented["reason"].lower()
+
+    # With a registered and approved plan, the resize proceeds.
+    plan = ExecutionPlan(
+        plan_id="plan-legacy-ok",
+        plan_type="balanced_tradeoff",
+        title="Legacy path",
+        machine_type="n2-standard-64",
+        cpu=64,
+        estimated_cost_eur=3.0,
+        ranking_rationale="test",
+    )
+    gov.register_plan("mc-001", plan)
+    gov.approve_plan(plan.plan_id, workload_id="mc-001")
+
+    allowed = resize_workload("mc-001", 64, plan_id=plan.plan_id)
+    assert allowed["status"] == "applied", allowed
+    assert allowed["control_mode"] == "validation"
+    assert get_runtime_snapshot()["workload"]["allocated_cpu"] == 64
+
+    # Materially changing the plan invalidates the approval.
+    changed = plan.model_copy(update={"cpu": 32, "machine_type": "n2-standard-32"})
+    assert plan_fingerprint(changed) != plan_fingerprint(plan)
+    gov.register_plan("mc-001", changed)
+    after_change = resize_workload("mc-001", 32, plan_id=plan.plan_id)
+    assert after_change["status"] == "blocked", after_change

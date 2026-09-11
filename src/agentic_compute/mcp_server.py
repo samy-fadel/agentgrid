@@ -115,6 +115,7 @@ _runtime: RuntimeAdapter = _create_runtime()
 from .capacity_search import search_compatible_capacity
 from .diagnostic import diagnose_blockers
 from .execution_controller import ExecutionController
+from .governance import MutationBlocked, enforce_mutation, get_governance_store
 from .history import get_history_store
 from .lifecycle_manager import default_lifecycle_manager
 from .models import (
@@ -250,13 +251,28 @@ def submit_job(
     script: str | None = None,
     machine_type: str | None = None,
     provisioning_model: str | None = None,
+    workload_id: str | None = None,
+    plan_id: str | None = None,
 ) -> dict:
     """Submit or initialize a new compute workload to the cluster.
 
     Registers a new workload with optional CPU, GPU, partition, memory, machine type,
     provisioning model (SPOT/STANDARD), and script parameters.
     If CPU is omitted, the cluster selects an optimal baseline allocation.
+
+    This is a direct mutation, so it is subject to the control mode the operator
+    configured for the workload. In validation mode an approved ``plan_id`` is
+    required; prefer ``execute_plan_controlled``, which also gives idempotency
+    and history linkage.
     """
+    target_workload = workload_id or name
+    try:
+        governing = enforce_mutation(target_workload, "submit_job", plan_id=plan_id)
+    except MutationBlocked as blocked:
+        payload = blocked.as_dict()
+        payload["snapshot"] = _runtime.snapshot().model_dump()
+        return payload
+
     if hasattr(_runtime, "submit_job"):
         try:
             res = _runtime.submit_job(
@@ -269,14 +285,30 @@ def submit_job(
                 machine_type=machine_type,
                 provisioning_model=provisioning_model,
             )
-            return {"status": "submitted", "job": res, "snapshot": _runtime.snapshot().model_dump()}
+            return {
+                "status": "submitted",
+                "job": res,
+                "control_mode": governing["control_mode"],
+                "snapshot": _runtime.snapshot().model_dump(),
+            }
         except Exception as exc:
             return {
                 "status": "error",
                 "error": str(exc),
+                "error_type": type(exc).__name__,
+                "control_mode": governing["control_mode"],
                 "snapshot": _runtime.snapshot().model_dump(),
             }
-    return {"status": "submitted", "snapshot": _runtime.snapshot().model_dump()}
+    # No submit_job on the adapter is a real gap, not a success.
+    return {
+        "status": "unsupported",
+        "reason": (
+            f"The configured runtime adapter ({type(_runtime).__name__}) exposes no "
+            f"submit_job; nothing was submitted."
+        ),
+        "control_mode": governing["control_mode"],
+        "snapshot": _runtime.snapshot().model_dump(),
+    }
 
 
 @mcp.tool()
@@ -297,13 +329,25 @@ def resize_workload(
     machine_type: str | None = None,
     provisioning_model: str | None = None,
     reason: str = "requested by compute agent through MCP",
+    plan_id: str | None = None,
 ) -> dict:
     """Resize a workload to one of the CPU allocations advertised by the snapshot.
 
     Allows scaling CPU cores, selecting prioritized machine types (e.g. N4 vs N2),
     and applying hedged provisioning models (e.g., SPOT, STANDARD, or 80% Spot / 20% Standard).
     Always call get_runtime_snapshot first and choose an advertised candidate.
+
+    Subject to the operator's control mode: advisory refuses the resize, and
+    validation requires an approved ``plan_id`` for this workload.
     """
+    try:
+        governing = enforce_mutation(workload_id, "resize_workload", plan_id=plan_id)
+    except MutationBlocked as blocked:
+        payload = blocked.as_dict()
+        payload["cpu"] = cpu
+        payload["snapshot"] = _runtime.snapshot().model_dump()
+        return payload
+
     action = Action(
         action="resize_workload",
         workload_id=workload_id,
@@ -321,6 +365,8 @@ def resize_workload(
         return {
             "status": "unsupported" if is_unsupported else "error",
             "error": str(exc),
+            "error_type": type(exc).__name__,
+            "control_mode": governing["control_mode"],
             "workload_id": workload_id,
             "cpu": cpu,
             "machine_type": machine_type,
@@ -332,6 +378,7 @@ def resize_workload(
     status = verification.get("status", "applied") if verification else "applied"
     return {
         "status": status,
+        "control_mode": governing["control_mode"],
         "workload_id": workload_id,
         "cpu": cpu,
         "machine_type": machine_type,
