@@ -58,11 +58,60 @@ class LifecycleManager:
         self._workloads[prof.workload_id] = record
         return record
 
+    def _rehydrate(self, workload_id: str) -> dict[str, Any] | None:
+        """Rebuild the in-memory record for a workload from persisted state.
+
+        The manager used to be purely in-memory, so a workload submitted by one
+        request was unknown to the next one and to any restarted process: the
+        journey submit -> track -> resume broke with a ``KeyError``. Persisted
+        rows are the source of truth, so they are replayed here.
+
+        Returns ``None`` when nothing was ever persisted for this workload; that
+        is a genuine "unknown workload", not a lost one.
+        """
+        prof = self.history_store.get_workload_profile(workload_id)
+        if prof is None:
+            return None
+
+        attempts = self.history_store.get_attempts(workload_id)
+        hist = self.history_store.get_history_record(workload_id)
+
+        record: dict[str, Any] = {
+            "workload_id": workload_id,
+            "profile": prof,
+            "state": (hist.state if hist is not None else "DEFINED"),
+            "progress_percent": (hist.progress_percent if hist is not None else None),
+            "progress_status": (
+                "measured" if hist is not None and hist.progress_percent is not None else "unavailable"
+            ),
+            "attempts": attempts,
+            "current_attempt": attempts[-1] if attempts else None,
+            "approved_plan": self.history_store.get_approved_plan(workload_id),
+            "total_calculated_cost_eur": (
+                hist.observed_calculated_cost_eur if hist is not None and hist.observed_calculated_cost_eur else 0.0
+            ),
+            "total_elapsed_minutes": (
+                hist.actual_duration_minutes if hist is not None and hist.actual_duration_minutes else 0.0
+            ),
+            "created_at": (hist.created_at if hist is not None else time.time()),
+            "updated_at": time.time(),
+            "rehydrated": True,
+        }
+        self._workloads[workload_id] = record
+        return record
+
+    def _require(self, workload_id: str) -> dict[str, Any]:
+        """Return the record for a workload, rehydrating from storage if needed."""
+        rec = self._workloads.get(workload_id)
+        if rec is None:
+            rec = self._rehydrate(workload_id)
+        if rec is None:
+            raise KeyError(f"Workload '{workload_id}' is not registered.")
+        return rec
+
     def transition_state(self, workload_id: str, new_state: LifecycleState, reason: str = "") -> dict[str, Any]:
         """Safely transition workload state."""
-        rec = self._workloads.get(workload_id)
-        if not rec:
-            raise KeyError(f"Workload '{workload_id}' is not registered.")
+        rec = self._require(workload_id)
 
         old_state = rec["state"]
         rec["state"] = new_state
@@ -81,9 +130,7 @@ class LifecycleManager:
         checkpoint_recovered_from: str | None = None,
     ) -> ExecutionAttempt:
         """Start a new physical execution attempt, verifying retry bounds and checkpointing."""
-        rec = self._workloads.get(workload_id)
-        if not rec:
-            raise KeyError(f"Workload '{workload_id}' is not registered.")
+        rec = self._require(workload_id)
 
         prof: WorkloadProfile = rec["profile"]
         p = plan if isinstance(plan, ExecutionPlan) else ExecutionPlan(**plan)
@@ -152,9 +199,7 @@ class LifecycleManager:
         cost_incurred_eur: float = 0.0,
     ) -> dict[str, Any]:
         """Update workload execution metrics with explicit observable vs unavailable progress."""
-        rec = self._workloads.get(workload_id)
-        if not rec:
-            raise KeyError(f"Workload '{workload_id}' is not registered.")
+        rec = self._require(workload_id)
 
         curr_att: ExecutionAttempt | None = rec.get("current_attempt")
         if curr_att:
@@ -188,9 +233,7 @@ class LifecycleManager:
         actual_duration_minutes: float | None = None,
     ) -> dict[str, Any]:
         """Record the conclusion of the current attempt and determine if resumption or retry is valid."""
-        rec = self._workloads.get(workload_id)
-        if not rec:
-            raise KeyError(f"Workload '{workload_id}' is not registered.")
+        rec = self._require(workload_id)
 
         prof: WorkloadProfile = rec["profile"]
         curr_att: ExecutionAttempt | None = rec.get("current_attempt")
@@ -223,8 +266,9 @@ class LifecycleManager:
 
     def can_resume_from_checkpoint(self, workload_id: str) -> tuple[bool, str]:
         """Determine if workload can resume from saved checkpoint or must restart from scratch."""
-        rec = self._workloads.get(workload_id)
-        if not rec:
+        try:
+            rec = self._require(workload_id)
+        except KeyError:
             return (False, "Workload not found.")
 
         prof: WorkloadProfile = rec["profile"]

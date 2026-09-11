@@ -565,3 +565,96 @@ def reset_governance_store() -> None:
     """Drop the cached store so a new AGENTGRID_DB_PATH takes effect (tests)."""
     global _governance_store
     _governance_store = None
+
+
+class MutationBlocked(PermissionError):
+    """Raised when the governing control mode forbids a mutation.
+
+    Subclasses :class:`PermissionError` so existing callers that already catch
+    the runtime adapters' permission errors keep behaving sensibly.
+    """
+
+    def __init__(self, reason: str, control_mode: str, workload_id: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.control_mode = control_mode
+        self.workload_id = workload_id
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": "blocked",
+            "reason": self.reason,
+            "control_mode": self.control_mode,
+            "workload_id": self.workload_id,
+        }
+
+
+def enforce_mutation(
+    workload_id: str | None,
+    action: str,
+    plan_id: str | None = None,
+    store: GovernanceStore | None = None,
+) -> dict[str, Any]:
+    """Authorise a cluster mutation that does not go through ``submit_plan``.
+
+    Several entry points -- the legacy MCP tools in particular -- mutate the
+    cluster directly. They previously honoured only whatever mode the runtime
+    adapter happened to hold, which defaults to ``delegation`` in both adapters.
+    That made the operator's choice advisory in name only.
+
+    This is the shared choke point:
+
+    * ``advisory``   -- every mutation is refused;
+    * ``validation`` -- refused unless an approval is recorded on the server for
+      ``plan_id``, bound to this workload;
+    * ``delegation`` -- allowed; policy limits on cost/shape are enforced by the
+      caller that knows the plan (``check_policy_bounds``).
+
+    Raises :class:`MutationBlocked` when refused, and returns the governing
+    state when allowed, so the caller can report which mode authorised it.
+    """
+    gov = store or get_governance_store()
+    state = gov.get_workload_control(workload_id or "")
+    mode = state["control_mode"]
+
+    if mode == "advisory":
+        raise MutationBlocked(
+            f"Advisory mode is read-only: '{action}' is refused for workload "
+            f"'{workload_id}'. Switch to validation or delegation to mutate the cluster.",
+            control_mode=mode,
+            workload_id=workload_id,
+        )
+
+    if mode == "validation":
+        if not plan_id:
+            raise MutationBlocked(
+                f"Validation mode requires an approved plan: '{action}' was requested for "
+                f"workload '{workload_id}' without a plan_id, so there is nothing an "
+                f"operator could have approved.",
+                control_mode=mode,
+                workload_id=workload_id,
+            )
+        registered = gov.get_registered_plan(plan_id)
+        if registered is None:
+            raise MutationBlocked(
+                f"Validation mode: plan '{plan_id}' is not registered on the server, so "
+                f"'{action}' cannot be authorised.",
+                control_mode=mode,
+                workload_id=workload_id,
+            )
+        approved, reason = gov.check_approval(
+            plan_id=plan_id,
+            workload_id=workload_id or registered["workload_id"],
+            fingerprint=registered["fingerprint"],
+        )
+        if not approved:
+            raise MutationBlocked(
+                f"Validation mode: {reason}", control_mode=mode, workload_id=workload_id
+            )
+
+    return {
+        "control_mode": mode,
+        "control_mode_source": state["source"],
+        "delegation_policy": state["delegation_policy"],
+        "workload_id": workload_id,
+    }

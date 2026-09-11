@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from google.adk.runners import InMemoryRunner
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 INDEX_HTML_PATH = os.path.join(STATIC_DIR, "index.html")
@@ -296,27 +296,75 @@ async def diagnose_endpoint(request: Request) -> dict[str, Any]:
 
 @app.post("/api/plans/compare")
 async def compare_plans_endpoint(request: Request) -> dict[str, Any]:
-    """Deterministically generate and compare execution plans."""
+    """Deterministically generate, compare, and *register* execution plans.
+
+    Registration matters: execution refuses plans the server has never seen, so
+    an agent cannot invent a plan id and then claim it was approved.
+    """
     from agentic_compute.plan_engine import evaluate_and_compare_plans
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.models import ExecutionPlan
+
     try:
         body = await request.json()
     except Exception:
         body = {}
 
     profile = body.get("workload_profile") or body
+    if not isinstance(profile, dict) or not profile.get("workload_id"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "workload_profile.workload_id is required: plans are registered against a "
+                "workload so they can later be approved and executed."
+            ),
+        )
+
     cluster_cpu = int(body.get("cluster_total_cpu", 128))
-    res = evaluate_and_compare_plans(
-        profile=profile,
-        cluster_total_cpu=cluster_cpu,
-        demo_mode=body.get("demo_mode"),
-    )
+    try:
+        res = evaluate_and_compare_plans(
+            profile=profile,
+            cluster_total_cpu=cluster_cpu,
+            demo_mode=body.get("demo_mode"),
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid workload profile: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    workload_id = profile["workload_id"]
+    command = profile.get("command") or profile.get("script")
+    if res.get("plans"):
+        gov = get_governance_store()
+        for plan_dict in res["plans"]:
+            try:
+                gov.register_plan(workload_id, ExecutionPlan(**plan_dict), command=command)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Could not register plan %s: %s", plan_dict.get("plan_id"), exc)
+        res["registered"] = True
+    else:
+        # No plan: say so explicitly rather than letting the UI show an empty
+        # list that looks like a loading state.
+        res["registered"] = False
+        res["registration_skipped_reason"] = (
+            "No compatible plan was produced, so nothing was registered for approval."
+        )
+    res["workload_id"] = workload_id
     return res
 
 
 @app.post("/api/plans/approve")
 async def approve_plan_endpoint(request: Request) -> dict[str, Any]:
-    """Approve a plan for execution in validation mode."""
+    """Record an operator approval for a plan, in validation mode.
+
+    The approval is written to the governance store, which is the only source
+    the execution gate consults. A missing or mismatched plan is a real HTTP
+    error: returning 200 with ``status: not_found`` previously let the UI
+    display a phantom approval.
+    """
+    from agentic_compute.governance import get_governance_store
     from agentic_compute.history import get_history_store
+
     try:
         body = await request.json()
     except Exception:
@@ -324,16 +372,90 @@ async def approve_plan_endpoint(request: Request) -> dict[str, Any]:
     plan_id = body.get("plan_id")
     if not plan_id:
         raise HTTPException(status_code=400, detail="plan_id is required")
-    store = get_history_store()
-    success = store.approve_execution_plan(plan_id)
-    return {"status": "approved" if success else "not_found", "plan_id": plan_id}
+
+    workload_id = body.get("workload_id")
+    approved_by = body.get("approved_by") or "operator"
+
+    gov = get_governance_store()
+    result = gov.approve_plan(plan_id, workload_id=workload_id, approved_by=approved_by)
+
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail=result["reason"])
+    if result["status"] == "workload_mismatch":
+        raise HTTPException(status_code=409, detail=result["reason"])
+
+    # Mirror the approval into history for reporting; failure here must not
+    # invalidate the authoritative approval, but it is surfaced.
+    try:
+        get_history_store().approve_execution_plan(plan_id)
+        result["history_updated"] = True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("History mirror of approval %s failed: %s", plan_id, exc)
+        result["history_updated"] = False
+
+    return result
+
+
+@app.get("/api/workloads/{workload_id}/control")
+def get_workload_control_endpoint(workload_id: str) -> dict[str, Any]:
+    """Return the control mode and delegation policy the server will enforce."""
+    from agentic_compute.governance import get_governance_store
+
+    state = get_governance_store().get_workload_control(workload_id)
+    return {
+        "workload_id": state["workload_id"],
+        "control_mode": state["control_mode"],
+        "delegation_policy": state["delegation_policy"].model_dump(),
+        "source": state["source"],
+    }
+
+
+@app.post("/api/workloads/{workload_id}/control")
+async def set_workload_control_endpoint(workload_id: str, request: Request) -> dict[str, Any]:
+    """Set the control mode/policy for a workload. Only the operator does this."""
+    from agentic_compute.governance import get_governance_store, normalize_control_mode
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    mode = body.get("control_mode")
+    if not mode:
+        raise HTTPException(status_code=400, detail="control_mode is required")
+    try:
+        normalize_control_mode(mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        state = get_governance_store().set_workload_control(
+            workload_id, mode, body.get("delegation_policy")
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid delegation policy: {exc}") from exc
+
+    return {
+        "workload_id": state["workload_id"],
+        "control_mode": state["control_mode"],
+        "delegation_policy": state["delegation_policy"].model_dump(),
+        "source": state["source"],
+    }
 
 
 @app.post("/api/execute-plan")
 async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
-    """Execute a plan with control mode enforcement."""
+    """Execute a plan under the control mode the *server* holds for the workload.
+
+    On a successful submission the workload profile, plan and attempt are
+    persisted, so the journey submit -> track -> history is continuous instead
+    of ending in a 404.
+    """
     from agentic_compute.execution_controller import ExecutionController
+    from agentic_compute.lifecycle_manager import LifecycleManager
+    from agentic_compute.models import ExecutionPlan, WorkloadProfile
     from agentic_compute.mcp_server import _runtime
+
     try:
         body = await request.json()
     except Exception:
@@ -341,10 +463,15 @@ async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
 
     profile = body.get("workload_profile") or {}
     plan = body.get("plan") or {}
-    control_mode = body.get("control_mode", "validation")
+    control_mode = body.get("control_mode")
     delegation_policy = body.get("delegation_policy")
     is_approved = bool(body.get("is_operator_approved", False))
     approved_plan_id = body.get("approved_plan_id")
+
+    if not profile.get("workload_id"):
+        raise HTTPException(status_code=400, detail="workload_profile.workload_id is required")
+    if not plan.get("plan_id"):
+        raise HTTPException(status_code=400, detail="plan.plan_id is required")
 
     controller = ExecutionController(_runtime)
     res = controller.submit_plan(
@@ -355,7 +482,29 @@ async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
         is_operator_approved=is_approved,
         approved_plan_id=approved_plan_id,
         runtime=_runtime,
+        allow_resubmit=bool(body.get("allow_resubmit", False)),
     )
+
+    if res.get("status") == "submitted" and res.get("job_id"):
+        try:
+            mgr = LifecycleManager()
+            typed_profile = WorkloadProfile(**profile)
+            typed_plan = ExecutionPlan(**plan)
+            mgr.register_workload(typed_profile)
+            attempt = mgr.start_attempt(
+                workload_id=typed_profile.workload_id,
+                plan=typed_plan,
+                job_id=res["job_id"],
+            )
+            res["attempt_id"] = attempt.attempt_id
+            res["attempt_number"] = attempt.attempt_number
+            res["history_linked"] = True
+        except Exception as exc:
+            # The job exists; say so, and say that tracking could not be linked.
+            logger.exception("Could not link submission to history: %s", exc)
+            res["history_linked"] = False
+            res["history_link_error"] = f"{type(exc).__name__}: {exc}"
+
     return res
 
 

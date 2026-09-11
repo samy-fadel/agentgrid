@@ -169,8 +169,24 @@ def test_feature3_plan_comparison_unfeasible_explanation():
 # ---------------------------------------------------------------------------
 
 def test_feature4_control_modes_enforcement():
-    """Verify advisory mode blocks mutations, validation requires approval, delegation enforces policy."""
-    controller = ExecutionController()
+    """Advisory blocks, validation needs a *server-recorded* approval, delegation stays inside policy.
+
+    Strengthened from the original test, which authorised execution simply by
+    passing ``is_operator_approved=True``. That is caller-supplied evidence: the
+    agent can set it itself, so it proved nothing. The test now:
+
+    * asserts self-attestation is explicitly refused,
+    * only unblocks after registering *and* approving the plan through
+      ``GovernanceStore``,
+    * sets the delegation mode on the server, because ``resolve_control`` lets a
+      caller tighten but never loosen the operator's mode.
+
+    A real runtime is used so a "submitted" verdict means a job truly exists.
+    """
+    from agentic_compute.simulator import SimulatedRuntime
+
+    controller = ExecutionController(SimulatedRuntime())
+    gov = controller.governance
     plan = ExecutionPlan(
         plan_id="plan-1",
         plan_type="cost_optimized",
@@ -188,20 +204,43 @@ def test_feature4_control_modes_enforcement():
     assert res_adv["status"] == "blocked"
     assert "advisory mode is read-only" in res_adv["reason"].lower()
 
-    # 2. Validation Mode: MUST block if not operator-approved
+    # 2. Validation Mode: MUST block if no approval was recorded server-side
     res_val_unapproved = controller.submit_plan(profile, plan, control_mode="validation", is_operator_approved=False)
     assert res_val_unapproved["status"] == "blocked"
-    assert "operator approval" in res_val_unapproved["reason"].lower()
 
-    # 3. Validation Mode: MUST succeed when approved
-    res_val_approved = controller.submit_plan(profile, plan, control_mode="validation", is_operator_approved=True)
-    assert res_val_approved["status"] == "submitted"
+    # 2b. Self-attestation MUST NOT open the gate: the agent can forge both of
+    #     these arguments, so they carry no authority.
+    res_forged = controller.submit_plan(
+        profile,
+        plan,
+        control_mode="validation",
+        is_operator_approved=True,
+        approved_plan_id=plan.plan_id,
+    )
+    assert res_forged["status"] == "blocked"
+    assert "caller-supplied approval flags are ignored" in res_forged["reason"].lower()
 
-    # 4. Delegation Mode: Autonomous within budget
+    # 3. Validation Mode: succeeds once the server holds a real approval.
+    gov.register_plan("wl-ctrl", plan)
+    approval = gov.approve_plan(plan.plan_id, workload_id="wl-ctrl", approved_by="test-operator")
+    assert approval["status"] == "approved"
+    res_val_approved = controller.submit_plan(profile, plan, control_mode="validation")
+    assert res_val_approved["status"] == "submitted", res_val_approved
+    assert res_val_approved["job_id"]
+    assert res_val_approved["verified"] is True
+
+    # 4. Delegation Mode: autonomous within budget, on a fresh workload so the
+    #    idempotency ledger is not the reason it is accepted.
     policy = DelegationPolicy(max_budget_eur=5.0, allowed_machine_types=["n2-standard-4"])
-    res_del_ok = controller.submit_plan(profile, plan, control_mode="delegation", delegation_policy=policy)
-    # Note: might be 'already_submitted' due to idempotency for same workload_id
-    assert res_del_ok["status"] in ("submitted", "already_submitted")
+    gov.set_workload_control("wl-deleg", "delegation", policy)
+    res_del_ok = controller.submit_plan(
+        WorkloadProfile(workload_id="wl-deleg", name="wl-deleg"),
+        plan,
+        control_mode="delegation",
+        delegation_policy=policy,
+    )
+    assert res_del_ok["status"] == "submitted", res_del_ok
+    assert res_del_ok["control_mode"] == "delegation"
 
     # 5. Delegation Mode: MUST block when plan exceeds policy budget
     expensive_plan = ExecutionPlan(
@@ -214,11 +253,12 @@ def test_feature4_control_modes_enforcement():
         total_time_to_result_minutes=10.0,
         ranking_rationale="fast",
     )
+    gov.set_workload_control("wl-exp", "delegation", policy)
     res_del_blocked = controller.submit_plan(
         WorkloadProfile(workload_id="wl-exp"), expensive_plan, control_mode="delegation", delegation_policy=policy
     )
     assert res_del_blocked["status"] == "blocked"
-    assert "exceeds delegated policy budget" in res_del_blocked["reason"].lower()
+    assert "exceeds delegated policy" in res_del_blocked["reason"].lower()
 
 
 def test_feature4_fallback_ladder_selection():
@@ -257,13 +297,46 @@ def test_feature4_fallback_ladder_selection():
     assert fallback.plan_id == "plan-standard"
 
 
-def test_feature4_safe_downscale():
-    """Verify safe downscaling cleans active tracking."""
+def test_feature4_safe_downscale_reports_outcome_honestly():
+    """Downscaling must report what actually happened, never a blanket success.
+
+    Strengthened from the original test, which called safe_downscale with no
+    runtime at all and asserted 'downscaled'. That encoded the very defect under
+    audit: claiming to have released an allocation without touching, or even
+    being able to observe, any cluster.
+    """
+    from agentic_compute.simulator import SimulatedRuntime
+
+    # 1. No runtime: the outcome cannot be verified, so it is a failure.
     controller = ExecutionController()
     controller._submitted_job_hashes["wl-downscale"] = "job-999"
     res = controller.safe_downscale("wl-downscale")
-    assert res["status"] == "downscaled"
-    assert "wl-downscale" not in controller._submitted_job_hashes
+    assert res["status"] == "failed"
+    assert res["safe"] is False
+    assert "cannot verify" in res["reason"].lower() or "no runtime" in res["reason"].lower()
+
+    # 2. Unknown identity: refuse rather than downscale someone else's workload.
+    runtime = SimulatedRuntime()
+    other = ExecutionController(runtime)
+    res_other = other.safe_downscale("not-the-running-workload", runtime=runtime)
+    assert res_other["status"] == "rejected"
+    assert res_other["safe"] is False
+
+    # 3. Active workload: refuse to interrupt running compute.
+    active_id = runtime.snapshot().workload.id
+    runtime.workload.remaining_work_units = 250.0
+    res_active = other.safe_downscale(active_id, runtime=runtime)
+    assert res_active["status"] == "rejected"
+    assert res_active["safe"] is False
+    assert "running" in res_active["reason"].lower()
+
+    # 4. Completed workload: a genuine downscale succeeds and clears tracking.
+    runtime.workload.remaining_work_units = 0.0
+    other._submitted_job_hashes[active_id] = "job-123"
+    res_done = other.safe_downscale(active_id, runtime=runtime)
+    assert res_done["status"] == "downscaled"
+    assert res_done["safe"] is True
+    assert active_id not in other._submitted_job_hashes
 
 
 # ---------------------------------------------------------------------------

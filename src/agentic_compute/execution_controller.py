@@ -130,13 +130,23 @@ class ExecutionController:
 
         # 2. Validation: only a persisted, fingerprint-matched approval counts.
         if mode == "validation":
+            # Caller-supplied approval evidence is never authoritative, so say so
+            # on *every* refusal path -- otherwise a caller that passed the flags
+            # reads "plan not registered" and assumes a lookup glitch.
+            hint = ""
+            if is_operator_approved or approved_plan_id:
+                hint = (
+                    " Note: caller-supplied approval flags are ignored; approval must be "
+                    "recorded on the server before execution."
+                )
+
             registered = self.governance.get_registered_plan(p.plan_id)
             if registered is None:
                 return (
                     False,
                     f"Execution blocked: plan '{p.plan_id}' is not registered on the server. "
                     f"Generate plans via the comparison endpoint so the exact plan is recorded, "
-                    f"then approve it.",
+                    f"then approve it.{hint}",
                 )
 
             effective_workload = wl_id or registered["workload_id"]
@@ -144,7 +154,7 @@ class ExecutionController:
                 return (
                     False,
                     f"Execution blocked: plan '{p.plan_id}' belongs to workload "
-                    f"'{registered['workload_id']}', not '{effective_workload}'.",
+                    f"'{registered['workload_id']}', not '{effective_workload}'.{hint}",
                 )
 
             fingerprint = plan_fingerprint(p, command=command)
@@ -154,12 +164,6 @@ class ExecutionController:
                 fingerprint=fingerprint,
             )
             if not approved:
-                hint = ""
-                if is_operator_approved or approved_plan_id:
-                    hint = (
-                        " Note: caller-supplied approval flags are ignored; approval must be "
-                        "recorded on the server before execution."
-                    )
                 return (False, f"Execution blocked: {reason}{hint}")
             return (True, f"Plan '{p.plan_id}' has a recorded operator approval.")
 

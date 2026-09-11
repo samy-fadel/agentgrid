@@ -79,14 +79,16 @@ def test_scenario_2_nominal_end_to_end_journey():
         plan_types = {p["plan_type"] for p in plans}
         assert plan_types == {"cost_optimized", "deadline_favored", "balanced_tradeoff"}
 
-        # 4. Human validation approval
+        # 4. Human validation approval.
+        #    The history store records the plan for reporting, but authorisation
+        #    lives in the governance store: that is the only source the execution
+        #    gate trusts. Approving only in history must NOT unlock execution.
         selected_plan_dict = plans[0]
         selected_plan = ExecutionPlan(**selected_plan_dict)
         store.save_execution_plan(selected_plan, workload_id=profile.workload_id)
         store.approve_execution_plan(selected_plan.plan_id)
 
-        # 5. Execute plan under validation mode with approval
-        exec_res = controller.submit_plan(
+        premature = controller.submit_plan(
             profile=profile,
             plan=selected_plan,
             control_mode="validation",
@@ -94,8 +96,26 @@ def test_scenario_2_nominal_end_to_end_journey():
             approved_plan_id=selected_plan.plan_id,
             runtime=runtime,
         )
-        assert exec_res["status"] == "submitted"
+        assert premature["status"] == "blocked", premature
+        assert "caller-supplied approval flags are ignored" in premature["reason"].lower()
+
+        gov = controller.governance
+        gov.register_plan(profile.workload_id, selected_plan, command=profile.command or profile.script)
+        approval = gov.approve_plan(
+            selected_plan.plan_id, workload_id=profile.workload_id, approved_by="operator-under-test"
+        )
+        assert approval["status"] == "approved", approval
+
+        # 5. Execute the exact plan the operator approved.
+        exec_res = controller.submit_plan(
+            profile=profile,
+            plan=selected_plan,
+            control_mode="validation",
+            runtime=runtime,
+        )
+        assert exec_res["status"] == "submitted", exec_res
         assert exec_res["verified"] is True
+        assert exec_res["job_id"]
 
         # 6. Lifecycle tracking: Queued -> Running -> Progress -> Completed
         att = mgr.start_attempt(workload_id=profile.workload_id, plan=selected_plan, job_id=exec_res["job_id"])
@@ -218,9 +238,18 @@ def test_scenario_6_missing_telemetry_visible_uncertainty():
 
 
 def test_scenario_7_human_control_modes_strict_enforcement():
-    """Scenario 7: Strict backend enforcement of Advisory, Validation, and Delegation modes."""
+    """Scenario 7: Advisory / Validation / Delegation enforced from server state.
+
+    Reworked from the original, which unlocked validation mode with
+    ``is_operator_approved=True`` and entered delegation mode simply by asking
+    for it. Both are caller-controlled, so neither demonstrated enforcement.
+    The scenario now records approvals and modes through ``GovernanceStore`` and
+    adds an escalation check: a caller must not be able to widen the operator's
+    mode.
+    """
     runtime = SimulatedRuntime()
     controller = ExecutionController(runtime)
+    gov = controller.governance
     plan = ExecutionPlan(
         plan_id="plan-test-7",
         title="Test Plan",
@@ -241,8 +270,9 @@ def test_scenario_7_human_control_modes_strict_enforcement():
     runtime.set_control_mode("advisory")
     with pytest.raises(PermissionError, match="advisory.*mode"):
         runtime.apply(Action(action="resize_workload", workload_id="mc-001", cpu=16, reason="test"))
+    runtime.set_control_mode("delegation")
 
-    # 2. Mode Validation: Requires explicit human approval
+    # 2. Mode Validation: requires an approval recorded on the server.
     res_val_unapproved = controller.submit_plan(
         profile=profile,
         plan=plan,
@@ -251,31 +281,54 @@ def test_scenario_7_human_control_modes_strict_enforcement():
         runtime=runtime,
     )
     assert res_val_unapproved["status"] == "blocked"
-    assert "requires explicit human operator approval" in res_val_unapproved["reason"].lower()
+    assert "not registered on the server" in res_val_unapproved["reason"].lower()
 
+    # Registering a plan is not approving it.
+    gov.register_plan(profile.workload_id, plan)
+    res_registered_only = controller.submit_plan(
+        profile=profile, plan=plan, control_mode="validation", runtime=runtime
+    )
+    assert res_registered_only["status"] == "blocked"
+    assert "approval" in res_registered_only["reason"].lower()
+
+    gov.approve_plan(plan.plan_id, workload_id=profile.workload_id)
     res_val_approved = controller.submit_plan(
         profile=profile,
         plan=plan,
         control_mode="validation",
-        is_operator_approved=True,
         runtime=runtime,
     )
-    assert res_val_approved["status"] == "submitted"
+    assert res_val_approved["status"] == "submitted", res_val_approved
 
-    # 3. Mode Délégation: Policy-bounded autonomy
-    # Policy with 20€ budget permits 15€ plan
+    # 2b. No escalation: with the server on its default (validation), a caller
+    #     asking for delegation must not obtain autonomous execution.
+    escalating = controller.submit_plan(
+        profile=WorkloadProfile(workload_id="wl-gov-7-escalate", cpu_requested=16),
+        plan=plan,
+        control_mode="delegation",
+        delegation_policy=DelegationPolicy(max_budget_eur=9999.0),
+        runtime=runtime,
+    )
+    assert escalating["status"] == "blocked", escalating
+    assert escalating["control_mode"] == "validation"
+
+    # 3. Mode Délégation: policy-bounded autonomy, configured by the operator.
+    profile_ok = WorkloadProfile(workload_id="wl-gov-7c", cpu_requested=16)
+    gov.set_workload_control(profile_ok.workload_id, "delegation", DelegationPolicy(max_budget_eur=20.0))
     res_del_ok = controller.submit_plan(
-        profile=profile,
+        profile=profile_ok,
         plan=plan,
         control_mode="delegation",
         delegation_policy=DelegationPolicy(max_budget_eur=20.0),
         runtime=runtime,
     )
-    assert res_del_ok["status"] in ("submitted", "already_submitted")
+    assert res_del_ok["status"] == "submitted", res_del_ok
 
     # Policy with 10€ budget rejects 15€ plan
+    profile_blocked = WorkloadProfile(workload_id="wl-gov-7b", cpu_requested=16)
+    gov.set_workload_control(profile_blocked.workload_id, "delegation", DelegationPolicy(max_budget_eur=10.0))
     res_del_blocked = controller.submit_plan(
-        profile=WorkloadProfile(workload_id="wl-gov-7b", cpu_requested=16),
+        profile=profile_blocked,
         plan=plan,
         control_mode="delegation",
         delegation_policy=DelegationPolicy(max_budget_eur=10.0),
@@ -335,7 +388,21 @@ def test_scenario_8_ordered_fallback_ladder_and_budget_breach():
 
 
 def test_scenario_9_submission_timeout_and_idempotency():
-    """Scenario 9: Ambiguous network timeout recovers active state without duplicate submission."""
+    """Scenario 9: an ambiguous timeout must never create a second job.
+
+    The original test only called ``submit_plan`` twice and never produced a
+    timeout, so the behaviour named in its own title was untested. It now:
+
+    * sets delegation on the server (a caller can no longer grant it to itself),
+    * raises a real :class:`AmbiguousSubmission` *after* the runtime accepted the
+      job, and checks recovery finds that same job by submission identity,
+    * replays through a brand-new controller to prove idempotency survives a
+      process restart,
+    * checks an explicitly authorised retry is distinguishable from a replay.
+    """
+    from agentic_compute.errors import AmbiguousSubmission
+    from agentic_compute.governance import plan_fingerprint, submission_key
+
     runtime = SimulatedRuntime()
     controller = ExecutionController(runtime)
     plan = ExecutionPlan(
@@ -348,6 +415,9 @@ def test_scenario_9_submission_timeout_and_idempotency():
         estimated_cost_eur=5.0,
     )
     profile = WorkloadProfile(workload_id="wl-idemp-99", cpu_requested=16)
+    controller.governance.set_workload_control(
+        profile.workload_id, "delegation", DelegationPolicy(max_budget_eur=50.0)
+    )
 
     # First submission
     res1 = controller.submit_plan(
@@ -356,8 +426,9 @@ def test_scenario_9_submission_timeout_and_idempotency():
         control_mode="delegation",
         runtime=runtime,
     )
-    assert res1["status"] == "submitted"
+    assert res1["status"] == "submitted", res1
     first_job_id = res1["job_id"]
+    assert first_job_id
 
     # Second submission with same workload_id -> Reuses existing job, avoids duplicate
     res2 = controller.submit_plan(
@@ -368,6 +439,92 @@ def test_scenario_9_submission_timeout_and_idempotency():
     )
     assert res2["status"] == "already_submitted"
     assert res2["job_id"] == first_job_id
+
+    # A brand new controller (i.e. a restarted process) must reach the same
+    # verdict: the ledger, not in-memory state, is the authority.
+    restarted = ExecutionController(SimulatedRuntime())
+    res3 = restarted.submit_plan(profile=profile, plan=plan, control_mode="delegation")
+    assert res3["status"] == "already_submitted"
+    assert res3["job_id"] == first_job_id
+
+    # Ambiguous timeout on a different workload: the runtime really accepts the
+    # job, then the transport fails. Recovery must find that exact job and must
+    # not submit again.
+    amb_runtime = SimulatedRuntime()
+    amb_controller = ExecutionController(amb_runtime)
+    amb_profile = WorkloadProfile(workload_id="wl-idemp-timeout", cpu_requested=16)
+    amb_controller.governance.set_workload_control(
+        amb_profile.workload_id, "delegation", DelegationPolicy(max_budget_eur=50.0)
+    )
+
+    real_submit = amb_runtime.submit_job
+    calls: list[str] = []
+
+    def flaky_submit(**kwargs):
+        calls.append(kwargs.get("name", ""))
+        real_submit(**kwargs)  # the cluster genuinely accepts it
+        raise AmbiguousSubmission(
+            "gateway timeout while awaiting the submission acknowledgement",
+            submission_key=kwargs.get("name"),
+        )
+
+    amb_runtime.submit_job = flaky_submit
+    res_amb = amb_controller.submit_plan(
+        profile=amb_profile, plan=plan, control_mode="delegation", runtime=amb_runtime
+    )
+    amb_runtime.submit_job = real_submit
+
+    expected_key = submission_key(
+        amb_profile.workload_id,
+        plan_fingerprint(plan, command=amb_profile.command or amb_profile.script),
+    )
+    assert len(calls) == 1, "the runtime must be called exactly once"
+    assert calls[0] == expected_key
+    assert res_amb["status"] == "submitted", res_amb
+    assert res_amb["recovered_after_timeout"] is True
+    assert res_amb["job_id"] == expected_key
+
+    # Replaying after the ambiguous timeout still must not duplicate.
+    res_amb_replay = amb_controller.submit_plan(
+        profile=amb_profile, plan=plan, control_mode="delegation", runtime=amb_runtime
+    )
+    assert res_amb_replay["status"] == "already_submitted"
+    assert res_amb_replay["job_id"] == res_amb["job_id"]
+
+    # A definite failure followed by an explicitly authorised retry is a
+    # different thing from a replay, and must be allowed to run again.
+    fail_runtime = SimulatedRuntime()
+    fail_controller = ExecutionController(fail_runtime)
+    fail_profile = WorkloadProfile(workload_id="wl-idemp-retry", cpu_requested=16)
+    fail_controller.governance.set_workload_control(
+        fail_profile.workload_id, "delegation", DelegationPolicy(max_budget_eur=50.0)
+    )
+
+    def broken_submit(**kwargs):
+        raise ConnectionError("cluster endpoint refused the connection")
+
+    fail_runtime.submit_job = broken_submit
+    res_fail = fail_controller.submit_plan(
+        profile=fail_profile, plan=plan, control_mode="delegation", runtime=fail_runtime
+    )
+    assert res_fail["status"] == "failed", res_fail
+    assert res_fail["ambiguous"] is False
+
+    # Without authorisation, the failed slot is not silently reused.
+    res_replay_failed = fail_controller.submit_plan(
+        profile=fail_profile, plan=plan, control_mode="delegation", runtime=fail_runtime
+    )
+    assert res_replay_failed["status"] != "submitted"
+
+    fail_runtime.submit_job = SimulatedRuntime.submit_job.__get__(fail_runtime)
+    res_retry = fail_controller.submit_plan(
+        profile=fail_profile,
+        plan=plan,
+        control_mode="delegation",
+        runtime=fail_runtime,
+        allow_resubmit=True,
+    )
+    assert res_retry["status"] == "submitted", res_retry
 
 
 def test_scenario_10_interruption_checkpoint_resume_and_non_interruptible_rejection():
