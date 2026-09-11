@@ -36,6 +36,7 @@ def isolated_agentgrid_state(tmp_path, monkeypatch):
     history = importlib.import_module("agentic_compute.history")
     governance = importlib.import_module("agentic_compute.governance")
     lifecycle = importlib.import_module("agentic_compute.lifecycle_manager")
+    capacity_advisor = importlib.import_module("agentic_compute.capacity_advisor")
 
     # Drop cached singletons so they re-open against the new path.
     history._history_store = None
@@ -45,9 +46,15 @@ def isolated_agentgrid_state(tmp_path, monkeypatch):
     # has been swapped, and a test could pass on stale memory instead of on
     # persisted state.
     lifecycle.default_lifecycle_manager._workloads.clear()
+    # Quota reads are cached for a short window so that one search does not
+    # re-fetch the same regional document once per machine type. Across tests
+    # that window is a leak: a stubbed response from one test would be served
+    # to the next, which asserts on a *different* stub.
+    capacity_advisor.reset_quota_cache()
 
     yield db_path
 
     history._history_store = None
     governance.reset_governance_store()
     lifecycle.default_lifecycle_manager._workloads.clear()
+    capacity_advisor.reset_quota_cache()

@@ -421,7 +421,55 @@ _GPU_QUOTA_METRICS = (
 _GLOBAL_GPU_QUOTA_METRIC = "GPUS_ALL_REGIONS"
 
 
+#: A quota document describes a whole region, so every machine type in a search
+#: asks for exactly the same page. Uncached, one search made one HTTP round trip
+#: per machine type per region -- slow, and close enough together to be
+#: indistinguishable from abuse of the Compute Engine read quota.
+#:
+#: The window is deliberately short. A quota reading is a measurement, and this
+#: module's contract is that it never presents a stale or invented number as
+#: current. Set ``AGENTGRID_QUOTA_CACHE_TTL=0`` to read through on every call.
+try:
+    QUOTA_CACHE_TTL_SECONDS: float = float(os.getenv("AGENTGRID_QUOTA_CACHE_TTL", "30"))
+except ValueError:
+    QUOTA_CACHE_TTL_SECONDS = 30.0
+
+_QUOTA_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def reset_quota_cache() -> None:
+    """Drop every cached quota reading.
+
+    Tests use this to keep runs independent; an operator can use it to force a
+    fresh read after asking for a quota increase.
+    """
+    _QUOTA_CACHE.clear()
+
+
 def _fetch_quotas(url: str, what: str) -> dict[str, Any]:
+    """Read a ``quotas[]`` collection, reusing a very recent read of the same URL.
+
+    Only successful reads are cached. An outage, a denied credential or a 503
+    must reach the caller every time it happens: freezing a failure in for the
+    whole window would turn a transient error into a persistent wrong answer,
+    and the caller decides how to surface uncertainty.
+    """
+    ttl = QUOTA_CACHE_TTL_SECONDS
+    if ttl > 0:
+        hit = _QUOTA_CACHE.get(url)
+        if hit is not None:
+            fetched_at, payload = hit
+            if (time.time() - fetched_at) < ttl:
+                return payload
+            del _QUOTA_CACHE[url]
+
+    result = _fetch_quotas_uncached(url, what)
+    if ttl > 0 and result.get("status") == "ok":
+        _QUOTA_CACHE[url] = (time.time(), result)
+    return result
+
+
+def _fetch_quotas_uncached(url: str, what: str) -> dict[str, Any]:
     """Read a ``quotas[]`` collection from the Compute Engine API.
 
     Returns ``{"status": "ok", "quotas": {METRIC: {"limit": x, "usage": y}}}``
@@ -831,6 +879,60 @@ def _evaluate_quota_numbers(
     }
 
 
+# One search fans out to one Capacity Advisor query and one quota lookup per
+# (region, provisioning model). Permitting an unbounded list would turn a single
+# dashboard click into dozens of live API calls, so the search is capped and the
+# regions left out are named.
+MAX_SEARCH_REGIONS = 5
+
+
+def resolve_search_regions(
+    workload: Any,
+    region: str | None = None,
+) -> tuple[list[str], str | None]:
+    """Decide which regions a capacity search covers, and explain the decision.
+
+    Returns ``(regions, note)``. ``regions`` is empty only when the location
+    constraints exclude everything -- in that case ``note`` says which region was
+    asked for and which ones were permitted, so the caller never has to guess
+    why it received nothing.
+
+    This used to be two separate pieces of logic: the search took
+    ``allowed_regions[0]`` and the HTTP route recomputed its own idea of the
+    searched region for the operator-facing note. They could disagree. Both now
+    call this function.
+    """
+    allowed = list(getattr(workload, "allowed_regions", None) or [])
+    allow_change = bool(getattr(workload, "allow_region_change", False))
+
+    if region:
+        if allowed and region not in allowed:
+            if not allow_change:
+                return [], (
+                    f"'{region}' is outside the allowed regions {allowed} and "
+                    "allow_region_change is false, so no candidate is offered."
+                )
+            return [region], (
+                f"'{region}' is outside the allowed regions {allowed}, but "
+                "allow_region_change is true, so it was searched anyway."
+            )
+        return [region], None
+
+    if not allowed:
+        return [os.getenv("CLOUDSDK_COMPUTE_REGION") or "us-central1"], None
+
+    if len(allowed) > MAX_SEARCH_REGIONS:
+        searched = allowed[:MAX_SEARCH_REGIONS]
+        skipped = allowed[MAX_SEARCH_REGIONS:]
+        return searched, (
+            f"A single search covers at most {MAX_SEARCH_REGIONS} regions. "
+            f"{searched} were searched; {skipped} were not. Re-run with an "
+            "explicit region to cover them."
+        )
+
+    return allowed, None
+
+
 def search_compatible_capacity(
     profile: Any,
     region: str | None = None,
@@ -853,16 +955,9 @@ def search_compatible_capacity(
     else:
         workload = WorkloadProfile(workload_id="adhoc-search")
 
-    target_region = (
-        region
-        or (workload.allowed_regions[0] if workload.allowed_regions else None)
-        or os.getenv("CLOUDSDK_COMPUTE_REGION")
-        or "us-central1"
-    )
-
-    if workload.allowed_regions and target_region not in workload.allowed_regions:
-        if not workload.allow_region_change:
-            return []
+    search_regions, _location_note = resolve_search_regions(workload, region)
+    if not search_regions:
+        return []
 
     project_id, project_source = resolve_quota_project()
     needed_cpu = workload.cpu_requested or 4
@@ -895,90 +990,95 @@ def search_compatible_capacity(
 
     candidates: list[dict[str, Any]] = []
 
-    # Batch query Capacity Advisor once per provisioning model
-    for prov_model in prov_models:
-        advice = query_capacity_advice(
-            machine_types=compatible_types,
-            size=1,
-            region=target_region,
-            provisioning_model=prov_model,
-            demo_mode=demo_mode,
-        )
-
-        advice_map = {}
-        for rec in advice.get("recommendations", []):
-            advice_map[rec.get("machine_type")] = rec
-
-        is_unavailable = advice.get("status") == "unavailable"
-        is_sim = advice.get("is_simulated", False)
-
-        for mtype in compatible_types:
-            meta = GCP_MACHINE_CATALOG[mtype]
-            stage = "catalog_proposed"
-
-            quota_res = check_quota_availability(
-                project_id=project_id,
+    # Every region the operator permitted is searched, not just the head of
+    # the list. Reducing ``allowed_regions`` to ``[0]`` meant an operator who
+    # accepted three regions was answered about one, and a shortage in that
+    # one region was reported as "no compatible capacity".
+    for target_region in search_regions:
+        # Batch query Capacity Advisor once per provisioning model
+        for prov_model in prov_models:
+            advice = query_capacity_advice(
+                machine_types=compatible_types,
+                size=1,
                 region=target_region,
-                cpu_needed=meta["cpu"],
-                gpu_needed=meta.get("gpu_count", 0),
                 provisioning_model=prov_model,
-                project_source=project_source,
+                demo_mode=demo_mode,
             )
 
-            quota_status = quota_res["status"]
-            # Only a *known* and sufficient quota authorises the next stage.
-            # QUOTA_UNKNOWN has is_exceeded=False but proves nothing, so it must
-            # leave the candidate at catalog_proposed.
-            quota_authorized = quota_res.get("is_known", True) and not quota_res["is_exceeded"]
-            if quota_authorized:
-                stage = "quota_authorized"
+            advice_map = {}
+            for rec in advice.get("recommendations", []):
+                advice_map[rec.get("machine_type")] = rec
 
-            rec_data = advice_map.get(mtype, {})
-            obtainability = rec_data.get("obtainability_score")
-            uptime = rec_data.get("estimated_uptime")
-            preempt_risk = rec_data.get("preemption_risk_level", rec_data.get("preemption_risk"))
+            is_unavailable = advice.get("status") == "unavailable"
+            is_sim = advice.get("is_simulated", False)
 
-            if is_unavailable:
-                provenance = "unavailable"
-                capacity_signal = "UNAVAILABLE"
-            elif is_sim:
-                provenance = "simulated_demo"
-                capacity_signal = "SIMULATED"
+            for mtype in compatible_types:
+                meta = GCP_MACHINE_CATALOG[mtype]
+                stage = "catalog_proposed"
+
+                quota_res = check_quota_availability(
+                    project_id=project_id,
+                    region=target_region,
+                    cpu_needed=meta["cpu"],
+                    gpu_needed=meta.get("gpu_count", 0),
+                    provisioning_model=prov_model,
+                    project_source=project_source,
+                )
+
+                quota_status = quota_res["status"]
+                # Only a *known* and sufficient quota authorises the next stage.
+                # QUOTA_UNKNOWN has is_exceeded=False but proves nothing, so it must
+                # leave the candidate at catalog_proposed.
+                quota_authorized = quota_res.get("is_known", True) and not quota_res["is_exceeded"]
                 if quota_authorized:
-                    stage = "capacity_estimated"
-            else:
-                provenance = "gcp_live_api"
-                if obtainability is not None:
-                    capacity_signal = "HIGH" if obtainability >= 0.85 else ("MEDIUM" if obtainability >= 0.65 else "LOW")
+                    stage = "quota_authorized"
+
+                rec_data = advice_map.get(mtype, {})
+                obtainability = rec_data.get("obtainability_score")
+                uptime = rec_data.get("estimated_uptime")
+                preempt_risk = rec_data.get("preemption_risk_level", rec_data.get("preemption_risk"))
+
+                if is_unavailable:
+                    provenance = "unavailable"
+                    capacity_signal = "UNAVAILABLE"
+                elif is_sim:
+                    provenance = "simulated_demo"
+                    capacity_signal = "SIMULATED"
                     if quota_authorized:
                         stage = "capacity_estimated"
                 else:
-                    capacity_signal = "UNKNOWN"
+                    provenance = "gcp_live_api"
+                    if obtainability is not None:
+                        capacity_signal = "HIGH" if obtainability >= 0.85 else ("MEDIUM" if obtainability >= 0.65 else "LOW")
+                        if quota_authorized:
+                            stage = "capacity_estimated"
+                    else:
+                        capacity_signal = "UNKNOWN"
 
-            uptime_mins = parse_duration_to_minutes(uptime) if uptime else None
+                uptime_mins = parse_duration_to_minutes(uptime) if uptime else None
 
-            candidate = CapacityCandidate(
-                machine_type=mtype,
-                quantity=1,
-                cpu_count=meta["cpu"],
-                memory_gb=meta["memory_gb"],
-                region=target_region,
-                zone=rec_data.get("recommended_zone", advice.get("recommended_zone")),
-                provisioning_model=prov_model,
-                compatibility="COMPATIBLE",
-                quota_status=quota_status,
-                quota_limit=quota_res.get("quota_limit"),
-                quota_usage=quota_res.get("quota_usage"),
-                quota_project=quota_res.get("quota_project"),
-                quota_project_source=quota_res.get("quota_project_source"),
-                capacity_signal=capacity_signal,
-                obtainability_score=obtainability,
-                preemption_risk=preempt_risk,
-                estimated_uptime_minutes=uptime_mins,
-                data_provenance=provenance,
-                timestamp=time.time(),
-                state_stage=stage,
-            )
-            candidates.append(candidate.model_dump())
+                candidate = CapacityCandidate(
+                    machine_type=mtype,
+                    quantity=1,
+                    cpu_count=meta["cpu"],
+                    memory_gb=meta["memory_gb"],
+                    region=target_region,
+                    zone=rec_data.get("recommended_zone", advice.get("recommended_zone")),
+                    provisioning_model=prov_model,
+                    compatibility="COMPATIBLE",
+                    quota_status=quota_status,
+                    quota_limit=quota_res.get("quota_limit"),
+                    quota_usage=quota_res.get("quota_usage"),
+                    quota_project=quota_res.get("quota_project"),
+                    quota_project_source=quota_res.get("quota_project_source"),
+                    capacity_signal=capacity_signal,
+                    obtainability_score=obtainability,
+                    preemption_risk=preempt_risk,
+                    estimated_uptime_minutes=uptime_mins,
+                    data_provenance=provenance,
+                    timestamp=time.time(),
+                    state_stage=stage,
+                )
+                candidates.append(candidate.model_dump())
 
     return candidates

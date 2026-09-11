@@ -74,6 +74,28 @@ def _slurm_evidence(detail: dict[str, Any], include_admin_comment: bool = True) 
     return f" Slurm record: {'; '.join(parts)}." if parts else ""
 
 
+# Slurm publishes the reason a job is held in ``state_reason``. The QoS and
+# association families all begin with one of these prefixes -- ``QOSGrpCpuLimit``,
+# ``QOSMaxJobsPerUserLimit``, ``AssocMaxCpuMinsPerJobLimit``,
+# ``AssocGrpCPURunMinutes``... The previous code matched the substrings ``qos``
+# and ``assocmax``, which both over-matched (any log line mentioning QoS) and
+# under-matched (every ``AssocGrp*`` reason fell through to "unknown").
+_SCHEDULER_LIMIT_PREFIXES = ("qos", "assocmax", "assocgrp", "assocjob", "assocnode")
+
+
+def _is_scheduler_limit_reason(state_reason: str | None) -> bool:
+    """True when the scheduler is holding the job against an accounting ceiling.
+
+    These ceilings live in slurmdbd and belong to the cluster administrator. A
+    cloud quota increase does not affect them, so they must never be reported
+    with a cloud source or a cloud remedy.
+    """
+    if not isinstance(state_reason, str):
+        return False
+    normalised = state_reason.strip().lower()
+    return normalised.startswith(_SCHEDULER_LIMIT_PREFIXES)
+
+
 def diagnose_blockers(
     job_state: str | None = None,
     state_reason: str | None = None,
@@ -132,17 +154,78 @@ def diagnose_blockers(
         + " "
         + admin_comment
     ).lower()
-    is_quota = (
+
+    # A cloud quota and a cluster accounting limit are two different blockers
+    # with two different owners. They used to be merged: any text containing
+    # "qos" or "assocmax" produced a finding sourced to ``gcp_compute_quota``
+    # advising a GCP quota increase. Nothing a cloud administrator can grant
+    # will move a ``QOSMaxJobsPerUserLimit``, which lives in slurmdbd.
+    is_gcp_quota = (
         "quota_exceeded" in err_text
         or "quota exceeded" in err_text
         or "ratelimitexceeded" in err_text
         or "cpus_all_regions" in err_text
         or "gpus_all_regions" in err_text
         or (state_reason and "quota" in state_reason.lower())
-        or "qos" in err_text or "qosmax" in err_text or "assocmax" in err_text
     )
 
-    if is_quota:
+    # Detected on ``state_reason`` only. Slurm publishes these in a dedicated
+    # field; scanning the free-form log for the substring "qos" turned a
+    # traceback that merely printed the QoS name into a fabricated limit.
+    is_scheduler_limit = _is_scheduler_limit_reason(state_reason)
+
+    if is_scheduler_limit:
+        findings.append(
+            DiagnosticItem(
+                category="quota",
+                observed_facts=(
+                    f"Slurm accounting limit reached: the scheduler is holding the "
+                    f"job under '{state_reason}'. This ceiling is held by the "
+                    f"cluster's accounting database (slurmdbd), not by the cloud "
+                    f"provider."
+                ) + slurm_evidence,
+                source="slurm_controller",
+                timestamp=ts,
+                confirmed=True,
+                hypothesis_details=None,
+                possible_actions=[
+                    {
+                        "action": (
+                            "Reduce the requested parallelism (vCPU count, node count "
+                            "or number of concurrent jobs) to fit inside the current "
+                            "QoS/association ceiling"
+                        ),
+                        "consequences": (
+                            "Starts without any administrative request, at lower "
+                            "parallelism and therefore longer wall-clock time"
+                        ),
+                    },
+                    {
+                        "action": (
+                            "Wait for this account's own running jobs to finish and "
+                            "release the ceiling"
+                        ),
+                        "consequences": (
+                            "No cost and no configuration change; start time depends "
+                            "on the account's current jobs, not on the cluster's "
+                            "total free capacity"
+                        ),
+                    },
+                    {
+                        "action": (
+                            "Ask the cluster administrator to raise the QoS or "
+                            "association limit for this account (sacctmgr)"
+                        ),
+                        "consequences": (
+                            "Removes the ceiling for future submissions; requires a "
+                            "cluster administrator, not a cloud quota request"
+                        ),
+                    },
+                ],
+            )
+        )
+
+    if is_gcp_quota:
         findings.append(
             DiagnosticItem(
                 category="quota",
@@ -178,7 +261,10 @@ def diagnose_blockers(
         or (state_reason and state_reason in ("NodesSpecError", "NodeDown"))
     )
 
-    if is_capacity and not is_quota:
+    # Only a *cloud* quota error suppresses the capacity finding: the two are
+    # usually the same provisioning failure described twice. A cluster QoS
+    # ceiling is an independent blocker and must not hide a real stockout.
+    if is_capacity and not is_gcp_quota:
         findings.append(
             DiagnosticItem(
                 category="capacity_shortage",

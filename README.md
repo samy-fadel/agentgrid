@@ -172,13 +172,28 @@ operator control mode. The mode is held by the server; a caller cannot grant its
   3. `capacity_estimated`: GCP Capacity Advisor signals (obtainability score 0–100%, preemption risk, uptime).
   4. `actually_allocated`: Ground-truth scheduler verification on the cluster.
 * **Truthful Provenance**: Explicit distinction between `gcp_live_api`, `simulated_demo`, and `unavailable`.
+* **Every permitted location is searched.** The search covers each region in the workload's
+  `allowed_regions`, not just the first, so a shortage in one region is not reported as "no
+  compatible capacity" while other authorised regions were never queried. An explicit
+  `region` narrows the search back to that one region. A single search is capped at
+  `MAX_SEARCH_REGIONS` (5) and names the regions it left out; the response carries
+  `searched_regions` and, when location constraints exclude everything, a `location_note`
+  saying which region was asked for and which were permitted. The search and that note come
+  from the same resolver, so they cannot disagree.
+* **Each region's quota document is read once per search**, not once per machine type
+  (30 s TTL, `AGENTGRID_QUOTA_CACHE_TTL=0` to read through). Only successful reads are
+  cached: a credential failure or a 503 reaches the caller every time it happens.
 
 ### 2. Diagnostic des blocages (Blocker Diagnostic Engine)
 Structured taxonomy classifying execution impediments into:
 * `resource_waiting`: Cluster saturation, dynamic cloud VM spin-up wait.
 * `priority`: Queued behind higher-priority workloads.
 * `dependencies`: Upstream workflow dependencies or user/admin holds.
-* `quota`: Project vCPU/GPU quota or Slurm QOS limits (`QOSMaxCpuPerUserLimit`).
+* `quota`: a ceiling was reached — **and the finding names who holds it.** A GCP regional or
+  project quota is sourced `gcp_compute_quota` and remedied by a quota request; a Slurm
+  QoS/association ceiling (`QOSMaxJobsPerUserLimit`, `AssocGrpCPURunMinutes`, …) is sourced
+  `slurm_controller` and remedied by reducing parallelism, waiting for the account's own
+  jobs, or `sacctmgr`. The two are reported as separate findings when both apply.
 * `capacity_shortage`: Cloud stockouts (`ZONE_RESOURCE_POOL_EXHAUSTED`), preemption spikes.
 * `incompatible_configuration`: Invalid constraints (`BadConstraints`), unsupported shapes.
 * `application_error`: Non-zero exit codes (e.g. exit 137 OOM, exit 139 SIGSEGV) with targeted remediations.
@@ -316,6 +331,9 @@ Being precise about this matters more than the feature list. As of the current c
 | The capacity axis of the cost / delay / capacity comparison | **Verified, and exercised against the real API** | `tests/test_plan_capacity_dimension.py` for the contract; against the live project the same 88 vCPU plans answered `QUOTA_EXCEEDED ... available 0/0` with `data_provenance: gcp_live_api` |
 | Every quota figure names the project it came from | **Verified** | `tests/test_plan_capacity_dimension.py`; `resolve_quota_project()` is the single resolver, and a figure read from the built-in default project says so in its reason and in the dashboard |
 | The controlled fallback is reachable by an operator and by the agent | **Verified** | `tests/test_fallback_exposure.py` — `POST /api/workloads/{id}/fallback`, MCP `select_fallback_plan`, and a dashboard control; the decision never submits |
+| A blocker keeps the origin that actually holds it | **Verified** | `tests/test_scheduler_limit_attribution.py` — a Slurm `QOSMaxJobsPerUserLimit` used to be reported as `source: gcp_compute_quota` advising a cloud quota increase, which no cloud administrator can grant; 20 of the file's 39 tests fail against the previous code |
+| Every region the operator permitted is searched, not just the first | **Verified** | `tests/test_multi_region_search.py` — `resolve_search_regions()` is the single resolver used by both the search and the HTTP explanation, so the candidates and the note can no longer disagree; the search is capped at 5 regions and names the ones left out |
+| One capacity search reads each region's quota document once | **Verified, measured against the real API** | `tests/test_quota_fetch_cache.py` — the same 12 live-API tests in `tests/test_multi_region_search.py` went from **88.7 s to 5.1 s**. Only successful reads are cached, for 30 s by default (`AGENTGRID_QUOTA_CACHE_TTL=0` disables it); an outage is never frozen in |
 | Execution | **Simulator only** | no VM has been provisioned by this project's test runs |
 | Slurm adapter | **Mocked HTTP only** | `tests/test_slurm.py`, `tests/test_slurm_telemetry_defects.py` drive stubbed `slurmrestd` responses. **Not validated against a real cluster.** |
 | Dashboard | **Compiled and rendered offline, not opened in a browser** | `tools/check_jsx.py`, `tools/render_check.py`. CSS, layout and real event dispatch are **not** covered. |

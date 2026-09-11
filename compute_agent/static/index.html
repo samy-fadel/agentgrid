@@ -226,7 +226,7 @@
           const data = await res.json();
           setCapacityCandidates(data.candidates || []);
           setCapacityMeta({
-            searched_region: data.searched_region,
+            searched_regions: data.searched_regions || (data.searched_region ? [data.searched_region] : []),
             allowed_regions: data.allowed_regions || [],
             allow_region_change: data.allow_region_change,
             location_note: data.location_note,
@@ -1678,9 +1678,13 @@
               {capacityMeta && (
                 <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs text-slate-300 space-y-1">
                   <div>
-                    Région interrogée :{" "}
+                    {capacityMeta.searched_regions.length > 1
+                      ? "Régions interrogées : "
+                      : "Région interrogée : "}
                     <span className="font-mono text-cyan-300">
-                      {capacityMeta.searched_region}
+                      {capacityMeta.searched_regions.length > 0
+                        ? capacityMeta.searched_regions.join(", ")
+                        : "aucune"}
                     </span>
                     {capacityMeta.allowed_regions.length > 0 && (
                       <span className="text-slate-400">

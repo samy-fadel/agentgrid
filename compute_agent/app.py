@@ -286,28 +286,22 @@ async def search_capacity_endpoint(request: Request) -> dict[str, Any]:
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid capacity request: {exc}") from exc
 
-    searched_region = (
-        target_region
-        or (allowed_regions[0] if allowed_regions else None)
-        or os.getenv("CLOUDSDK_COMPUTE_REGION")
-        or "us-central1"
+    # The searched regions and the note come from the same resolver the search
+    # itself uses. They were previously recomputed here from the request body,
+    # which is how the note ended up claiming regions "were not explored" that
+    # the search had in fact covered -- and vice versa.
+    from agentic_compute.capacity_advisor import resolve_search_regions
+    from agentic_compute.models import WorkloadProfile
+
+    searched_regions, location_note = resolve_search_regions(
+        WorkloadProfile(**profile), target_region
     )
-    location_note = None
-    if allowed_regions and searched_region not in allowed_regions and not allow_region_change:
-        location_note = (
-            f"'{searched_region}' is outside the allowed regions {allowed_regions} and "
-            "allow_region_change is false, so no candidate is offered."
-        )
-    elif allowed_regions and len(allowed_regions) > 1:
-        location_note = (
-            f"Only '{searched_region}' was searched; the remaining allowed regions "
-            f"{[r for r in allowed_regions if r != searched_region]} were not explored "
-            "in this request."
-        )
 
     return {
         "candidates": [c.model_dump() for c in candidates],
-        "searched_region": searched_region,
+        "searched_regions": searched_regions,
+        # Kept for callers written against the single-region response.
+        "searched_region": searched_regions[0] if searched_regions else None,
         "allowed_regions": allowed_regions or [],
         "allow_region_change": allow_region_change,
         "location_note": location_note,

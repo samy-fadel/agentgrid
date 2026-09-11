@@ -117,16 +117,30 @@ def test_allowing_a_region_change_lets_the_search_leave_the_allow_list(client, m
     assert all(c["region"] == "us-central1" for c in body["candidates"])
 
 
-def test_a_multi_region_allow_list_admits_it_only_searched_one(client, monkeypatch):
+def test_a_multi_region_allow_list_is_searched_in_full(client, monkeypatch):
+    """This test used to assert the *defect* (1-D).
+
+    It required ``searched_region == "europe-west4"`` and a note saying
+    europe-west1 was "not explored" -- pinning in place the behaviour that an
+    operator who permitted two regions was answered about one. Admitting the gap
+    was honest but it is not the product's job: capability 1 is to find the
+    compatible capacity across the permitted locations.
+
+    The assertion is strengthened, not relaxed: both regions must now appear in
+    ``searched_regions`` *and* in the candidates themselves.
+    """
     _quota(monkeypatch, "QUOTA_AVAILABLE", True, False)
     resp = client.post(
         "/api/capacity-search",
         json={"cpu_requested": 4, "allowed_regions": ["europe-west4", "europe-west1"]},
     )
     body = resp.json()
-    assert body["searched_region"] == "europe-west4"
-    assert "europe-west1" in body["location_note"]
-    assert "not explored" in body["location_note"]
+    assert sorted(body["searched_regions"]) == ["europe-west1", "europe-west4"]
+    assert sorted({c["region"] for c in body["candidates"]}) == [
+        "europe-west1",
+        "europe-west4",
+    ]
+    assert "not explored" not in (body.get("location_note") or "")
 
 
 def test_unknown_quota_leaves_candidates_at_catalog_proposed(client, monkeypatch):
