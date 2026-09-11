@@ -190,6 +190,11 @@ class CapacityCandidate(BaseModel):
     quota_status: Literal["QUOTA_AVAILABLE", "QUOTA_EXCEEDED", "QUOTA_UNKNOWN"] = "QUOTA_AVAILABLE"
     quota_limit: int | None = None
     quota_usage: int | None = None
+    # Which project the quota figures came from, and whether the operator chose
+    # it. Without this, a figure read from the built-in default project read as
+    # if it were the operator's own quota.
+    quota_project: str | None = None
+    quota_project_source: str | None = None
     
     capacity_signal: Literal["HIGH", "MEDIUM", "LOW", "UNAVAILABLE", "SIMULATED", "UNKNOWN"] = "HIGH"
     obtainability_score: float | None = None

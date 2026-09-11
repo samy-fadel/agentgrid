@@ -141,21 +141,54 @@ def test_a_failing_quota_lookup_does_not_break_the_comparison(quota_enabled, mon
         assert "network unreachable" in plan["capacity_detail"]
 
 
-def test_no_configured_project_is_stated_rather_than_assumed(monkeypatch):
+def test_without_a_configured_project_the_built_in_default_is_named(monkeypatch):
+    """The plan check and the capacity search must read the same project.
+
+    Both now go through ``resolve_quota_project``. With nothing configured they
+    fall back to the built-in demo project, and the verdict says which project
+    was read, instead of one feature answering "no project configured" while the
+    other silently read a hardcoded id and called the answer verified.
+    """
     monkeypatch.setenv("AGENTGRID_PLAN_CAPACITY_CHECK", "true")
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     monkeypatch.delenv("PROJECT_ID", raising=False)
 
-    def _must_not_be_called(**kwargs):  # pragma: no cover - guard
-        raise AssertionError("no quota call should be made without a project")
+    seen: list[dict] = []
 
-    monkeypatch.setattr(capacity_advisor, "check_quota_availability", _must_not_be_called)
+    def _stub(**kwargs):
+        seen.append(kwargs)
+        return {
+            "status": "QUOTA_UNKNOWN",
+            "reason": "no credentials",
+            "data_provenance": "unavailable",
+        }
 
-    result = evaluate_and_compare_plans(profile=PROFILE)
+    monkeypatch.setattr(capacity_advisor, "check_quota_availability", _stub)
 
-    for plan in result["plans"]:
-        assert plan["capacity_status"] == "QUOTA_UNKNOWN"
-        assert plan["capacity_source"] == "no_project_configured"
+    evaluate_and_compare_plans(profile=PROFILE)
+
+    assert seen, "the quota reader should still be consulted"
+    assert seen[0]["project_id"] == capacity_advisor.BUILT_IN_DEMO_PROJECT
+    assert seen[0]["project_source"] == "built_in_default"
+
+
+def test_a_default_project_figure_says_which_project_it_came_from():
+    """`check_quota_availability` stamps the project on every verdict."""
+    verdict = capacity_advisor.check_quota_availability(
+        region="europe-west4", cpu_needed=8, demo_mode=True
+    )
+
+    assert verdict["quota_project"] == capacity_advisor.BUILT_IN_DEMO_PROJECT
+    assert verdict["quota_project_source"] == "built_in_default"
+
+
+def test_an_explicit_project_is_reported_as_the_caller_s_choice():
+    verdict = capacity_advisor.check_quota_availability(
+        project_id="operator-project", region="europe-west4", cpu_needed=8, demo_mode=True
+    )
+
+    assert verdict["quota_project"] == "operator-project"
+    assert verdict["quota_project_source"] == "caller"
 
 
 def test_identical_shapes_are_looked_up_once(quota_enabled):

@@ -14,6 +14,30 @@ except ImportError:
     HAVE_GOOGLE_AUTH = False
 
 
+#: Project used when the operator has configured none. Keeping a working demo is
+#: reasonable; presenting another project's quota as "verified" for the operator's
+#: request is not. Every verdict therefore carries which project was read and
+#: whether that project was chosen by the operator or by this default.
+BUILT_IN_DEMO_PROJECT = "dubai-489009"
+
+
+def resolve_quota_project(project_id: str | None = None) -> tuple[str, str]:
+    """Return ``(project_id, source)`` for any quota or capacity lookup.
+
+    ``source`` is ``"caller"``, ``"environment"`` or ``"built_in_default"``. The
+    third case used to be invisible: with no ``GOOGLE_CLOUD_PROJECT`` set, the
+    advisor read a hardcoded project id and answered "verified against live
+    Compute Engine regional quota" -- a true sentence about somebody else's
+    project, and a misleading one about the operator's.
+    """
+    if project_id:
+        return (project_id, "caller")
+    env = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+    if env:
+        return (env, "environment")
+    return (BUILT_IN_DEMO_PROJECT, "built_in_default")
+
+
 def parse_duration_to_minutes(duration_val: Any) -> float | None:
     """Parse GCP API duration string or numeric seconds to minutes.
 
@@ -72,7 +96,7 @@ def query_capacity_advice(
         or "us-central1"
     )
 
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID") or "dubai-489009"
+    project_id, project_source = resolve_quota_project()
 
     # Check if demo mode is enabled or permitted
     if demo_mode is not None:
@@ -519,6 +543,47 @@ def _fetch_global_quotas(project_id: str) -> dict[str, Any]:
 
 
 def check_quota_availability(
+    project_id: str | None = None,
+    region: str = "us-central1",
+    cpu_needed: int = 0,
+    gpu_needed: int = 0,
+    provisioning_model: str = "STANDARD",
+    demo_mode: bool | None = None,
+    project_source: str | None = None,
+) -> dict[str, Any]:
+    """Read quota for a request and say *which project* was read.
+
+    The verdict used to name a region but never a project, while the project id
+    itself fell back to a hardcoded value when nothing was configured. "Request
+    fits within quota (verified against live Compute Engine regional quota)" was
+    then a true statement about a project the operator had never named. Every
+    verdict now carries ``quota_project`` and ``quota_project_source``, and the
+    reason says so out loud when the built-in default was used.
+    """
+    resolved, source = resolve_quota_project(project_id)
+    verdict = _check_quota_availability(
+        project_id=resolved,
+        region=region,
+        cpu_needed=cpu_needed,
+        gpu_needed=gpu_needed,
+        provisioning_model=provisioning_model,
+        demo_mode=demo_mode,
+    )
+    verdict["quota_project"] = resolved
+    verdict["quota_project_source"] = project_source or source
+    if (
+        verdict["quota_project_source"] == "built_in_default"
+        and verdict.get("data_provenance") not in ("simulated_demo", "invalid_override")
+    ):
+        verdict["reason"] = (
+            f"{verdict.get('reason', '')} This figure was read from project "
+            f"'{resolved}', the built-in default: no GOOGLE_CLOUD_PROJECT or PROJECT_ID "
+            f"is configured, so it is not necessarily your project's quota."
+        ).strip()
+    return verdict
+
+
+def _check_quota_availability(
     project_id: str,
     region: str,
     cpu_needed: int,
@@ -799,7 +864,7 @@ def search_compatible_capacity(
         if not workload.allow_region_change:
             return []
 
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "dubai-489009")
+    project_id, project_source = resolve_quota_project()
     needed_cpu = workload.cpu_requested or 4
     needed_gpu = workload.gpu_requested or 0
     needed_mem_gb = (workload.memory_mb_requested / 1024.0) if workload.memory_mb_requested else 0.0
@@ -857,6 +922,7 @@ def search_compatible_capacity(
                 cpu_needed=meta["cpu"],
                 gpu_needed=meta.get("gpu_count", 0),
                 provisioning_model=prov_model,
+                project_source=project_source,
             )
 
             quota_status = quota_res["status"]
@@ -903,6 +969,8 @@ def search_compatible_capacity(
                 quota_status=quota_status,
                 quota_limit=quota_res.get("quota_limit"),
                 quota_usage=quota_res.get("quota_usage"),
+                quota_project=quota_res.get("quota_project"),
+                quota_project_source=quota_res.get("quota_project_source"),
                 capacity_signal=capacity_signal,
                 obtainability_score=obtainability,
                 preemption_risk=preempt_risk,

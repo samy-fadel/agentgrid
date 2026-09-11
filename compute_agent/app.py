@@ -533,6 +533,88 @@ async def set_workload_control_endpoint(workload_id: str, request: Request) -> d
     return _control_state_payload(state)
 
 
+@app.post("/api/workloads/{workload_id}/fallback")
+async def evaluate_fallback_endpoint(workload_id: str, request: Request) -> dict[str, Any]:
+    """Propose the next rung of the controlled fallback ladder.
+
+    The ladder was implemented and tested in ``ExecutionController`` but reached
+    by nothing: no endpoint, no MCP tool, no dashboard control. Capability 4 of
+    the product is "execution *with a controlled fallback plan*", and
+    ``execute_plan_controlled`` even advertised "fallback handling" while no
+    caller could obtain one.
+
+    This endpoint decides only. It never submits: the returned rung still has to
+    go through ``/api/execute-plan``, which is where the control mode, the
+    approval and the ceilings are enforced.
+    """
+    from agentic_compute.execution_controller import ExecutionController
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.mcp_server import _runtime
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    gov = get_governance_store()
+    registered = gov.list_registered_plans(workload_id)
+
+    current_plan = body.get("current_plan")
+    current_plan_id = body.get("current_plan_id")
+    if current_plan is None and current_plan_id:
+        match = gov.get_registered_plan(current_plan_id)
+        if match is None or match["workload_id"] != workload_id:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Plan '{current_plan_id}' is not registered for workload "
+                    f"'{workload_id}'. Compare plans first."
+                ),
+            )
+        current_plan = match["plan"]
+    if current_plan is None:
+        raise HTTPException(
+            status_code=400,
+            detail="current_plan or current_plan_id is required to know what is being replaced.",
+        )
+
+    available = body.get("available_plans")
+    if available is None:
+        available = [entry["plan"] for entry in registered]
+        plans_source = "registered_plans"
+    else:
+        plans_source = "request"
+
+    try:
+        controller = ExecutionController(_runtime)
+        verdict = controller.evaluate_fallback_ladder_with_details(
+            current_plan=current_plan,
+            available_plans=available,
+            failure_category=body.get("failure_category", "unknown"),
+            budget_limit_eur=body.get("budget_limit_eur"),
+            accumulated_cost_eur=float(body.get("accumulated_cost_eur", 0.0)),
+            workload_id=workload_id,
+            profile=body.get("workload_profile"),
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid plan payload: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    plan = verdict.get("plan")
+    payload = dict(verdict)
+    payload["plan"] = plan.model_dump() if plan is not None and hasattr(plan, "model_dump") else plan
+    payload["workload_id"] = workload_id
+    payload["candidates_considered"] = len(available)
+    payload["available_plans_source"] = plans_source
+    payload["submitted"] = False
+    payload["next_step"] = (
+        "Nothing has been submitted. Send the selected plan to /api/execute-plan, which "
+        "enforces the control mode, the approval and the delegated ceilings."
+    )
+    return payload
+
+
 @app.post("/api/execute-plan")
 async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
     """Execute a plan under the control mode the *server* holds for the workload.

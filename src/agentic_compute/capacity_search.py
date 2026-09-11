@@ -7,6 +7,7 @@ from .capacity_advisor import (
     GCP_MACHINE_CATALOG,
     check_quota_availability,
     query_capacity_advice,
+    resolve_quota_project,
     search_compatible_capacity as _advisor_search_compatible_capacity,
 )
 from .models import CapacityCandidate, WorkloadProfile
@@ -23,14 +24,18 @@ def check_project_quota(
         (quota_status, quota_limit, quota_usage)
         where quota_status in ('QUOTA_AVAILABLE', 'QUOTA_EXCEEDED', 'QUOTA_UNKNOWN').
     """
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "dubai-489009")
+    # `limit` / `usage` were never keys of the verdict: it exposes `quota_limit`
+    # and `quota_usage`. This helper therefore always answered (status, None,
+    # None), quietly discarding the two numbers the status was derived from.
+    project_id, project_source = resolve_quota_project()
     res = check_quota_availability(
         project_id=project_id,
         region=region,
         cpu_needed=required_cpus,
         provisioning_model=provisioning_model,
+        project_source=project_source,
     )
-    return (res["status"], res.get("limit"), res.get("usage"))
+    return (res["status"], res.get("quota_limit"), res.get("quota_usage"))
 
 
 def search_compatible_capacity(

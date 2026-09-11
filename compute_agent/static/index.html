@@ -137,6 +137,8 @@
       const [approvedPlanId, setApprovedPlanId] = useState(null);
 
       const [planComparison, setPlanComparison] = useState(null);
+      const [fallbackVerdict, setFallbackVerdict] = useState(null);
+      const [fallbackPlanId, setFallbackPlanId] = useState(null);
       const [loadingPlans, setLoadingPlans] = useState(false);
       const [planError, setPlanError] = useState(null);
 
@@ -325,6 +327,36 @@
           setExecutionResult({ status: "error", reason: `Unable to reach the API: ${e.message}` });
         } finally {
           setExecutingPlanId(null);
+        }
+      };
+
+      const handleProposeFallback = async (plan) => {
+        setFallbackVerdict(null);
+        setFallbackPlanId(plan.plan_id);
+        try {
+          const res = await fetch(`${API_BASE}/api/workloads/${WORKLOAD_ID}/fallback`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              current_plan: plan,
+              failure_category: "spot_preemption",
+              workload_profile: buildWorkloadProfile(),
+            }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            setFallbackVerdict({
+              status: "error",
+              reason: body.detail || `Fallback request refused (HTTP ${res.status})`,
+            });
+            return;
+          }
+          // Show the server's verdict verbatim, including a refusal.
+          setFallbackVerdict(body);
+        } catch (e) {
+          setFallbackVerdict({ status: "error", reason: `Unable to reach the API: ${e.message}` });
+        } finally {
+          setFallbackPlanId(null);
         }
       };
 
@@ -1519,9 +1551,57 @@
                             {executingPlanId === plan.plan_id ? "Soumission…" : "Exécuter"}
                           </button>
                         </div>
+                        <button
+                          onClick={() => handleProposeFallback(plan)}
+                          disabled={fallbackPlanId === plan.plan_id}
+                          className="w-full px-2 py-1.5 text-xs rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-50"
+                          title="Demande au serveur quel plan de repli est autorisé si celui-ci échoue. N'exécute rien."
+                        >
+                          {fallbackPlanId === plan.plan_id ? "Évaluation…" : "Proposer un repli"}
+                        </button>
                       </div>
                     ))}
                   </div>
+
+                  {fallbackVerdict && (
+                    <div
+                      className={`mt-3 rounded-xl border p-3 text-xs space-y-1 ${
+                        fallbackVerdict.status === "selected"
+                          ? "border-cyan-500/40 bg-cyan-500/5"
+                          : "border-amber-500/40 bg-amber-500/5"
+                      }`}
+                    >
+                      <div className="font-semibold text-slate-100">
+                        Repli · {fallbackVerdict.status}
+                      </div>
+                      <div className="text-slate-300">{fallbackVerdict.reason}</div>
+                      {fallbackVerdict.plan && (
+                        <div className="font-mono text-cyan-300">
+                          {fallbackVerdict.plan.plan_id} · {fallbackVerdict.plan.region} ·{" "}
+                          {fmt(fallbackVerdict.plan.estimated_cost_eur, 2)} €
+                        </div>
+                      )}
+                      {fallbackVerdict.requires_approval && (
+                        <div className="text-amber-300">
+                          Ce plan doit encore être approuvé avant toute soumission.
+                        </div>
+                      )}
+                      {Array.isArray(fallbackVerdict.skipped_candidates) &&
+                        fallbackVerdict.skipped_candidates.length > 0 && (
+                          <ul className="text-slate-400 list-disc list-inside">
+                            {fallbackVerdict.skipped_candidates.map((sk) => (
+                              <li key={sk.plan_id}>
+                                {sk.plan_id} : {sk.reason}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      <div className="text-slate-500">
+                        Aucune soumission n'a eu lieu ({fallbackVerdict.candidates_considered ?? 0}{" "}
+                        candidat(s) examiné(s)).
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1672,6 +1752,14 @@
                           >
                             {c.quota_status}
                             {c.quota_limit != null ? ` (${c.quota_usage ?? "?"}/${c.quota_limit})` : ""}
+                            {c.quota_project_source === "built_in_default" && (
+                              <span
+                                className="ml-1 text-amber-300"
+                                title={`Quota lue dans le projet par défaut « ${c.quota_project} » : aucun GOOGLE_CLOUD_PROJECT n'est configuré, ce n'est pas nécessairement votre quota.`}
+                              >
+                                ⚠ projet par défaut
+                              </span>
+                            )}
                           </td>
                           <td className="py-2 font-mono">{c.capacity_signal}</td>
                           <td className="py-2 font-mono text-slate-400">{c.data_provenance}</td>

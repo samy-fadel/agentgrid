@@ -227,6 +227,12 @@ Structured taxonomy classifying execution impediments into:
   and runs forever. A released `submitted` or `uncertain` claim also keeps its cost charged: a
   job existed, or may have, and authorising another try is not a refund. A released `failed`
   claim created nothing and is refunded.
+* **The controlled fallback is reachable.** `POST /api/workloads/{id}/fallback` and the MCP tool
+  `select_fallback_plan` return the next authorised rung: advisory refuses outright, the delegated
+  ceilings are recomputed from the ledger, rungs that break the workload's constraints come back in
+  `skipped_candidates` with their reason, and the verdict carries `requires_approval` outside
+  delegation. The decision never submits — `submitted: false`, and the plan still has to go through
+  `/api/execute-plan`. The dashboard exposes it as "Proposer un repli" on each plan card.
 * **The constraints declared on the workload bind execution, not just planning.**
   `allowed_regions`, `allowed_zones`, `allow_spot`, `allow_region_change`, `allow_zone_change`
   and `allow_fallback_to_standard` used to be honoured only by the plan engine. `DelegationPolicy`
@@ -308,6 +314,8 @@ Being precise about this matters more than the feature list. As of the current c
 | The workload's own constraints (region, zone, Spot, fallback to Standard) bind submission *and* every fallback rung | **Verified** | `tests/test_profile_constraints.py` — before the fix a plan in a forbidden region was submitted with a real job id |
 | A caller cannot widen its own constraints at execution time | **Verified** | `tests/test_profile_constraints.py` — the profile persisted at plan-comparison time refuses first; `constraint_source` names which profile refused |
 | The capacity axis of the cost / delay / capacity comparison | **Verified, and exercised against the real API** | `tests/test_plan_capacity_dimension.py` for the contract; against the live project the same 88 vCPU plans answered `QUOTA_EXCEEDED ... available 0/0` with `data_provenance: gcp_live_api` |
+| Every quota figure names the project it came from | **Verified** | `tests/test_plan_capacity_dimension.py`; `resolve_quota_project()` is the single resolver, and a figure read from the built-in default project says so in its reason and in the dashboard |
+| The controlled fallback is reachable by an operator and by the agent | **Verified** | `tests/test_fallback_exposure.py` — `POST /api/workloads/{id}/fallback`, MCP `select_fallback_plan`, and a dashboard control; the decision never submits |
 | Execution | **Simulator only** | no VM has been provisioned by this project's test runs |
 | Slurm adapter | **Mocked HTTP only** | `tests/test_slurm.py`, `tests/test_slurm_telemetry_defects.py` drive stubbed `slurmrestd` responses. **Not validated against a real cluster.** |
 | Dashboard | **Compiled and rendered offline, not opened in a browser** | `tools/check_jsx.py`, `tools/render_check.py`. CSS, layout and real event dispatch are **not** covered. |

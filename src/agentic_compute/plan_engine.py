@@ -168,18 +168,11 @@ def annotate_plans_with_capacity(
     ``QUOTA_UNKNOWN`` with the reason attached, which is a different statement
     from ``QUOTA_AVAILABLE``.
     """
-    from .capacity_advisor import check_quota_availability
+    from .capacity_advisor import check_quota_availability, resolve_quota_project
 
-    project = project_id or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
-    if not project:
-        for plan in plans:
-            plan.capacity_status = "QUOTA_UNKNOWN"
-            plan.capacity_source = "no_project_configured"
-            plan.capacity_detail = (
-                "No GCP project is configured (GOOGLE_CLOUD_PROJECT / PROJECT_ID), "
-                "so no quota could be read for this plan."
-            )
-        return plans
+    # The same resolver as the capacity search, so the two features cannot
+    # disagree about which project they read.
+    project, project_source = resolve_quota_project(project_id)
 
     cache: dict[tuple[str, int, int, str], dict[str, Any]] = {}
     for plan in plans:
@@ -196,6 +189,7 @@ def annotate_plans_with_capacity(
                     gpu_needed=total_gpu,
                     provisioning_model=model,
                     demo_mode=demo_mode,
+                    project_source=project_source,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 cache[key] = {

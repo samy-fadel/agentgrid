@@ -574,12 +574,19 @@ def diagnose_blockers_tool(
     gcp_error: str | None = None,
     error_log: str | None = None,
     workload_profile: dict | None = None,
+    slurm_job_details: dict | None = None,
 ) -> dict:
     """Analyze telemetry to diagnose and categorize execution blockers.
 
     Categories: resource_waiting, priority, dependencies, quota,
     capacity_shortage, incompatible_configuration, application_error.
     Returns confirmed facts, origin sources, timestamps, and concrete remediation actions.
+
+    Pass the whole ``slurm_job_details`` record from slurmrestd when you have
+    one. Slurm-GCP writes the provider's error into ``admin_comment``, which is
+    frequently the only place a capacity shortage is recorded; the state alone
+    classifies as unknown. This parameter existed in the library and in the HTTP
+    endpoint but not here, so an agent could not supply the evidence.
     """
     findings = diagnose_blockers(
         job_state=job_state,
@@ -588,6 +595,7 @@ def diagnose_blockers_tool(
         gcp_error=gcp_error,
         error_log=error_log,
         workload_profile=workload_profile,
+        slurm_job_details=slurm_job_details,
     )
     return {"diagnostics": findings}
 
@@ -639,6 +647,72 @@ def execute_plan_controlled(
         runtime=_runtime,
     )
     return res
+
+
+@mcp.tool()
+def select_fallback_plan(
+    workload_id: str,
+    current_plan: dict | None = None,
+    current_plan_id: str | None = None,
+    failure_category: str = "unknown",
+    available_plans: list[dict] | None = None,
+    budget_limit_eur: float | None = None,
+) -> dict:
+    """Propose the next rung of the controlled fallback ladder after a failure.
+
+    Use after a preemption, a stockout or a failed attempt. The ladder is bound
+    by the same authority as a first submission: advisory refuses it outright,
+    the delegated budget and retry ceilings are recomputed from the server's
+    ledger, and a rung that breaks the constraints declared on the workload
+    (allowed regions and zones, Spot, fallback to Standard) is skipped with its
+    reason recorded in ``skipped_candidates``.
+
+    This selects; it does not launch. Outside delegation the answer carries
+    ``requires_approval: true`` and the plan must be approved by the operator
+    before ``execute_plan_controlled`` will submit it.
+    """
+    gov = get_governance_store()
+    registered = gov.list_registered_plans(workload_id)
+
+    plan = current_plan
+    if plan is None and current_plan_id:
+        match = gov.get_registered_plan(current_plan_id)
+        if match is None or match["workload_id"] != workload_id:
+            return {
+                "status": "not_found",
+                "plan": None,
+                "reason": (
+                    f"Plan '{current_plan_id}' is not registered for workload "
+                    f"'{workload_id}'. Compare plans first."
+                ),
+            }
+        plan = match["plan"]
+    if plan is None:
+        return {
+            "status": "invalid_request",
+            "plan": None,
+            "reason": "current_plan or current_plan_id is required.",
+        }
+
+    candidates = available_plans
+    if candidates is None:
+        candidates = [entry["plan"] for entry in registered]
+
+    verdict = _execution_controller.evaluate_fallback_ladder_with_details(
+        current_plan=plan,
+        available_plans=candidates,
+        failure_category=failure_category,
+        budget_limit_eur=budget_limit_eur,
+        workload_id=workload_id,
+    )
+    selected = verdict.get("plan")
+    payload = dict(verdict)
+    payload["plan"] = (
+        selected.model_dump() if selected is not None and hasattr(selected, "model_dump") else selected
+    )
+    payload["submitted"] = False
+    payload["candidates_considered"] = len(candidates)
+    return payload
 
 
 @mcp.tool()
