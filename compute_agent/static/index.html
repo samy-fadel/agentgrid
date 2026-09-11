@@ -1526,9 +1526,12 @@
                         <th className="text-left py-2">Machine</th>
                         <th className="text-left py-2">Région / zone</th>
                         <th className="text-right py-2">vCPU</th>
+                        <th className="text-right py-2">Mémoire</th>
                         <th className="text-left py-2">Approvisionnement</th>
                         <th className="text-left py-2">Palier</th>
                         <th className="text-left py-2">Quota</th>
+                        <th className="text-left py-2">Signal</th>
+                        <th className="text-left py-2">Provenance</th>
                       </tr>
                     </thead>
                     <tbody className="text-slate-200">
@@ -1536,16 +1539,28 @@
                         <tr key={i} className="border-b border-slate-800/60">
                           <td className="py-2 font-mono">{c.machine_type}</td>
                           <td className="py-2 font-mono">{c.region}{c.zone ? ` / ${c.zone}` : ""}</td>
-                          <td className="py-2 text-right font-mono">{c.cpu}</td>
+                          <td className="py-2 text-right font-mono">{c.cpu_count}</td>
+                          <td className="py-2 text-right font-mono">{fmt(c.memory_gb, 0)} Go</td>
                           <td className="py-2 font-mono">{c.provisioning_model}</td>
                           <td className="py-2">
                             <span className="px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono">
                               {c.state_stage}
                             </span>
                           </td>
-                          <td className="py-2 font-mono text-slate-400">
-                            {c.quota_status || c.quota_state || "—"}
+                          <td
+                            className={`py-2 font-mono ${
+                              c.quota_status === "QUOTA_AVAILABLE"
+                                ? "text-emerald-400"
+                                : c.quota_status === "QUOTA_EXCEEDED"
+                                ? "text-rose-400"
+                                : "text-amber-400"
+                            }`}
+                          >
+                            {c.quota_status}
+                            {c.quota_limit != null ? ` (${c.quota_usage ?? "?"}/${c.quota_limit})` : ""}
                           </td>
+                          <td className="py-2 font-mono">{c.capacity_signal}</td>
+                          <td className="py-2 font-mono text-slate-400">{c.data_provenance}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1591,22 +1606,42 @@
               {!loadingDiagnostics && !diagnosticsError && diagnosticsList.length > 0 && (
                 <div className="space-y-3">
                   {diagnosticsList.map((d, i) => (
-                    <div key={i} className="rounded-lg border border-slate-800 bg-slate-950/60 p-4 space-y-1">
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm font-semibold text-slate-100">{d.title || d.category}</span>
-                        <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-amber-300">
-                          source : {d.source || "inconnue"}
+                    <div key={i} className="rounded-lg border border-slate-800 bg-slate-950/60 p-4 space-y-2">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <span className="text-sm font-semibold text-slate-100">{d.category}</span>
+                        <span className="flex items-center gap-2">
+                          {/* The source is kept visible: a Slurm QoS limit and a
+                              GCP quota are different problems with different
+                              remedies, and must never be merged. */}
+                          <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-amber-300">
+                            source : {d.source}
+                          </span>
+                          <span
+                            className={`text-[11px] font-mono px-2 py-0.5 rounded ${
+                              d.confirmed
+                                ? "bg-emerald-500/15 text-emerald-300"
+                                : "bg-slate-800 text-slate-400"
+                            }`}
+                          >
+                            {d.confirmed ? "constaté" : "hypothèse"}
+                          </span>
                         </span>
                       </div>
-                      {d.severity && (
-                        <div className="text-xs text-slate-400">Sévérité : <span className="font-mono">{d.severity}</span></div>
+                      <p className="text-xs text-slate-300">{d.observed_facts}</p>
+                      {d.hypothesis_details && (
+                        <p className="text-[11px] text-slate-500 italic">{d.hypothesis_details}</p>
                       )}
-                      {d.detail && <p className="text-xs text-slate-300">{d.detail}</p>}
-                      {d.evidence && (
-                        <p className="text-[11px] text-slate-500 font-mono break-words">{d.evidence}</p>
-                      )}
-                      {d.recommended_action && (
-                        <p className="text-xs text-cyan-300">→ {d.recommended_action}</p>
+                      {(d.possible_actions || []).length > 0 && (
+                        <ul className="space-y-1 pt-1">
+                          {d.possible_actions.map((a, j) => (
+                            <li key={j} className="text-xs text-cyan-300">
+                              → {a.action}
+                              {a.consequences && (
+                                <span className="text-slate-500"> — {a.consequences}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
                       )}
                     </div>
                   ))}
@@ -1660,30 +1695,32 @@
                         <th className="text-right py-2">Coût observé</th>
                         <th className="text-right py-2">Écart</th>
                         <th className="text-right py-2">Durée</th>
+                        <th className="text-left py-2">Base du coût</th>
                       </tr>
                     </thead>
                     <tbody className="text-slate-200">
                       {historyRecords.map((r, i) => {
-                        const est = r.estimated_cost_eur;
-                        const obs = r.observed_calculated_cost_eur;
-                        const delta = est != null && obs != null ? obs - est : null;
+                        const est = r.initial_estimated_cost_eur;
+                        const obs = r.final_calculated_cost_eur;
+                        const delta = r.cost_comparison_delta_eur;
                         return (
                           <tr key={i} className="border-b border-slate-800/60">
                             <td className="py-2 font-mono">{r.workload_id}</td>
-                            <td className="py-2 font-mono">{r.state}</td>
-                            <td className="py-2 text-right font-mono">{r.total_attempts ?? "—"}</td>
-                            <td className="py-2 text-right font-mono">{est != null ? `${fmt(est, 2)} €` : "—"}</td>
-                            <td className="py-2 text-right font-mono">{obs != null ? `${fmt(obs, 2)} €` : "inconnu"}</td>
+                            <td className="py-2 font-mono">{r.final_status}</td>
+                            <td className="py-2 text-right font-mono">{(r.attempts || []).length}</td>
+                            <td className="py-2 text-right font-mono">{fmt(est, 2)} €</td>
+                            <td className="py-2 text-right font-mono">{fmt(obs, 2)} €</td>
                             <td
                               className={`py-2 text-right font-mono ${
-                                delta == null ? "text-slate-500" : delta > 0 ? "text-rose-400" : "text-emerald-400"
+                                delta > 0 ? "text-rose-400" : delta < 0 ? "text-emerald-400" : "text-slate-400"
                               }`}
                             >
-                              {delta == null ? "—" : `${delta > 0 ? "+" : ""}${fmt(delta, 2)} €`}
+                              {delta > 0 ? "+" : ""}{fmt(delta, 2)} €
                             </td>
                             <td className="py-2 text-right font-mono">
-                              {r.actual_duration_minutes != null ? `${fmt(r.actual_duration_minutes, 1)} min` : "—"}
+                              {fmt(r.final_actual_duration_minutes, 1)} min
                             </td>
+                            <td className="py-2 font-mono text-slate-400">{r.reconciliation_status}</td>
                           </tr>
                         );
                       })}

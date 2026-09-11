@@ -257,15 +257,61 @@ async def search_capacity_endpoint(request: Request) -> dict[str, Any]:
     allow_std = str(merged.get("allow_standard", "true")).lower() in ("true", "1")
     demo_mode = str(merged.get("demo_mode", "false")).lower() in ("true", "1") if "demo_mode" in merged else None
 
-    candidates = search_compatible_capacity(
-        cpu_requested=cpu_req,
-        gpu_requested=gpu_req,
-        memory_gb_requested=mem_req,
-        allow_spot=allow_spot,
-        allow_standard=allow_std,
-        demo_mode=demo_mode,
+    # Location constraints. These were previously dropped on the floor, so a
+    # caller restricted to one region silently received candidates from another.
+    allowed_regions = merged.get("allowed_regions")
+    if isinstance(allowed_regions, str):
+        allowed_regions = [r.strip() for r in allowed_regions.split(",") if r.strip()]
+    target_region = merged.get("target_region") or merged.get("region")
+    allow_region_change = str(merged.get("allow_region_change", "false")).lower() in ("true", "1")
+
+    profile: dict[str, Any] = {
+        "workload_id": merged.get("workload_id") or "workload-search",
+        "cpu_requested": cpu_req,
+        "gpu_requested": gpu_req,
+        "memory_mb_requested": int(mem_req * 1024),
+        "allow_spot": allow_spot,
+        "allow_fallback_to_standard": allow_std,
+        "allow_region_change": allow_region_change,
+    }
+    if allowed_regions:
+        profile["allowed_regions"] = allowed_regions
+
+    try:
+        candidates = search_compatible_capacity(
+            profile=profile,
+            target_region=target_region,
+            demo_mode=demo_mode,
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid capacity request: {exc}") from exc
+
+    searched_region = (
+        target_region
+        or (allowed_regions[0] if allowed_regions else None)
+        or os.getenv("CLOUDSDK_COMPUTE_REGION")
+        or "us-central1"
     )
-    return {"candidates": [c.model_dump() for c in candidates]}
+    location_note = None
+    if allowed_regions and searched_region not in allowed_regions and not allow_region_change:
+        location_note = (
+            f"'{searched_region}' is outside the allowed regions {allowed_regions} and "
+            "allow_region_change is false, so no candidate is offered."
+        )
+    elif allowed_regions and len(allowed_regions) > 1:
+        location_note = (
+            f"Only '{searched_region}' was searched; the remaining allowed regions "
+            f"{[r for r in allowed_regions if r != searched_region]} were not explored "
+            "in this request."
+        )
+
+    return {
+        "candidates": [c.model_dump() for c in candidates],
+        "searched_region": searched_region,
+        "allowed_regions": allowed_regions or [],
+        "allow_region_change": allow_region_change,
+        "location_note": location_note,
+    }
 
 
 @app.post("/api/diagnose")

@@ -4,7 +4,7 @@ import time
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ClusterState(BaseModel):
@@ -96,7 +96,17 @@ class Action(BaseModel):
 
 
 class WorkloadProfile(BaseModel):
-    """Profile of a computation, its resource requirements, constraints, and resilience capabilities."""
+    """Profile of a computation, its resource requirements, constraints, and resilience capabilities.
+
+    Unknown keys are rejected. Pydantic's default is to drop them silently, which
+    turned a plausible-but-wrong key such as ``budget_eur`` or ``cpu_count`` into
+    a *dropped constraint*: the caller declared a budget, the engine never saw
+    one, and the answer came back "feasible". A rejected request is honest; a
+    silently ignored constraint is not.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     workload_id: str
     name: str = "compute-workload"
     command: str | None = None
@@ -230,6 +240,13 @@ class ExecutionPlan(BaseModel):
     estimated_cost_eur: float
     cost_scope_included: list[str] = Field(default_factory=lambda: ["vm_compute_hourly"])
     cost_exclusions_known: list[str] = Field(default_factory=lambda: ["network_egress", "persistent_disk_storage"])
+    # How the cost figure above was obtained. The plan engine computes this; without
+    # the field declared here Pydantic silently dropped it and the API presented a
+    # modelled number as if it were a quoted price.
+    cost_basis: str = "modelled_flat_rate_hypothesis"
+    cost_basis_detail: str | None = None
+    # False when the currently attached runtime cannot actually run the plan.
+    executable_on_runtime: bool = True
     
     estimated_wait_minutes: float = 0.0
     estimated_prep_minutes: float = 0.0

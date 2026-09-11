@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+import logging
 import os
 
 from .models import Action
@@ -12,6 +13,8 @@ from .capacity_advisor import query_capacity_advice
 
 
 from mcp.server.transport_security import TransportSecuritySettings
+
+logger = logging.getLogger(__name__)
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8080"))
@@ -182,27 +185,71 @@ async def diagnose_route(request):
 
 @mcp.custom_route("/plans/compare", methods=["POST"])
 async def compare_plans_route(request):
-    """Evaluate, compare, and price execution plans deterministically."""
+    """Evaluate, compare, price *and register* execution plans deterministically.
+
+    Registration is what makes a plan approvable later. Without it this route was
+    a second door into the product that produced plan ids the execution gate had
+    never seen, so nothing compared here could ever be executed.
+    """
     from starlette.responses import JSONResponse
+    from .governance import get_governance_store
+    from .models import ExecutionPlan
     try:
         body = await request.json()
     except Exception:
         body = {}
 
     profile = body.get("workload_profile") or body
+    if not isinstance(profile, dict) or not profile.get("workload_id"):
+        return JSONResponse(
+            {
+                "error": (
+                    "workload_profile.workload_id is required: plans are registered "
+                    "against a workload so they can later be approved and executed."
+                )
+            },
+            status_code=400,
+        )
+
     cluster_cpu = int(body.get("cluster_total_cpu", 128))
-    result = evaluate_and_compare_plans(
-        profile=profile,
-        cluster_total_cpu=cluster_cpu,
-        demo_mode=body.get("demo_mode"),
-    )
+    try:
+        result = evaluate_and_compare_plans(
+            profile=profile,
+            cluster_total_cpu=cluster_cpu,
+            demo_mode=body.get("demo_mode"),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": f"Invalid workload profile: {exc}"}, status_code=400)
+
+    workload_id = profile["workload_id"]
+    command = profile.get("command") or profile.get("script")
+    if result.get("plans"):
+        gov = get_governance_store()
+        for plan_dict in result["plans"]:
+            try:
+                gov.register_plan(workload_id, ExecutionPlan(**plan_dict), command=command)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Could not register plan %s: %s", plan_dict.get("plan_id"), exc)
+        result["registered"] = True
+    else:
+        result["registered"] = False
+        result["registration_skipped_reason"] = (
+            "No compatible plan was produced, so nothing was registered for approval."
+        )
+    result["workload_id"] = workload_id
     return JSONResponse(result)
 
 
 @mcp.custom_route("/plans/approve", methods=["POST"])
 async def approve_plan_route(request):
-    """Human-in-the-loop endpoint to approve a concrete execution plan."""
+    """Human-in-the-loop endpoint to approve a concrete execution plan.
+
+    The approval is written to the governance store, which is the only source the
+    execution gate consults. Writing only to history, as this route used to do,
+    produced an approval that looked recorded but unlocked nothing.
+    """
     from starlette.responses import JSONResponse
+    from .governance import get_governance_store
     try:
         body = await request.json()
     except Exception:
@@ -210,8 +257,25 @@ async def approve_plan_route(request):
     plan_id = body.get("plan_id")
     if not plan_id:
         return JSONResponse({"error": "plan_id is required"}, status_code=400)
-    success = _history_store.approve_execution_plan(plan_id)
-    return JSONResponse({"status": "approved" if success else "not_found", "plan_id": plan_id})
+
+    gov = get_governance_store()
+    result = gov.approve_plan(
+        plan_id,
+        workload_id=body.get("workload_id"),
+        approved_by=body.get("approved_by") or "operator",
+    )
+    if result["status"] == "not_found":
+        return JSONResponse(result, status_code=404)
+    if result["status"] == "workload_mismatch":
+        return JSONResponse(result, status_code=409)
+
+    try:
+        _history_store.approve_execution_plan(plan_id)
+        result["history_updated"] = True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("History mirror of approval %s failed: %s", plan_id, exc)
+        result["history_updated"] = False
+    return JSONResponse(result)
 
 
 @mcp.custom_route("/history", methods=["GET"])

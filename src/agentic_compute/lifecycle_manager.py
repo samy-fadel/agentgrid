@@ -76,22 +76,27 @@ class LifecycleManager:
         attempts = self.history_store.get_attempts(workload_id)
         hist = self.history_store.get_history_record(workload_id)
 
+        last = attempts[-1] if attempts else None
         record: dict[str, Any] = {
             "workload_id": workload_id,
             "profile": prof,
-            "state": (hist.state if hist is not None else "DEFINED"),
-            "progress_percent": (hist.progress_percent if hist is not None else None),
-            "progress_status": (
-                "measured" if hist is not None and hist.progress_percent is not None else "unavailable"
-            ),
+            "state": (hist.final_status if hist is not None else "DEFINED"),
+            # ExecutionAttempt carries no progress figure, so progress after a
+            # restart is genuinely unknown. Saying "0%" would be an invention.
+            "progress_percent": None,
+            "progress_status": "unavailable",
             "attempts": attempts,
-            "current_attempt": attempts[-1] if attempts else None,
-            "approved_plan": self.history_store.get_approved_plan(workload_id),
+            "current_attempt": last,
+            "approved_plan": (
+                hist.approved_plan
+                if hist is not None and hist.approved_plan is not None
+                else self.history_store.get_approved_plan(workload_id)
+            ),
             "total_calculated_cost_eur": (
-                hist.observed_calculated_cost_eur if hist is not None and hist.observed_calculated_cost_eur else 0.0
+                hist.final_calculated_cost_eur if hist is not None else 0.0
             ),
             "total_elapsed_minutes": (
-                hist.actual_duration_minutes if hist is not None and hist.actual_duration_minutes else 0.0
+                hist.final_actual_duration_minutes if hist is not None else 0.0
             ),
             "created_at": (hist.created_at if hist is not None else time.time()),
             "updated_at": time.time(),
@@ -264,6 +269,112 @@ class LifecycleManager:
         self._sync_to_history(workload_id)
         return rec
 
+    def verify_checkpoint(self, workload_id: str) -> dict[str, Any]:
+        """Look at the declared checkpoint location and report what is really there.
+
+        Returns ``verification`` as one of:
+
+        * ``verified_present`` -- at least one object/file exists at the location.
+        * ``verified_absent``  -- the location was reachable and is empty or missing.
+        * ``unverified``       -- the location could not be inspected here; the
+          reason says why. This is deliberately *not* reported as present:
+          claiming a checkpoint exists because a boolean said so is how a
+          "resume" promise turns into a silent restart from zero.
+        """
+        import os
+        from urllib.parse import urlparse
+
+        try:
+            rec = self._require(workload_id)
+        except KeyError:
+            return {
+                "location": None,
+                "verification": "unverified",
+                "exists": None,
+                "reason": "Workload not found.",
+                "checked_by": None,
+            }
+
+        prof: WorkloadProfile = rec["profile"]
+        location = prof.checkpoint_location
+        result: dict[str, Any] = {
+            "location": location,
+            "verification": "unverified",
+            "exists": None,
+            "reason": "",
+            "checked_by": None,
+        }
+
+        if not location:
+            result["reason"] = "No checkpoint_location was declared."
+            return result
+
+        parsed = urlparse(location)
+        scheme = parsed.scheme
+
+        if scheme in ("", "file"):
+            path = parsed.path if scheme == "file" else location
+            result["checked_by"] = "local_filesystem"
+            try:
+                if not os.path.exists(path):
+                    result["verification"] = "verified_absent"
+                    result["exists"] = False
+                    result["reason"] = f"'{path}' does not exist on this filesystem."
+                elif os.path.isdir(path):
+                    entries = os.listdir(path)
+                    result["exists"] = bool(entries)
+                    result["verification"] = (
+                        "verified_present" if entries else "verified_absent"
+                    )
+                    result["reason"] = (
+                        f"'{path}' contains {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}."
+                    )
+                else:
+                    size = os.path.getsize(path)
+                    result["exists"] = size > 0
+                    result["verification"] = (
+                        "verified_present" if size > 0 else "verified_absent"
+                    )
+                    result["reason"] = f"'{path}' is a {size}-byte file."
+            except OSError as exc:
+                result["reason"] = f"'{path}' could not be inspected: {exc}"
+            return result
+
+        if scheme == "gs":
+            result["checked_by"] = "google_cloud_storage"
+            try:
+                from google.cloud import storage  # type: ignore
+            except Exception as exc:  # pragma: no cover - depends on the host
+                result["reason"] = (
+                    "A gs:// checkpoint cannot be inspected here: the "
+                    f"google-cloud-storage client is unavailable ({exc}). The "
+                    "checkpoint is neither confirmed present nor confirmed absent."
+                )
+                return result
+            bucket_name = parsed.netloc
+            prefix = parsed.path.lstrip("/")
+            try:
+                client = storage.Client()
+                blobs = list(client.list_blobs(bucket_name, prefix=prefix, max_results=1))
+                result["exists"] = bool(blobs)
+                result["verification"] = "verified_present" if blobs else "verified_absent"
+                result["reason"] = (
+                    f"gs://{bucket_name}/{prefix} "
+                    + ("holds at least one object." if blobs else "holds no object.")
+                )
+            except Exception as exc:  # pragma: no cover - depends on credentials
+                result["reason"] = (
+                    f"gs://{bucket_name}/{prefix} could not be listed ({exc}); the "
+                    "checkpoint is neither confirmed present nor confirmed absent."
+                )
+            return result
+
+        result["reason"] = (
+            f"Checkpoint scheme '{scheme}' is not one this deployment knows how to "
+            "inspect, so the checkpoint cannot be confirmed."
+        )
+        return result
+
     def can_resume_from_checkpoint(self, workload_id: str) -> tuple[bool, str]:
         """Determine if workload can resume from saved checkpoint or must restart from scratch."""
         try:
@@ -292,16 +403,44 @@ class LifecycleManager:
                 "Checkpointing is enabled but no checkpoint_location URI was provided.",
             )
 
-        # If previous attempts exist
-        if rec["attempts"]:
-            last_att = rec["attempts"][-1]
+        # The flags above only say what the workload *claims*. Look at the storage.
+        evidence = self.verify_checkpoint(workload_id)
+        attempts = rec["attempts"]
+        last_attempt_note = (
+            f"Previous attempt #{attempts[-1].attempt_number} is on record. "
+            if attempts
+            else ""
+        )
+
+        if evidence["verification"] == "verified_present":
             return (
                 True,
-                f"Checkpoint resumption available at '{prof.checkpoint_location}'. "
-                f"Previous attempt #{last_att.attempt_number} can be recovered without restarting from 0%.",
+                f"Checkpoint verified at '{prof.checkpoint_location}': {evidence['reason']} "
+                f"{last_attempt_note}Resume can start from the saved state.",
             )
 
-        return (True, f"Checkpointing enabled; target directory '{prof.checkpoint_location}'.")
+        if evidence["verification"] == "verified_absent":
+            if attempts:
+                return (
+                    False,
+                    f"No checkpoint exists at '{prof.checkpoint_location}': "
+                    f"{evidence['reason']} {last_attempt_note}"
+                    "The previous attempt left nothing to resume from, so the next "
+                    "execution restarts from 0%.",
+                )
+            return (
+                True,
+                f"Checkpointing is enabled and '{prof.checkpoint_location}' is currently "
+                f"empty ({evidence['reason']}), which is expected before the first "
+                "attempt writes a checkpoint.",
+            )
+
+        return (
+            True,
+            f"Checkpointing is declared at '{prof.checkpoint_location}', but its "
+            f"presence could NOT be verified from here: {evidence['reason']} "
+            f"{last_attempt_note}Treat resume as unproven: the run may restart from 0%.",
+        )
 
     def _sync_to_history(self, workload_id: str) -> None:
         rec = self._workloads.get(workload_id)

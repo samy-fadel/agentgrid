@@ -194,3 +194,113 @@ def test_dashboard_reports_the_server_verdict_for_approval_and_execution():
     # Execution shows whatever the server returned, including "blocked".
     assert "setExecutionResult(body)" in html
     assert "already_submitted" in html
+
+
+# ---------------------------------------------------------------------------
+# UI <-> model contract
+#
+# A React panel that reads a field the API never returns renders an empty cell
+# and passes every syntax and render check. This caught real defects: the
+# capacity table read `c.cpu` (the model exposes `cpu_count`), the diagnostics
+# panel read `d.title`/`d.detail`/`d.severity` (the model exposes `category`/
+# `observed_facts`/`confirmed`), and the history table read `r.state` and
+# `r.estimated_cost_eur` (the model exposes `final_status` and
+# `initial_estimated_cost_eur`).
+# ---------------------------------------------------------------------------
+
+import re
+
+_PANEL_START = re.compile(r"\{activeTab === '([a-z]+)' &&")
+
+
+def _panel_blocks(html: str) -> dict[str, str]:
+    """Split the render tree into one source slice per tab panel.
+
+    Scoping matters: the loop variable ``c`` is bound to a ``CandidateAllocation``
+    in the mission tab and to a ``CapacityCandidate`` in the capacity tab. A
+    whole-file scan therefore reports every mission field as missing from
+    ``CapacityCandidate`` and drowns the real defects in noise.
+    """
+    starts = [(m.group(1), m.start()) for m in _PANEL_START.finditer(html)]
+    blocks: dict[str, str] = {}
+    for index, (tab, start) in enumerate(starts):
+        end = starts[index + 1][1] if index + 1 < len(starts) else len(html)
+        blocks[tab] = html[start:end]
+    return blocks
+
+
+def _fields_read_on(html: str, variable: str) -> set[str]:
+    """Property names read from `variable` inside the dashboard source."""
+    return set(re.findall(rf"\b{re.escape(variable)}\.([A-Za-z_][A-Za-z0-9_]*)", html))
+
+
+def _contract_problems(blocks: dict[str, str]) -> list[str]:
+    from agentic_compute.models import (
+        CapacityCandidate,
+        DiagnosticItem,
+        ExecutionHistoryRecord,
+        ExecutionPlan,
+    )
+
+    # (tab, loop variable) -> the model the panel actually iterates over.
+    bindings = {
+        ("plans", "plan"): ExecutionPlan,
+        ("capacity", "c"): CapacityCandidate,
+        ("diagnostics", "d"): DiagnosticItem,
+        ("history", "r"): ExecutionHistoryRecord,
+    }
+    # Names that are JS built-ins or local helpers rather than model fields.
+    js_builtins = {"map", "length", "filter", "toFixed", "join", "slice", "props"}
+
+    problems = []
+    for (tab, variable), model in bindings.items():
+        block = blocks.get(tab)
+        if block is None:
+            problems.append(f"the `{tab}` panel is missing from the render tree")
+            continue
+        allowed = set(model.model_fields) | js_builtins
+        for field in sorted(_fields_read_on(block, variable)):
+            if field not in allowed:
+                problems.append(
+                    f"the `{tab}` panel reads `{variable}.{field}` but "
+                    f"{model.__name__} has no such field"
+                )
+    return problems
+
+
+def test_panels_only_read_fields_the_api_actually_returns():
+    html = DEFAULT_TARGET.read_text(encoding="utf-8")
+    problems = _contract_problems(_panel_blocks(html))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_contract_check_detects_a_field_that_does_not_exist():
+    """Negative control: without this, the test above could pass while blind."""
+    html = DEFAULT_TARGET.read_text(encoding="utf-8")
+    blocks = _panel_blocks(html)
+    blocks["history"] = blocks["history"] + "\n{r.definitely_not_a_field}\n"
+    problems = _contract_problems(blocks)
+    assert any("definitely_not_a_field" in p for p in problems), problems
+
+
+def test_capacity_panel_shows_quota_and_provenance():
+    """Quota state and data provenance must be visible, not implied."""
+    html = DEFAULT_TARGET.read_text(encoding="utf-8")
+    assert "c.quota_status" in html
+    assert "c.data_provenance" in html
+    assert "c.state_stage" in html
+
+
+def test_diagnostics_panel_keeps_the_source_of_each_finding():
+    """A Slurm QoS limit and a GCP quota are different problems."""
+    html = DEFAULT_TARGET.read_text(encoding="utf-8")
+    assert "d.source" in html
+    assert "d.confirmed" in html
+
+
+def test_history_panel_compares_estimated_and_observed_cost():
+    html = DEFAULT_TARGET.read_text(encoding="utf-8")
+    assert "r.initial_estimated_cost_eur" in html
+    assert "r.final_calculated_cost_eur" in html
+    assert "r.cost_comparison_delta_eur" in html
+    assert "r.reconciliation_status" in html
