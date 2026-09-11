@@ -1,0 +1,567 @@
+"""Server-side source of truth for operator control, plan approval and submission identity.
+
+Why this module exists
+----------------------
+Before this module, three security-relevant decisions were taken from values the
+*caller* supplied:
+
+1. The control mode travelled as a function argument, so an agent could send
+   ``control_mode="delegation"`` and escape the operator's chosen mode.
+2. ``evaluate_control_gate`` accepted ``is_operator_approved=True`` -- or an
+   ``approved_plan_id`` equal to the plan being submitted -- as proof of human
+   approval. A model can trivially produce both.
+3. Submission de-duplication lived in a per-instance dict, and the controller was
+   re-created on every HTTP request, so idempotency never survived a request
+   boundary, let alone a restart.
+
+Everything here is persisted in the same SQLite database as the execution
+history, so the answers to "what mode is this workload in", "was this exact plan
+approved by a human", and "did we already submit this" survive process restarts.
+
+Threat model note
+-----------------
+This module defends against a *confused or over-eager agent*, not against a
+malicious operator: application-level authentication is explicitly out of scope
+for this intervention. Anyone who can reach the approval endpoint is treated as
+the operator. What it does guarantee is that the execution path cannot approve
+itself -- approval must be a separate, recorded, prior act.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import time
+import uuid
+from typing import Any, Optional
+
+from .models import DelegationPolicy, ExecutionPlan
+
+# Operator control modes, ordered from most restrictive to least.
+CONTROL_MODES = ("advisory", "validation", "delegation")
+
+#: Fields whose change makes an approved plan materially different, so a prior
+#: approval must no longer apply. Ordered for a stable fingerprint.
+MATERIAL_PLAN_FIELDS = (
+    "cpu",
+    "gpu",
+    "machine_type",
+    "region",
+    "zone",
+    "provisioning_model",
+    "quantity",
+    "estimated_cost_eur",
+)
+
+
+def default_control_mode() -> str:
+    """Server default when a workload has no explicit governance row.
+
+    Defaults to ``validation`` (human approval required) so that the safe
+    behaviour is the one you get by forgetting to configure anything.
+    """
+    mode = (os.getenv("AGENTGRID_DEFAULT_CONTROL_MODE") or "validation").lower().strip()
+    return mode if mode in CONTROL_MODES else "validation"
+
+
+def normalize_control_mode(mode: str | None) -> str:
+    """Map operator-facing synonyms onto the canonical mode names."""
+    if mode is None:
+        return default_control_mode()
+    m = str(mode).lower().strip()
+    if m in ("advisory", "conseil", "read_only", "readonly"):
+        return "advisory"
+    if m in ("validation", "validate", "human_in_the_loop"):
+        return "validation"
+    if m in ("delegation", "delegated", "autonomous"):
+        return "delegation"
+    raise ValueError(
+        f"Unknown control mode '{mode}'. Expected one of: {', '.join(CONTROL_MODES)}."
+    )
+
+
+def plan_fingerprint(
+    plan: ExecutionPlan | dict[str, Any],
+    command: str | None = None,
+) -> str:
+    """Return a stable digest of a plan's materially-executable properties.
+
+    Any change to CPU, GPU, machine type, region, zone, provisioning model,
+    quantity, cost or command yields a different fingerprint, which invalidates
+    a previously recorded approval. Cosmetic fields (title, rationale, narrative
+    text) are deliberately excluded so that re-rendering a plan does not force
+    the operator to approve it again.
+    """
+    data = plan.model_dump() if isinstance(plan, ExecutionPlan) else dict(plan)
+    material = {key: data.get(key) for key in MATERIAL_PLAN_FIELDS}
+    material["command"] = command
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def make_plan_id(workload_id: str, plan_type: str, fingerprint: str) -> str:
+    """Build a plan id that is unique per (workload, plan shape).
+
+    The previous engine emitted bare ids such as ``plan-cost-optimized`` for
+    every workload, so approving a plan for one workload also matched a
+    different workload's plan of the same type.
+    """
+    return f"plan-{workload_id}-{plan_type}-{fingerprint[:12]}"
+
+
+def submission_key(workload_id: str, fingerprint: str) -> str:
+    """Stable submission identity used to recover from an ambiguous timeout.
+
+    This is what gets attached to the job so that, if the network drops after
+    the scheduler accepted the request, we can look for *this specific*
+    submission instead of "any job that happens to exist".
+    """
+    return f"agentgrid-{workload_id}-{fingerprint[:12]}"
+
+
+class GovernanceError(RuntimeError):
+    """Base class for governance failures."""
+
+
+class ControlModeViolation(GovernanceError):
+    """Raised when an action is not permitted by the workload's control mode."""
+
+
+class PolicyViolation(GovernanceError):
+    """Raised when a delegated action exceeds its DelegationPolicy boundaries."""
+
+
+class GovernanceStore:
+    """Persistent store for control modes, plan approvals and submission claims."""
+
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        from .history import get_db_path
+
+        self.db_path = db_path or get_db_path()
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS workload_governance (
+                    workload_id TEXT PRIMARY KEY,
+                    control_mode TEXT NOT NULL,
+                    delegation_policy_json TEXT,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS registered_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    workload_id TEXT NOT NULL,
+                    plan_type TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS plan_approvals (
+                    plan_id TEXT PRIMARY KEY,
+                    workload_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    approved_by TEXT NOT NULL,
+                    approved_at REAL NOT NULL,
+                    revoked_at REAL
+                );
+
+                CREATE TABLE IF NOT EXISTS submission_ledger (
+                    submission_key TEXT PRIMARY KEY,
+                    workload_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    job_id TEXT,
+                    state TEXT NOT NULL,
+                    detail TEXT,
+                    attempt_id TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_submission_workload
+                    ON submission_ledger (workload_id);
+                """
+            )
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Control mode / policy
+    # ------------------------------------------------------------------
+
+    def set_workload_control(
+        self,
+        workload_id: str,
+        control_mode: str,
+        delegation_policy: DelegationPolicy | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record the operator's chosen mode and policy for a workload."""
+        mode = normalize_control_mode(control_mode)
+        policy_json = None
+        if delegation_policy is not None:
+            policy = (
+                delegation_policy
+                if isinstance(delegation_policy, DelegationPolicy)
+                else DelegationPolicy(**delegation_policy)
+            )
+            policy_json = policy.model_dump_json()
+
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO workload_governance
+                    (workload_id, control_mode, delegation_policy_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(workload_id) DO UPDATE SET
+                    control_mode=excluded.control_mode,
+                    delegation_policy_json=COALESCE(
+                        excluded.delegation_policy_json,
+                        workload_governance.delegation_policy_json
+                    ),
+                    updated_at=excluded.updated_at
+                """,
+                (workload_id, mode, policy_json, now),
+            )
+            conn.commit()
+        return self.get_workload_control(workload_id)
+
+    def get_workload_control(self, workload_id: str) -> dict[str, Any]:
+        """Return the effective mode/policy, falling back to the server default."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT control_mode, delegation_policy_json FROM workload_governance WHERE workload_id = ?",
+                (workload_id,),
+            ).fetchone()
+
+        if row is None:
+            return {
+                "workload_id": workload_id,
+                "control_mode": default_control_mode(),
+                "delegation_policy": DelegationPolicy(),
+                "source": "server_default",
+            }
+
+        policy = DelegationPolicy()
+        if row["delegation_policy_json"]:
+            try:
+                policy = DelegationPolicy(**json.loads(row["delegation_policy_json"]))
+            except Exception:
+                policy = DelegationPolicy()
+
+        return {
+            "workload_id": workload_id,
+            "control_mode": row["control_mode"],
+            "delegation_policy": policy,
+            "source": "operator_configured",
+        }
+
+    # ------------------------------------------------------------------
+    # Plan registration and approval
+    # ------------------------------------------------------------------
+
+    def register_plan(
+        self,
+        workload_id: str,
+        plan: ExecutionPlan | dict[str, Any],
+        command: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a plan so it can later be approved and executed.
+
+        Registration is what makes a plan *referenceable*. Execution refuses
+        plans it has never seen, which stops an agent from inventing a plan id.
+        """
+        p = plan if isinstance(plan, ExecutionPlan) else ExecutionPlan(**plan)
+        fingerprint = plan_fingerprint(p, command=command)
+        now = time.time()
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO registered_plans
+                    (plan_id, workload_id, plan_type, fingerprint, plan_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    workload_id=excluded.workload_id,
+                    plan_type=excluded.plan_type,
+                    fingerprint=excluded.fingerprint,
+                    plan_json=excluded.plan_json
+                """,
+                (
+                    p.plan_id,
+                    workload_id,
+                    p.plan_type,
+                    fingerprint,
+                    p.model_dump_json(),
+                    now,
+                ),
+            )
+            # A materially changed plan can no longer rely on an old approval.
+            conn.execute(
+                """
+                UPDATE plan_approvals SET revoked_at = ?
+                WHERE plan_id = ? AND fingerprint != ? AND revoked_at IS NULL
+                """,
+                (now, p.plan_id, fingerprint),
+            )
+            conn.commit()
+
+        return {"plan_id": p.plan_id, "workload_id": workload_id, "fingerprint": fingerprint}
+
+    def get_registered_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM registered_plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "plan_id": row["plan_id"],
+            "workload_id": row["workload_id"],
+            "plan_type": row["plan_type"],
+            "fingerprint": row["fingerprint"],
+            "plan": json.loads(row["plan_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def list_registered_plans(self, workload_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT plan_id FROM registered_plans WHERE workload_id = ? ORDER BY created_at",
+                (workload_id,),
+            ).fetchall()
+        return [self.get_registered_plan(r["plan_id"]) for r in rows]
+
+    def approve_plan(
+        self,
+        plan_id: str,
+        workload_id: str | None = None,
+        approved_by: str = "operator",
+    ) -> dict[str, Any]:
+        """Record a human approval for a previously registered plan.
+
+        This is the *only* way to authorise execution in validation mode.
+        """
+        registered = self.get_registered_plan(plan_id)
+        if registered is None:
+            return {
+                "status": "not_found",
+                "plan_id": plan_id,
+                "reason": (
+                    f"Plan '{plan_id}' is not registered. Compare plans first so the "
+                    f"server records the exact plan being approved."
+                ),
+            }
+
+        if workload_id is not None and registered["workload_id"] != workload_id:
+            return {
+                "status": "workload_mismatch",
+                "plan_id": plan_id,
+                "reason": (
+                    f"Plan '{plan_id}' belongs to workload '{registered['workload_id']}', "
+                    f"not '{workload_id}'."
+                ),
+            }
+
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO plan_approvals
+                    (plan_id, workload_id, fingerprint, approved_by, approved_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    workload_id=excluded.workload_id,
+                    fingerprint=excluded.fingerprint,
+                    approved_by=excluded.approved_by,
+                    approved_at=excluded.approved_at,
+                    revoked_at=NULL
+                """,
+                (plan_id, registered["workload_id"], registered["fingerprint"], approved_by, now),
+            )
+            conn.commit()
+
+        return {
+            "status": "approved",
+            "plan_id": plan_id,
+            "workload_id": registered["workload_id"],
+            "fingerprint": registered["fingerprint"],
+            "approved_by": approved_by,
+            "approved_at": now,
+        }
+
+    def revoke_approval(self, plan_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE plan_approvals SET revoked_at = ? WHERE plan_id = ? AND revoked_at IS NULL",
+                (time.time(), plan_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def check_approval(
+        self,
+        plan_id: str,
+        workload_id: str,
+        fingerprint: str,
+    ) -> tuple[bool, str]:
+        """Return (approved, reason) for the exact plan the caller wants to run."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_approvals WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+
+        if row is None:
+            return (
+                False,
+                f"No recorded operator approval for plan '{plan_id}'. "
+                f"Validation mode requires an approval registered on the server before execution.",
+            )
+        if row["revoked_at"] is not None:
+            return (False, f"Approval for plan '{plan_id}' was revoked.")
+        if row["workload_id"] != workload_id:
+            return (
+                False,
+                f"Approval for plan '{plan_id}' is bound to workload "
+                f"'{row['workload_id']}', not '{workload_id}'.",
+            )
+        if row["fingerprint"] != fingerprint:
+            return (
+                False,
+                f"Plan '{plan_id}' changed materially since it was approved "
+                f"(approved fingerprint {row['fingerprint'][:12]}, "
+                f"submitted {fingerprint[:12]}). Re-approval is required.",
+            )
+        return (True, f"Plan '{plan_id}' has a recorded operator approval.")
+
+    # ------------------------------------------------------------------
+    # Submission ledger (persistent idempotency)
+    # ------------------------------------------------------------------
+
+    def claim_submission(
+        self,
+        key: str,
+        workload_id: str,
+        plan_id: str,
+        fingerprint: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Atomically claim the right to submit.
+
+        Returns ``(True, row)`` when this caller won the claim and must perform
+        the submission, or ``(False, row)`` when a claim already exists -- in
+        which case the existing row describes what happened previously.
+
+        The INSERT is the lock: SQLite's primary key constraint makes concurrent
+        double-clicks resolve to exactly one winner.
+        """
+        now = time.time()
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO submission_ledger
+                        (submission_key, workload_id, plan_id, fingerprint,
+                         job_id, state, detail, attempt_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, NULL, 'claimed', NULL, NULL, ?, ?)
+                    """,
+                    (key, workload_id, plan_id, fingerprint, now, now),
+                )
+                conn.commit()
+                won = True
+            except sqlite3.IntegrityError:
+                won = False
+
+            row = conn.execute(
+                "SELECT * FROM submission_ledger WHERE submission_key = ?", (key,)
+            ).fetchone()
+
+        return won, dict(row) if row else {}
+
+    def record_submission(
+        self,
+        key: str,
+        state: str,
+        job_id: str | None = None,
+        detail: str | None = None,
+        attempt_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a submission claim with its outcome.
+
+        States: ``claimed`` (in flight), ``submitted`` (accepted, job known),
+        ``uncertain`` (ambiguous timeout, outcome genuinely unknown),
+        ``failed`` (rejected before any job existed).
+        """
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE submission_ledger
+                SET state = ?,
+                    job_id = COALESCE(?, job_id),
+                    detail = ?,
+                    attempt_id = COALESCE(?, attempt_id),
+                    updated_at = ?
+                WHERE submission_key = ?
+                """,
+                (state, job_id, detail, attempt_id, now, key),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM submission_ledger WHERE submission_key = ?", (key,)
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def get_submission(self, key: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM submission_ledger WHERE submission_key = ?", (key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def release_submission(self, key: str) -> bool:
+        """Drop a claim so an explicitly authorised retry may submit again.
+
+        Used when an operator (or a bounded retry policy) decides a failed or
+        uncertain submission should be attempted afresh. This is deliberately
+        distinct from a replay: a replay must never delete the claim.
+        """
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM submission_ledger WHERE submission_key = ?", (key,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def list_submissions(self, workload_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM submission_ledger WHERE workload_id = ? ORDER BY created_at",
+                (workload_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+_governance_store: Optional[GovernanceStore] = None
+
+
+def get_governance_store() -> GovernanceStore:
+    """Return the process-wide governance store (created lazily)."""
+    global _governance_store
+    if _governance_store is None:
+        _governance_store = GovernanceStore()
+    return _governance_store
+
+
+def reset_governance_store() -> None:
+    """Drop the cached store so a new AGENTGRID_DB_PATH takes effect (tests)."""
+    global _governance_store
+    _governance_store = None

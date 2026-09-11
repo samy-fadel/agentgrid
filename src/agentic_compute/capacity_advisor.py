@@ -374,49 +374,274 @@ GCP_MACHINE_CATALOG = {
 }
 
 
+#: Compute Engine regional quota metric names, per
+#: https://cloud.google.com/compute/docs/reference/rest/v1/regions/get
+#: The response carries ``quotas[]`` entries shaped ``{metric, limit, usage}``.
+_CPU_QUOTA_METRIC = "CPUS"
+_PREEMPTIBLE_CPU_QUOTA_METRIC = "PREEMPTIBLE_CPUS"
+_GPU_QUOTA_METRICS = (
+    "NVIDIA_A100_GPUS",
+    "NVIDIA_L4_GPUS",
+    "NVIDIA_T4_GPUS",
+    "GPUS_ALL_REGIONS",
+)
+
+
+def _fetch_regional_quotas(project_id: str, region: str) -> dict[str, Any]:
+    """Read live regional quotas from the Compute Engine API.
+
+    Returns ``{"status": "ok", "quotas": {METRIC: {"limit": x, "usage": y}}}``
+    or ``{"status": "unavailable", "reason": ...}``. Never invents numbers:
+    when the call cannot be made or the region reports no quota data, the
+    caller must surface uncertainty instead of a default.
+    """
+    if not HAVE_GOOGLE_AUTH:
+        return {
+            "status": "unavailable",
+            "reason": "google-auth is not installed; no credentials path available.",
+        }
+    if not project_id:
+        return {"status": "unavailable", "reason": "No GCP project id configured."}
+
+    try:
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        if not credentials.valid:
+            credentials.refresh(Request())
+        token = credentials.token
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"Could not obtain GCP credentials: {type(exc).__name__}: {exc}",
+        }
+
+    url = (
+        f"https://compute.googleapis.com/compute/v1/projects/{project_id}"
+        f"/regions/{region}?fields=quotas,quotaStatusWarning"
+    )
+    try:
+        resp = requests.get(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=10.0
+        )
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"Compute Engine regions.get call failed: {type(exc).__name__}: {exc}",
+        }
+
+    if resp.status_code != 200:
+        return {
+            "status": "unavailable",
+            "reason": (
+                f"Compute Engine regions.get returned HTTP {resp.status_code} "
+                f"for project '{project_id}' region '{region}'."
+            ),
+        }
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        return {"status": "unavailable", "reason": f"Malformed quota response: {exc}"}
+
+    entries = payload.get("quotas") or []
+    if not entries:
+        # The API documents a fail-open behaviour where quota data may simply be
+        # missing for a region. That is not the same as "quota is fine".
+        warning = payload.get("quotaStatusWarning")
+        return {
+            "status": "unavailable",
+            "reason": (
+                f"Region '{region}' returned no quota data"
+                + (f" ({warning})" if warning else "")
+                + "."
+            ),
+        }
+
+    quotas = {
+        str(e.get("metric")): {
+            "limit": float(e.get("limit", 0.0)),
+            "usage": float(e.get("usage", 0.0)),
+        }
+        for e in entries
+        if e.get("metric")
+    }
+    return {"status": "ok", "quotas": quotas}
+
+
 def check_quota_availability(
     project_id: str,
     region: str,
     cpu_needed: int,
     gpu_needed: int = 0,
     provisioning_model: str = "STANDARD",
+    demo_mode: bool | None = None,
 ) -> dict[str, Any]:
-    """Check if requested vCPUs and GPUs are within project quota limits.
+    """Report whether project quota authorises this request, honestly.
 
-    Distinguishes authorized quota from capacity availability.
+    Three distinct outcomes, never conflated:
+
+    * ``QUOTA_AVAILABLE`` / ``QUOTA_EXCEEDED`` -- derived from real numbers,
+      either read from the Compute Engine API or supplied explicitly by the
+      operator through ``GCP_QUOTA_*`` environment overrides.
+    * ``QUOTA_UNKNOWN`` -- no credentials, no API access, or the region reported
+      no quota data. Previously this path returned "Quota verified" based on
+      hardcoded 256 vCPU / 8 GPU defaults, which made a fictional project in a
+      fictional region look authorised.
+
+    Synthetic figures are produced only under an explicit demo mode and are
+    always labelled as such in ``data_provenance``.
     """
-    # Check for test/env quota overrides
-    limit_cpu = int(os.getenv("GCP_QUOTA_CPU_LIMIT") or os.getenv("GCP_PROJECT_QUOTA_CPUS") or "256")
-    used_cpu = int(os.getenv("GCP_QUOTA_CPU_USED") or os.getenv("GCP_PROJECT_QUOTA_USED") or "0")
-    limit_gpu = int(os.getenv("GCP_QUOTA_GPU_LIMIT", "8"))
-    used_gpu = int(os.getenv("GCP_QUOTA_GPU_USED", "0"))
+    is_demo = bool(demo_mode) if demo_mode is not None else (
+        os.getenv("DEMO_MODE", "").lower() in ("true", "1", "yes")
+    )
 
+    # 1. Explicit operator-supplied overrides always win: these are real numbers
+    #    the operator asserted, not defaults we invented.
+    env_cpu_limit = os.getenv("GCP_QUOTA_CPU_LIMIT") or os.getenv("GCP_PROJECT_QUOTA_CPUS")
+    env_cpu_used = os.getenv("GCP_QUOTA_CPU_USED") or os.getenv("GCP_PROJECT_QUOTA_USED")
+
+    if env_cpu_limit is not None:
+        try:
+            limit_cpu = int(env_cpu_limit)
+            used_cpu = int(env_cpu_used or "0")
+            limit_gpu = int(os.getenv("GCP_QUOTA_GPU_LIMIT", "0"))
+            used_gpu = int(os.getenv("GCP_QUOTA_GPU_USED", "0"))
+        except ValueError as exc:
+            return {
+                "status": "QUOTA_UNKNOWN",
+                "is_exceeded": False,
+                "is_known": False,
+                "quota_limit": None,
+                "quota_usage": None,
+                "data_provenance": "invalid_override",
+                "reason": f"Quota override environment variables are not numeric: {exc}",
+            }
+        return _evaluate_quota_numbers(
+            limit_cpu, used_cpu, limit_gpu, used_gpu,
+            cpu_needed, gpu_needed, provenance="operator_override",
+        )
+
+    # 2. Live API when credentials are available.
+    if not is_demo:
+        live = _fetch_regional_quotas(project_id, region)
+        if live["status"] == "ok":
+            quotas = live["quotas"]
+            metric = (
+                _PREEMPTIBLE_CPU_QUOTA_METRIC
+                if str(provisioning_model).upper().startswith("SPOT")
+                and _PREEMPTIBLE_CPU_QUOTA_METRIC in quotas
+                else _CPU_QUOTA_METRIC
+            )
+            cpu_q = quotas.get(metric)
+            if cpu_q is None:
+                return {
+                    "status": "QUOTA_UNKNOWN",
+                    "is_exceeded": False,
+                    "is_known": False,
+                    "quota_limit": None,
+                    "quota_usage": None,
+                    "data_provenance": "gcp_live_api",
+                    "reason": (
+                        f"Region '{region}' reported no '{metric}' quota metric; "
+                        f"authorisation cannot be confirmed."
+                    ),
+                }
+
+            gpu_limit = 0.0
+            gpu_usage = 0.0
+            if gpu_needed:
+                gpu_entries = [quotas[m] for m in _GPU_QUOTA_METRICS if m in quotas]
+                if not gpu_entries:
+                    return {
+                        "status": "QUOTA_UNKNOWN",
+                        "is_exceeded": False,
+                        "is_known": False,
+                        "quota_limit": cpu_q["limit"],
+                        "quota_usage": cpu_q["usage"],
+                        "data_provenance": "gcp_live_api",
+                        "reason": (
+                            f"Region '{region}' reported no GPU quota metric, but "
+                            f"{gpu_needed} GPU(s) were requested."
+                        ),
+                    }
+                best = max(gpu_entries, key=lambda q: q["limit"] - q["usage"])
+                gpu_limit, gpu_usage = best["limit"], best["usage"]
+
+            return _evaluate_quota_numbers(
+                int(cpu_q["limit"]), int(cpu_q["usage"]),
+                int(gpu_limit), int(gpu_usage),
+                cpu_needed, gpu_needed, provenance="gcp_live_api",
+            )
+
+        # 3. No access and not a demo: say so.
+        return {
+            "status": "QUOTA_UNKNOWN",
+            "is_exceeded": False,
+            "is_known": False,
+            "quota_limit": None,
+            "quota_usage": None,
+            "data_provenance": "unavailable",
+            "reason": (
+                f"Project quota for '{project_id}' in '{region}' could not be verified: "
+                f"{live['reason']} Treated as unknown, not as authorised."
+            ),
+        }
+
+    # 4. Explicit demo mode: synthetic figures, clearly labelled.
+    return _evaluate_quota_numbers(
+        256, 0, 8, 0, cpu_needed, gpu_needed, provenance="simulated_demo",
+    )
+
+
+def _evaluate_quota_numbers(
+    limit_cpu: int,
+    used_cpu: int,
+    limit_gpu: int,
+    used_gpu: int,
+    cpu_needed: int,
+    gpu_needed: int,
+    provenance: str,
+) -> dict[str, Any]:
+    """Compare a request against known quota figures."""
     avail_cpu = max(0, limit_cpu - used_cpu)
     avail_gpu = max(0, limit_gpu - used_gpu)
 
-    cpu_ok = cpu_needed <= avail_cpu
-    gpu_ok = gpu_needed <= avail_gpu
+    problems: list[str] = []
+    if cpu_needed > avail_cpu:
+        problems.append(
+            f"CPU quota exceeded: requested {cpu_needed} vCPUs, available {avail_cpu}/{limit_cpu}"
+        )
+    if gpu_needed > avail_gpu:
+        problems.append(
+            f"GPU quota exceeded: requested {gpu_needed} GPUs, available {avail_gpu}/{limit_gpu}"
+        )
 
-    if not cpu_ok or not gpu_ok:
-        reason = []
-        if not cpu_ok:
-            reason.append(f"CPU quota exceeded: requested {cpu_needed} vCPUs, available {avail_cpu}/{limit_cpu}")
-        if not gpu_ok:
-            reason.append(f"GPU quota exceeded: requested {gpu_needed} GPUs, available {avail_gpu}/{limit_gpu}")
+    suffix = {
+        "gcp_live_api": "verified against live Compute Engine regional quota",
+        "operator_override": "evaluated against operator-supplied quota figures",
+        "simulated_demo": "SIMULATED demo figures, not a real project quota",
+    }.get(provenance, provenance)
+
+    if problems:
         return {
             "status": "QUOTA_EXCEEDED",
             "is_exceeded": True,
+            "is_known": True,
             "quota_limit": limit_cpu,
             "quota_usage": used_cpu,
-            "reason": "; ".join(reason),
+            "data_provenance": provenance,
+            "reason": "; ".join(problems) + f" ({suffix})",
         }
 
     return {
         "status": "QUOTA_AVAILABLE",
         "is_exceeded": False,
+        "is_known": True,
         "quota_limit": limit_cpu,
         "quota_usage": used_cpu,
-        "reason": "Quota verified",
+        "data_provenance": provenance,
+        "reason": f"Request fits within quota ({suffix})",
     }
 
 
@@ -514,7 +739,11 @@ def search_compatible_capacity(
             )
 
             quota_status = quota_res["status"]
-            if not quota_res["is_exceeded"]:
+            # Only a *known* and sufficient quota authorises the next stage.
+            # QUOTA_UNKNOWN has is_exceeded=False but proves nothing, so it must
+            # leave the candidate at catalog_proposed.
+            quota_authorized = quota_res.get("is_known", True) and not quota_res["is_exceeded"]
+            if quota_authorized:
                 stage = "quota_authorized"
 
             rec_data = advice_map.get(mtype, {})
@@ -528,13 +757,13 @@ def search_compatible_capacity(
             elif is_sim:
                 provenance = "simulated_demo"
                 capacity_signal = "SIMULATED"
-                if not quota_res["is_exceeded"]:
+                if quota_authorized:
                     stage = "capacity_estimated"
             else:
                 provenance = "gcp_live_api"
                 if obtainability is not None:
                     capacity_signal = "HIGH" if obtainability >= 0.85 else ("MEDIUM" if obtainability >= 0.65 else "LOW")
-                    if not quota_res["is_exceeded"]:
+                    if quota_authorized:
                         stage = "capacity_estimated"
                 else:
                     capacity_signal = "UNKNOWN"

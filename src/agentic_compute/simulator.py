@@ -12,8 +12,97 @@ from .models import (
     RuntimeSnapshot,
     WorkloadState,
 )
+from .errors import ConfigurationRejected
 from .runtime import RuntimeAdapter
 from .slurm_adapter import generate_candidate_cpus
+
+
+#: Machine shapes the simulated cluster is willing to model, with their vCPU
+#: count. Requests for anything outside this catalogue are rejected rather than
+#: silently accepted, so a plan that names an impossible machine cannot report
+#: success.
+SIMULATED_MACHINE_CATALOG: dict[str, int] = {
+    "n2-standard-2": 2,
+    "n2-standard-4": 4,
+    "n2-standard-8": 8,
+    "n2-standard-16": 16,
+    "n2-standard-32": 32,
+    "n2-standard-64": 64,
+    "n4-standard-32": 32,
+    "n4-standard-64": 64,
+    "c2-standard-60": 60,
+    "h3-standard-88": 88,
+}
+
+#: Canonical provisioning model names. Operators and adapters spell these in
+#: several ways ("STANDARD", "100% Standard", "standard"); they all describe the
+#: same thing and must not produce a spurious mismatch. Anything genuinely
+#: unrecognised is rejected instead of being passed through.
+_PROVISIONING_ALIASES: dict[str, str] = {
+    "standard": "100% Standard",
+    "100% standard": "100% Standard",
+    "100%standard": "100% Standard",
+    "on-demand": "100% Standard",
+    "ondemand": "100% Standard",
+    "spot": "100% Spot",
+    "100% spot": "100% Spot",
+    "100%spot": "100% Spot",
+    "preemptible": "100% Spot",
+    "80% spot / 20% standard": "80% Spot / 20% Standard",
+    "80% spot/20% standard": "80% Spot / 20% Standard",
+    "hedged": "80% Spot / 20% Standard",
+}
+
+
+def normalize_provisioning_model(value: str | None) -> str:
+    """Map a provisioning-model spelling onto its canonical form.
+
+    Returns ``100% Standard`` when nothing is specified. Raises
+    :class:`ConfigurationRejected` for a genuinely unknown value so that a typo
+    such as ``BANANA`` is refused instead of being stored and later compared
+    against real telemetry.
+    """
+    if value is None or str(value).strip() == "":
+        return "100% Standard"
+    key = str(value).strip().lower()
+    if key in _PROVISIONING_ALIASES:
+        return _PROVISIONING_ALIASES[key]
+    raise ConfigurationRejected(
+        f"Unsupported provisioning model '{value}'. Supported values: "
+        f"{', '.join(sorted({v for v in _PROVISIONING_ALIASES.values()}))}.",
+        parameter="provisioning_model",
+    )
+
+
+def validate_machine_type(machine_type: str | None, cpu: int) -> str:
+    """Validate a machine type against the simulated catalogue.
+
+    When no machine type is supplied, the smallest shape that fits ``cpu`` is
+    chosen so callers that do not care still get a coherent answer.
+    """
+    if machine_type is None or str(machine_type).strip() == "":
+        for name, size in sorted(SIMULATED_MACHINE_CATALOG.items(), key=lambda kv: kv[1]):
+            if size >= cpu:
+                return name
+        raise ConfigurationRejected(
+            f"No catalogued machine type can provide {cpu} vCPUs.",
+            parameter="machine_type",
+        )
+
+    mtype = str(machine_type).strip()
+    if mtype not in SIMULATED_MACHINE_CATALOG:
+        raise ConfigurationRejected(
+            f"Unsupported machine type '{mtype}'. Supported types: "
+            f"{', '.join(sorted(SIMULATED_MACHINE_CATALOG))}.",
+            parameter="machine_type",
+        )
+    if SIMULATED_MACHINE_CATALOG[mtype] < cpu:
+        raise ConfigurationRejected(
+            f"Machine type '{mtype}' provides {SIMULATED_MACHINE_CATALOG[mtype]} vCPUs, "
+            f"which cannot satisfy the requested {cpu} vCPUs.",
+            parameter="machine_type",
+        )
+    return mtype
 
 
 def compute_hedged_cost_factor(cpu: int, mix: str) -> float:
@@ -78,6 +167,10 @@ class SimulatedRuntime(RuntimeAdapter):
             max_cost_eur=self.max_cost_eur,
         )
         self.last_slurm_action = None
+        # Names this runtime genuinely accepted via submit_job. The seeded demo
+        # workload is deliberately absent: it was never submitted, so an
+        # ambiguous-timeout recovery must not be able to "find" it.
+        self._accepted_submissions: set[str] = set()
 
     def configure_objective(
         self,
@@ -96,11 +189,23 @@ class SimulatedRuntime(RuntimeAdapter):
         )
 
     def _discover_active_job(self, name: str | None = None) -> str | None:
-        """Query simulated cluster state to recover active job without duplicate submission."""
-        if hasattr(self, "workload") and self.workload:
-            if name is None or self.workload.id == name:
-                return self.workload.id
-        return None
+        """Recover a job created under a *specific* submission identity.
+
+        Only a job that was actually submitted under ``name`` counts. The
+        previous version returned the current workload whenever ``name`` was
+        None, which let an ambiguous-timeout recovery latch onto the unrelated
+        demo workload ``mc-001`` and report it as a fresh successful submission.
+        """
+        if not name:
+            return None
+        if getattr(self, "workload", None) is None:
+            return None
+        if self.workload.id != name:
+            return None
+        # Only jobs this runtime actually accepted may be rediscovered.
+        if name not in self._accepted_submissions:
+            return None
+        return self.workload.id
 
     def submit_job(
         self,
@@ -110,17 +215,68 @@ class SimulatedRuntime(RuntimeAdapter):
         partition: str | None = None,
         memory_mb: int | None = None,
         script: str | None = None,
+        machine_type: str | None = None,
+        provisioning_model: str | None = None,
         approved_by_operator: bool = False,
     ) -> dict[str, Any]:
-        """Initialize or reset workload with custom parameters."""
+        """Create a simulated workload under the canonical runtime contract.
+
+        ``machine_type`` and ``provisioning_model`` are part of the contract
+        because MCP and the execution controller always send them. Previously
+        this signature omitted them, so every controller-driven submission
+        raised ``TypeError`` -- which the controller then misread as a network
+        timeout and reported as a verified success.
+        """
         allocated_cpu = cpu if cpu is not None else 4
+
+        if allocated_cpu <= 0:
+            raise ConfigurationRejected(
+                f"Requested cpu={allocated_cpu} is invalid; must be a positive integer.",
+                parameter="cpu",
+            )
+        if allocated_cpu > self.total_cpu:
+            raise ConfigurationRejected(
+                f"Requested {allocated_cpu} vCPUs exceeds simulated cluster capacity "
+                f"of {self.total_cpu} vCPUs.",
+                parameter="cpu",
+            )
+        if gpu and gpu > self.total_gpu:
+            raise ConfigurationRejected(
+                f"Requested {gpu} GPUs but the simulated cluster exposes {self.total_gpu}.",
+                parameter="gpu",
+            )
+
+        resolved_machine_type = validate_machine_type(machine_type, allocated_cpu)
+        resolved_provisioning = normalize_provisioning_model(provisioning_model)
+
         self.check_execution_permission(
-            {"action": "submit_job", "workload_id": name, "cpu": allocated_cpu},
+            {
+                "action": "submit_job",
+                "workload_id": name,
+                "cpu": allocated_cpu,
+                "machine_type": resolved_machine_type,
+                "provisioning_model": resolved_provisioning,
+            },
             approved_by_operator=approved_by_operator,
         )
+
         self.workload = _SimWorkload(id=name, allocated_cpu=allocated_cpu, allocated_gpu=gpu)
         self.current_time_minutes = 0.0
-        return {"id": name, "cpu": allocated_cpu, "gpu": gpu, "partition": partition}
+        self.machine_type = resolved_machine_type
+        self.provisioning_model = resolved_provisioning
+        self._accepted_submissions.add(name)
+
+        return {
+            # `job_id` is the canonical key across adapters; `id` is retained
+            # for backwards compatibility with existing callers.
+            "job_id": name,
+            "id": name,
+            "cpu": allocated_cpu,
+            "gpu": gpu,
+            "partition": partition,
+            "machine_type": resolved_machine_type,
+            "provisioning_model": resolved_provisioning,
+        }
 
     def _speedup(self, cpu: int) -> float:
         p = self.parallel_fraction
