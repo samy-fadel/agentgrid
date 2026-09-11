@@ -211,6 +211,13 @@ Structured taxonomy classifying execution impediments into:
   nothing and is not charged; an `uncertain` one may have, so it is. Ledger rows written before
   submissions were priced are surfaced as `unpriced_prior_submissions` rather than counted as
   free. The same rule applies to every rung of the fallback ladder.
+* **The retry ceiling is enforced the same way.** `max_retries` was checked but never fed an
+  attempt count, so it never fired: with `max_retries: 1`, four distinct plans produced four
+  jobs. Every claim ever won for a workload is now counted as a launch, and releasing a claim
+  archives it instead of deleting it — otherwise a release-and-retry loop erases its own history
+  and runs forever. A released `submitted` or `uncertain` claim also keeps its cost charged: a
+  job existed, or may have, and authorising another try is not a refund. A released `failed`
+  claim created nothing and is refunded.
 * **Execution Safety**:
   * **Ordered Fallback Ladder**: Automatic failover (e.g., Spot → Standard On-Demand) when stockouts occur, staying within remaining budget.
   * **Idempotent Anti-Duplicate Submission**: A submission is claimed in a persistent SQLite

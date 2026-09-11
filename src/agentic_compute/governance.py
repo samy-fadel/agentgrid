@@ -193,6 +193,30 @@ class GovernanceStore:
 
                 CREATE INDEX IF NOT EXISTS idx_submission_workload
                     ON submission_ledger (workload_id);
+
+                -- Releasing a claim used to delete the row outright, which
+                -- erased the fact that a launch had happened at all. A retry
+                -- ceiling cannot be enforced against a history that deletes
+                -- itself, and an `uncertain` outcome that may have created a
+                -- job must not stop being charged just because the operator
+                -- authorised another try.
+                CREATE TABLE IF NOT EXISTS submission_archive (
+                    archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_key TEXT NOT NULL,
+                    workload_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    job_id TEXT,
+                    state TEXT NOT NULL,
+                    detail TEXT,
+                    attempt_id TEXT,
+                    estimated_cost_eur REAL,
+                    created_at REAL NOT NULL,
+                    archived_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_archive_workload
+                    ON submission_archive (workload_id);
                 """
             )
 
@@ -529,6 +553,11 @@ class GovernanceStore:
     #: included precisely because it may have created something.
     COMMITTING_STATES = ("claimed", "submitted", "uncertain")
 
+    #: Archived (released) states that still represent money. A `failed` claim
+    #: created nothing and is refunded; a released `submitted` or `uncertain`
+    #: one is not.
+    RETAINED_ARCHIVE_STATES = ("submitted", "uncertain")
+
     def get_commitments(
         self, workload_id: str, exclude_key: str | None = None
     ) -> dict[str, Any]:
@@ -554,29 +583,65 @@ class GovernanceStore:
             sql += " AND submission_key != ?"
             params.append(exclude_key)
 
+        launched_sql = "SELECT COUNT(*) AS n FROM submission_ledger WHERE workload_id = ?"
+        launched_params: list[Any] = [workload_id]
+        if exclude_key:
+            launched_sql += " AND submission_key != ?"
+            launched_params.append(exclude_key)
+
         with self._connect() as conn:
             rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            live_launches = conn.execute(launched_sql, launched_params).fetchone()["n"]
+            archived = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT submission_key, plan_id, state, estimated_cost_eur "
+                    "FROM submission_archive WHERE workload_id = ?",
+                    (workload_id,),
+                ).fetchall()
+            ]
 
         committed = 0.0
         unpriced = 0
-        for row in rows:
+
+        def _price(row: dict[str, Any]) -> float | None:
             cost = row.get("estimated_cost_eur")
             if cost is None:
                 # Row written before the ledger priced submissions, or a plan
                 # whose price was never known. Try the registered plan, then
                 # admit ignorance rather than silently treating it as free.
                 cost = self._registered_plan_cost(row["plan_id"])
+            return None if cost is None else float(cost)
+
+        for row in rows:
+            cost = _price(row)
             if cost is None:
                 unpriced += 1
                 continue
-            committed += float(cost)
+            committed += cost
+
+        # A released claim still counts if something may have been created by
+        # it. `failed` and `claimed` created nothing; `submitted` created a job
+        # and `uncertain` may have, so authorising a retry does not refund them.
+        retained = [r for r in archived if r["state"] in self.RETAINED_ARCHIVE_STATES]
+        for row in retained:
+            cost = _price(row)
+            if cost is None:
+                unpriced += 1
+                continue
+            committed += cost
 
         return {
             "workload_id": workload_id,
             "committed_cost_eur": round(committed, 4),
-            "submission_count": len(rows),
+            "submission_count": len(rows) + len(retained),
             "unpriced_submissions": unpriced,
             "counted_states": list(self.COMMITTING_STATES),
+            # Every claim that was ever won is a launch, including the ones
+            # since released. This is what bounds a retry loop.
+            "launched_attempts": live_launches + len(archived),
+            "released_launches": len(archived),
+            "retained_released_commitments": len(retained),
         }
 
     def record_submission(
@@ -621,16 +686,60 @@ class GovernanceStore:
         return dict(row) if row else None
 
     def release_submission(self, key: str) -> bool:
-        """Drop a claim so an explicitly authorised retry may submit again.
+        """Archive a claim so an explicitly authorised retry may submit again.
 
         Used when an operator (or a bounded retry policy) decides a failed or
         uncertain submission should be attempted afresh. This is deliberately
-        distinct from a replay: a replay must never delete the claim.
+        distinct from a replay: a replay must never release the claim.
+
+        The row is copied to ``submission_archive`` before being removed. A
+        straight delete erased the evidence that a launch had happened, so a
+        retry ceiling could be walked past indefinitely and an `uncertain`
+        submission -- which may well have created a job -- stopped being
+        charged against the delegated budget.
         """
+        now = time.time()
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM submission_ledger WHERE submission_key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO submission_archive
+                    (submission_key, workload_id, plan_id, fingerprint, job_id,
+                     state, detail, attempt_id, estimated_cost_eur,
+                     created_at, archived_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["submission_key"],
+                    row["workload_id"],
+                    row["plan_id"],
+                    row["fingerprint"],
+                    row["job_id"],
+                    row["state"],
+                    row["detail"],
+                    row["attempt_id"],
+                    row["estimated_cost_eur"],
+                    row["created_at"],
+                    now,
+                ),
+            )
             cur = conn.execute("DELETE FROM submission_ledger WHERE submission_key = ?", (key,))
             conn.commit()
             return cur.rowcount > 0
+
+    def list_archived_submissions(self, workload_id: str) -> list[dict[str, Any]]:
+        """Released claims, kept so a retry history cannot delete itself."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM submission_archive WHERE workload_id = ? ORDER BY archived_at",
+                (workload_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_submissions(self, workload_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:

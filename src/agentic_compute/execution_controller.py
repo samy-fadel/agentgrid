@@ -258,6 +258,7 @@ class ExecutionController:
         runtime: Any = None,
         allow_resubmit: bool = False,
         accumulated_cost_eur: float = 0.0,
+        attempts_used: int = 0,
     ) -> dict[str, Any]:
         """Submit a workload once, under the governing control mode.
 
@@ -317,9 +318,16 @@ class ExecutionController:
             commitments = self.governance.get_commitments(workload_id, exclude_key=key)
             server_committed = commitments["committed_cost_eur"]
             effective_accumulated = max(accumulated_cost_eur, server_committed)
+            # The retry ceiling was equally toothless: nothing ever passed an
+            # attempt count, so `max_retries` never fired. Every claim ever won
+            # for this workload is a launch, including released ones.
+            effective_attempts = max(attempts_used, commitments["launched_attempts"])
 
             within, policy_reason = self.check_policy_bounds(
-                p_plan, policy, accumulated_cost_eur=effective_accumulated
+                p_plan,
+                policy,
+                accumulated_cost_eur=effective_accumulated,
+                attempts_used=effective_attempts,
             )
             if not within:
                 return {
@@ -339,6 +347,12 @@ class ExecutionController:
                     ),
                     "prior_submissions_counted": commitments["submission_count"],
                     "unpriced_prior_submissions": commitments["unpriced_submissions"],
+                    "attempts_used": effective_attempts,
+                    "attempts_source": (
+                        "server_submission_ledger"
+                        if commitments["launched_attempts"] >= attempts_used
+                        else "caller_supplied"
+                    ),
                 }
 
         # 3. Claim the submission slot. The ledger, not a local dict, is the
@@ -691,6 +705,7 @@ class ExecutionController:
         control_mode: str | None = None,
         delegation_policy: DelegationPolicy | dict[str, Any] | None = None,
         workload_id: str | None = None,
+        attempts_used: int = 0,
     ) -> dict[str, Any]:
         """Choose the next rung of the fallback ladder, subject to the same rules.
 
@@ -719,6 +734,7 @@ class ExecutionController:
             if commitments["committed_cost_eur"] > accumulated_cost_eur:
                 accumulated_cost_eur = commitments["committed_cost_eur"]
                 accumulated_source = "server_submission_ledger"
+            attempts_used = max(attempts_used, commitments["launched_attempts"])
 
         if effective_mode is not None and normalize_control_mode(effective_mode) == "advisory":
             return {
@@ -762,7 +778,10 @@ class ExecutionController:
             # the first submission, using the cumulative spend.
             if effective_policy is not None:
                 within, policy_reason = self.check_policy_bounds(
-                    cand, effective_policy, accumulated_cost_eur=accumulated_cost_eur
+                    cand,
+                    effective_policy,
+                    accumulated_cost_eur=accumulated_cost_eur,
+                    attempts_used=attempts_used,
                 )
                 if not within:
                     return {

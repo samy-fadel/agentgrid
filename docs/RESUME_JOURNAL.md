@@ -107,6 +107,7 @@ Tous reproduits sur le SHA de départ `26bc86c` avant toute correction.
 | §1 | Dépendances de test non déclarées | `pip install -e ".[dev]"` puis `pytest` échouait sur un poste neuf : ni `httpx` (requis par `fastapi.testclient`) ni `dukpy` (requis par la porte JSX) n'étaient déclarés |
 | §3-F | **Plafond délégué non cumulatif** | mode `delegation`, `max_budget_eur = 10,00 €` : trois plans distincts à 8,00 € ont tous été acceptés (`submitted` × 3, trois job ids réels) soit 24,00 € engagés sous un plafond de 10,00 €. `check_policy_bounds` acceptait bien un `accumulated_cost_eur`, mais aucun appelant hors échelle de repli n'en fournissait : le plafond ne voyait jamais qu'un plan isolé. Même famille que les drapeaux d'approbation auto-déclarés — une borne qui dépend du bon vouloir de l'appelant n'est pas une borne |
 | §2-A | **Enregistrement Slurm ignoré** | `slurm_job_details` figurait dans la signature de `diagnose_blockers`, l'outil MCP le transmettait, et la fonction ne le lisait jamais. Un enregistrement slurmrestd complet (`state_reason: BadConstraints`, `admin_comment: ZONE_RESOURCE_POOL_EXHAUSTED…`, `dependency: afterok:4700`) renvoyait `category: unknown`, `observed_facts: "Job state: UNKNOWN, Reason: None"`, `confirmed: false`. De plus `POST /api/diagnose` ne transmettait pas du tout le champ : deux façons de perdre la même preuve. Slurm-GCP écrit les erreurs du fournisseur dans `admin_comment` — c'est souvent le seul endroit où une pénurie est consignée |
+| §3-G | **Plafond de tentatives jamais appliqué** | `max_retries` était vérifié par `check_policy_bounds`, mais aucun appelant ne fournissait `attempts_used` : la valeur par défaut `0` désarmait le test. Reproduction : `max_retries = 1`, quatre plans distincts, **quatre jobs lancés**. Aggravant : `release_submission` faisait un `DELETE`, donc l'historique des lancements s'effaçait lui-même — une boucle « relâcher puis relancer » était illimitée, et une soumission `uncertain` (qui a peut-être créé un job) cessait d'être imputée au budget |
 
 ## Décisions
 - **D1** : Node.js absent de l'environnement. La compilation JSX est vérifiée hors-ligne via le
@@ -155,7 +156,7 @@ Tous reproduits sur le SHA de départ `26bc86c` avant toute correction.
 | `tests/test_checkpoint_verification.py` | 6 | vérification réelle du checkpoint (5/6 échouent avant correction) |
 | `tests/test_cost_accounting_journey.py` | 5 | coût compté une fois par tentative, reprise honnête (5/5 échouent avant correction) |
 | `tests/test_slurm_telemetry_defects.py` | 9 | les 7 défauts §7 (6/9 échouent avant correction) |
-| `tests/test_delegation_budget_ceiling.py` | 11 | plafond délégué réellement cumulatif, dérivé du registre serveur (9/10 échouent avant correction ; le 10e est un garde-fou de non-régression sur le rejeu) |
+| `tests/test_delegation_budget_ceiling.py` | 15 | plafonds délégués réellement cumulatifs (budget **et** tentatives), dérivés du registre serveur ; claim relâché archivé, pas supprimé |
 | `tests/test_diagnostics_slurm_record.py` | 14 | `slurm_job_details` réellement lu, `admin_comment` classé, scalaires slurmrestd non inventés (8/14 échouent avant correction ; les 6 autres sont des garde-fous) |
 | `tests/test_mcp_contract.py` | 15 | contrat MCP + outils historiques soumis à la gouvernance |
 | `tests/test_slurm.py` | 23 | adaptateur Slurm |

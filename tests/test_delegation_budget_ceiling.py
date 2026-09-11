@@ -192,16 +192,93 @@ def test_the_ceiling_survives_a_restart(delegated):
     assert result["accumulated_cost_source"] == "server_submission_ledger"
 
 
-def test_releasing_a_claim_returns_its_budget(delegated):
-    """An operator-authorised retry must not be charged twice."""
-    failing = _plan("plan-1", 8.0, REGIONS[0])
-    delegated.submit_plan(profile=_profile(), plan=failing)
+def test_releasing_a_failed_claim_returns_its_budget(delegated):
+    """Nothing was created, so an authorised retry starts from the same budget."""
+    rejected = _plan("plan-bad", 8.0, REGIONS[0])
+    rejected["cpu"] = 64  # the runtime rejects this outright
+
+    delegated.submit_plan(profile=_profile(), plan=rejected)
+    gov = get_governance_store()
+    key = gov.list_submissions(WORKLOAD)[0]["submission_key"]
+    assert gov.get_submission(key)["state"] == "failed"
+
+    assert gov.release_submission(key) is True
+    assert gov.get_commitments(WORKLOAD)["committed_cost_eur"] == pytest.approx(0.0)
+
+
+def test_releasing_a_submitted_claim_does_not_refund_it(delegated):
+    """A job existed. Authorising a retry is not a refund.
+
+    Releasing used to DELETE the ledger row, which both erased the spend and
+    erased the evidence that a launch had happened -- so a retry loop could walk
+    past both ceilings indefinitely.
+    """
+    delegated.submit_plan(profile=_profile(), plan=_plan("plan-1", 8.0, REGIONS[0]))
 
     gov = get_governance_store()
     key = gov.list_submissions(WORKLOAD)[0]["submission_key"]
     gov.release_submission(key)
 
-    assert gov.get_commitments(WORKLOAD)["committed_cost_eur"] == pytest.approx(0.0)
+    commitments = gov.get_commitments(WORKLOAD)
+    assert commitments["committed_cost_eur"] == pytest.approx(8.0)
+    assert commitments["retained_released_commitments"] == 1
+    # The launch is still counted even though the live ledger row is gone.
+    assert commitments["launched_attempts"] == 1
+    assert gov.list_submissions(WORKLOAD) == []
+    assert len(gov.list_archived_submissions(WORKLOAD)) == 1
+
+
+def test_releasing_an_uncertain_claim_does_not_refund_it():
+    """It may have created a job. Refunding it would understate the exposure."""
+    gov = get_governance_store()
+    gov.set_workload_control(WORKLOAD, "delegation", {"max_budget_eur": 10.0})
+    key = "agentgrid-wl-ceiling-cafebabe"
+    gov.claim_submission(key, WORKLOAD, "plan-x", "cafebabe", estimated_cost_eur=6.0)
+    gov.record_submission(key, state="uncertain")
+
+    gov.release_submission(key)
+
+    assert gov.get_commitments(WORKLOAD)["committed_cost_eur"] == pytest.approx(6.0)
+
+
+def test_the_retry_ceiling_is_enforced_from_the_server_side():
+    """`max_retries` never fired: nothing ever passed an attempt count.
+
+    Reproduced with `max_retries=1`: four distinct plans, four jobs launched.
+    """
+    gov = get_governance_store()
+    gov.set_workload_control(
+        WORKLOAD, "delegation", {"max_budget_eur": 1000.0, "max_retries": 1}
+    )
+    controller = ExecutionController(runtime=SimulatedRuntime())
+
+    first = controller.submit_plan(profile=_profile(), plan=_plan("p1", 1.0, REGIONS[0]))
+    assert first["status"] == "submitted", first["reason"]
+
+    second = controller.submit_plan(profile=_profile(), plan=_plan("p2", 1.0, REGIONS[1]))
+    assert second["status"] == "blocked"
+    assert "retry budget exhausted" in second["reason"]
+    assert second["attempts_used"] == 1
+    assert second["attempts_source"] == "server_submission_ledger"
+    # Well within the 1000 EUR budget: this refusal is about attempts, not money.
+    assert "budget limit" not in second["reason"]
+
+
+def test_a_released_launch_still_counts_against_the_retry_ceiling():
+    """Otherwise release-and-retry is an unlimited loop."""
+    gov = get_governance_store()
+    gov.set_workload_control(
+        WORKLOAD, "delegation", {"max_budget_eur": 1000.0, "max_retries": 1}
+    )
+    controller = ExecutionController(runtime=SimulatedRuntime())
+    controller.submit_plan(profile=_profile(), plan=_plan("p1", 1.0, REGIONS[0]))
+
+    key = gov.list_submissions(WORKLOAD)[0]["submission_key"]
+    gov.release_submission(key)
+
+    again = controller.submit_plan(profile=_profile(), plan=_plan("p2", 1.0, REGIONS[1]))
+    assert again["status"] == "blocked"
+    assert "retry budget exhausted" in again["reason"]
 
 
 def test_the_fallback_ladder_uses_the_server_figure_too(delegated):

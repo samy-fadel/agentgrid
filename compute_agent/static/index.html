@@ -1790,13 +1790,38 @@
                         const est = r.initial_estimated_cost_eur;
                         const obs = r.final_calculated_cost_eur;
                         const delta = r.cost_comparison_delta_eur;
+                        // A cost someone stated is not a cost anyone measured.
+                        // Attempts carry cost_status; anything that is not
+                        // calculated_from_usage must say so here, or the honesty
+                        // work in the backend is invisible where it is read.
+                        const attempts = r.attempts || [];
+                        const declared = attempts.filter(
+                          (a) => a.cost_status && a.cost_status !== "calculated_from_usage"
+                        );
                         return (
                           <tr key={i} className="border-b border-slate-800/60">
                             <td className="py-2 font-mono">{r.workload_id}</td>
                             <td className="py-2 font-mono">{r.final_status}</td>
-                            <td className="py-2 text-right font-mono">{(r.attempts || []).length}</td>
+                            <td className="py-2 text-right font-mono">{attempts.length}</td>
                             <td className="py-2 text-right font-mono">{fmt(est, 2)} €</td>
-                            <td className="py-2 text-right font-mono">{fmt(obs, 2)} €</td>
+                            <td className="py-2 text-right font-mono">
+                              {fmt(obs, 2)} €
+                              {declared.length > 0 && (
+                                <span
+                                  className="ml-1 text-amber-400"
+                                  title={
+                                    declared.length +
+                                    " tentative(s) sur " +
+                                    attempts.length +
+                                    " rapportent un coût déclaré, non mesuré (" +
+                                    declared.map((a) => a.cost_status).join(", ") +
+                                    ")"
+                                  }
+                                >
+                                  déclaré
+                                </span>
+                              )}
+                            </td>
                             <td
                               className={`py-2 text-right font-mono ${
                                 delta > 0 ? "text-rose-400" : delta < 0 ? "text-emerald-400" : "text-slate-400"
