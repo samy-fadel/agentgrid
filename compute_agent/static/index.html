@@ -138,26 +138,81 @@
 
       const [planComparison, setPlanComparison] = useState(null);
       const [loadingPlans, setLoadingPlans] = useState(false);
+      const [planError, setPlanError] = useState(null);
 
       const [capacityCandidates, setCapacityCandidates] = useState([]);
       const [loadingCandidates, setLoadingCandidates] = useState(false);
+      const [capacityError, setCapacityError] = useState(null);
 
       const [diagnosticsList, setDiagnosticsList] = useState([]);
       const [loadingDiagnostics, setLoadingDiagnostics] = useState(false);
+      const [diagnosticsError, setDiagnosticsError] = useState(null);
 
       const [historyRecords, setHistoryRecords] = useState([]);
       const [loadingHistory, setLoadingHistory] = useState(false);
+      const [historyError, setHistoryError] = useState(null);
+
+      // Execution / approval feedback: always the server's own answer.
+      const [approvalError, setApprovalError] = useState(null);
+      const [approvingPlanId, setApprovingPlanId] = useState(null);
+      const [executionResult, setExecutionResult] = useState(null);
+      const [executingPlanId, setExecutingPlanId] = useState(null);
+      const [serverControl, setServerControl] = useState(null);
+      const [modeSyncError, setModeSyncError] = useState(null);
+
+      // Requested workload size. Kept independent of budget and deadline so a
+      // single field can be changed and transmitted on its own.
+      const [cpuRequested, setCpuRequested] = useState(16);
+      const [memoryGbRequested, setMemoryGbRequested] = useState(32);
+
+      const WORKLOAD_ID = "workload-gui";
+
+      // Build the profile from the *current* form values. It used to be
+      // hard-coded, so changing only the budget changed nothing server-side.
+      const buildWorkloadProfile = () => ({
+        workload_id: WORKLOAD_ID,
+        name: "compute-simulation",
+        cpu_requested: Number(cpuRequested),
+        memory_mb_requested: Math.round(Number(memoryGbRequested) * 1024),
+        deadline_minutes_from_start: Number(deadline),
+        budget_amount: Number(budget),
+        is_parallelizable: true,
+        supports_checkpointing: true,
+        checkpoint_location: "gs://agentgrid-checkpoints/workload-gui",
+      });
+
+      const describeError = async (res, fallback) => {
+        try {
+          const body = await res.json();
+          if (body && body.detail) return `HTTP ${res.status}: ${body.detail}`;
+        } catch (e) {
+          /* body was not JSON */
+        }
+        return `${fallback} (HTTP ${res.status})`;
+      };
 
       const fetchCapacityCandidates = async () => {
         setLoadingCandidates(true);
+        setCapacityError(null);
         try {
-          const res = await fetch(`${API_BASE}/api/capacity-search?cpu_requested=16&memory_gb_requested=32`);
-          if (res.ok) {
-            const data = await res.json();
-            setCapacityCandidates(data.candidates || []);
+          const res = await fetch(`${API_BASE}/api/capacity-search`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              cpu_requested: Number(cpuRequested),
+              memory_gb_requested: Number(memoryGbRequested),
+            }),
+          });
+          if (!res.ok) {
+            setCapacityError(await describeError(res, "Capacity search failed"));
+            setCapacityCandidates([]);
+            return;
           }
+          const data = await res.json();
+          setCapacityCandidates(data.candidates || []);
         } catch (e) {
-          console.error("Error fetching candidates:", e);
+          setCapacityError(`Unable to reach the API: ${e.message}`);
+          setCapacityCandidates([]);
         } finally {
           setLoadingCandidates(false);
         }
@@ -165,61 +220,112 @@
 
       const fetchPlanComparison = async () => {
         setLoadingPlans(true);
+        setPlanError(null);
         try {
-          const payload = {
-            workload_profile: {
-              workload_id: "workload-gui",
-              name: "compute-simulation",
-              deadline_minutes_from_start: parseFloat(deadline),
-              budget_amount: parseFloat(budget),
-              is_parallelizable: true,
-              supports_checkpointing: true,
-              checkpoint_location: "gs://agentgrid-checkpoints/workload-gui",
-            },
-            cluster_total_cpu: 128,
-          };
           const res = await fetch(`${API_BASE}/api/plans/compare`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({
+              workload_profile: buildWorkloadProfile(),
+              cluster_total_cpu: 128,
+            }),
           });
-          if (res.ok) {
-            const data = await res.json();
-            setPlanComparison(data);
+          if (!res.ok) {
+            setPlanError(await describeError(res, "Plan comparison failed"));
+            setPlanComparison(null);
+            return;
           }
+          setPlanComparison(await res.json());
         } catch (e) {
-          console.error("Error evaluating plans:", e);
+          setPlanError(`Unable to reach the API: ${e.message}`);
+          setPlanComparison(null);
         } finally {
           setLoadingPlans(false);
         }
       };
 
       const handleApprovePlan = async (planId) => {
+        setApprovalError(null);
+        setApprovingPlanId(planId);
         try {
           const res = await fetch(`${API_BASE}/api/plans/approve`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ plan_id: planId }),
+            body: JSON.stringify({ plan_id: planId, workload_id: WORKLOAD_ID }),
           });
-          if (res.ok) {
+          if (!res.ok) {
+            // Never show an approval the server did not record.
+            setApprovedPlanId(null);
+            setApprovalError(await describeError(res, "Approval refused"));
+            return;
+          }
+          const body = await res.json();
+          if (body.status === "approved") {
             setApprovedPlanId(planId);
+          } else {
+            setApprovedPlanId(null);
+            setApprovalError(body.reason || `Approval refused: ${body.status}`);
           }
         } catch (e) {
-          console.error("Error approving plan:", e);
+          setApprovedPlanId(null);
+          setApprovalError(`Unable to reach the API: ${e.message}`);
+        } finally {
+          setApprovingPlanId(null);
+        }
+      };
+
+      const handleExecutePlan = async (plan) => {
+        setExecutionResult(null);
+        setExecutingPlanId(plan.plan_id);
+        try {
+          const res = await fetch(`${API_BASE}/api/execute-plan`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              workload_profile: buildWorkloadProfile(),
+              plan: plan,
+              control_mode: controlMode,
+              delegation_policy: { max_budget_eur: Number(delegationBudget) },
+            }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            setExecutionResult({
+              status: "error",
+              reason: body.detail || `Execution request refused (HTTP ${res.status})`,
+            });
+            return;
+          }
+          // Display exactly what the server returned, including "blocked".
+          setExecutionResult(body);
+          if (body.status === "submitted" || body.status === "already_submitted") {
+            fetchHistory();
+          }
+        } catch (e) {
+          setExecutionResult({ status: "error", reason: `Unable to reach the API: ${e.message}` });
+        } finally {
+          setExecutingPlanId(null);
         }
       };
 
       const fetchDiagnostics = async () => {
         setLoadingDiagnostics(true);
+        setDiagnosticsError(null);
         try {
-          const q = snapshot?.workload ? `?job_state=${snapshot.workload.status || 'RUNNING'}` : "?job_state=PENDING&state_reason=ReqNodeNotAvail";
+          const q = snapshot?.workload
+            ? `?job_state=${snapshot.workload.status || "RUNNING"}`
+            : "?job_state=PENDING&state_reason=ReqNodeNotAvail";
           const res = await fetch(`${API_BASE}/api/diagnose${q}`);
-          if (res.ok) {
-            const data = await res.json();
-            setDiagnosticsList(data.diagnostics || []);
+          if (!res.ok) {
+            setDiagnosticsError(await describeError(res, "Diagnostics failed"));
+            setDiagnosticsList([]);
+            return;
           }
+          const data = await res.json();
+          setDiagnosticsList(data.diagnostics || []);
         } catch (e) {
-          console.error("Error fetching diagnostics:", e);
+          setDiagnosticsError(`Unable to reach the API: ${e.message}`);
+          setDiagnosticsList([]);
         } finally {
           setLoadingDiagnostics(false);
         }
@@ -227,24 +333,63 @@
 
       const fetchHistory = async () => {
         setLoadingHistory(true);
+        setHistoryError(null);
         try {
           const res = await fetch(`${API_BASE}/api/history`);
-          if (res.ok) {
-            const data = await res.json();
-            setHistoryRecords(data.records || []);
+          if (!res.ok) {
+            setHistoryError(await describeError(res, "History unavailable"));
+            setHistoryRecords([]);
+            return;
           }
+          const data = await res.json();
+          setHistoryRecords(data.records || []);
         } catch (e) {
-          console.error("Error fetching history:", e);
+          setHistoryError(`Unable to reach the API: ${e.message}`);
+          setHistoryRecords([]);
         } finally {
           setLoadingHistory(false);
         }
       };
 
+      // The control mode is enforced by the server, so the selector must push
+      // it there. Showing a mode the backend does not hold would be a lie.
+      const syncControlMode = async (mode, budgetEur) => {
+        setModeSyncError(null);
+        try {
+          const res = await fetch(`${API_BASE}/api/workloads/${WORKLOAD_ID}/control`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              control_mode: mode,
+              delegation_policy: { max_budget_eur: Number(budgetEur) },
+            }),
+          });
+          if (!res.ok) {
+            setModeSyncError(await describeError(res, "Could not set the control mode"));
+            return;
+          }
+          setServerControl(await res.json());
+        } catch (e) {
+          setModeSyncError(`Unable to reach the API: ${e.message}`);
+        }
+      };
+
+      const applyControlMode = (mode) => {
+        setControlMode(mode);
+        syncControlMode(mode, delegationBudget);
+      };
+
       useEffect(() => {
-        if (activeTab === "plans" && !planComparison) fetchPlanComparison();
-        if (activeTab === "capacity" && capacityCandidates.length === 0) fetchCapacityCandidates();
-        if (activeTab === "diagnostics" && diagnosticsList.length === 0) fetchDiagnostics();
-        if (activeTab === "history" && historyRecords.length === 0) fetchHistory();
+        syncControlMode(controlMode, delegationBudget);
+      }, []);
+
+      useEffect(() => {
+        if (activeTab === "plans" && !planComparison && !loadingPlans) fetchPlanComparison();
+        if (activeTab === "capacity" && capacityCandidates.length === 0 && !loadingCandidates)
+          fetchCapacityCandidates();
+        if (activeTab === "diagnostics" && diagnosticsList.length === 0 && !loadingDiagnostics)
+          fetchDiagnostics();
+        if (activeTab === "history" && historyRecords.length === 0 && !loadingHistory) fetchHistory();
       }, [activeTab]);
 
 
@@ -528,7 +673,7 @@
               <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Mode de contrôle :</span>
               <div className="flex items-center space-x-1">
                 <button
-                  onClick={() => setControlMode("advisory")}
+                  onClick={() => applyControlMode("advisory")}
                   className={`px-2 py-1 text-xs rounded font-medium transition-colors ${
                     controlMode === "advisory"
                       ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
@@ -539,7 +684,7 @@
                   Advisory
                 </button>
                 <button
-                  onClick={() => setControlMode("validation")}
+                  onClick={() => applyControlMode("validation")}
                   className={`px-2 py-1 text-xs rounded font-medium transition-colors ${
                     controlMode === "validation"
                       ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
@@ -550,7 +695,7 @@
                   Validation
                 </button>
                 <button
-                  onClick={() => setControlMode("delegation")}
+                  onClick={() => applyControlMode("delegation")}
                   className={`px-2 py-1 text-xs rounded font-medium transition-colors ${
                     controlMode === "delegation"
                       ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
@@ -1153,6 +1298,402 @@
 
           </div>
           )}
+
+          {/* ---------------------------------------------------------------
+              Plan comparison (feature 3) + approval and execution (feature 4)
+              --------------------------------------------------------------- */}
+          {activeTab === 'plans' && (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                  Comparaison de plans — coût, délai, capacité
+                </h2>
+                <button
+                  onClick={fetchPlanComparison}
+                  disabled={loadingPlans}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                >
+                  {loadingPlans ? "Calcul en cours…" : "Recalculer avec les paramètres actuels"}
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-400">
+                Budget <span className="text-cyan-300 font-mono">{budget} €</span>, délai{" "}
+                <span className="text-cyan-300 font-mono">{deadline} min</span>, {cpuRequested} vCPU,{" "}
+                {memoryGbRequested} Go. Mode appliqué par le serveur :{" "}
+                <span className="text-amber-300 font-mono">
+                  {serverControl ? serverControl.control_mode : "…"}
+                </span>
+              </p>
+
+              {loadingPlans && (
+                <div className="text-sm text-slate-400 py-8 text-center">Évaluation des plans…</div>
+              )}
+
+              {!loadingPlans && planError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
+                  <div className="font-semibold mb-1">Comparaison indisponible</div>
+                  <div className="font-mono text-xs break-words">{planError}</div>
+                </div>
+              )}
+
+              {!loadingPlans && !planError && planComparison && !planComparison.is_feasible && (
+                <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-100 space-y-2">
+                  <div className="font-semibold">Aucun plan compatible avec les contraintes déclarées</div>
+                  {(planComparison.blocking_constraints || []).map((b, i) => (
+                    <div key={i} className="text-xs font-mono">• {typeof b === "string" ? b : JSON.stringify(b)}</div>
+                  ))}
+                  {(planComparison.suggested_relaxations || []).length > 0 && (
+                    <div className="pt-2">
+                      <div className="font-semibold text-xs uppercase tracking-wider">Assouplissements possibles</div>
+                      {planComparison.suggested_relaxations.map((r, i) => (
+                        <div key={i} className="text-xs font-mono">• {typeof r === "string" ? r : JSON.stringify(r)}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!loadingPlans && !planError && planComparison && planComparison.is_feasible && (
+                <div className="space-y-3">
+                  {approvalError && (
+                    <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
+                      Approbation refusée : <span className="font-mono">{approvalError}</span>
+                    </div>
+                  )}
+                  {executionResult && (
+                    <div
+                      className={`rounded-lg border p-3 text-xs ${
+                        executionResult.status === "submitted"
+                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                          : executionResult.status === "already_submitted"
+                          ? "border-sky-500/40 bg-sky-500/10 text-sky-200"
+                          : "border-amber-500/40 bg-amber-500/10 text-amber-100"
+                      }`}
+                    >
+                      <div className="font-semibold uppercase tracking-wider">{executionResult.status}</div>
+                      <div className="font-mono break-words">{executionResult.reason}</div>
+                      {executionResult.job_id && (
+                        <div className="font-mono mt-1">job_id : {executionResult.job_id}</div>
+                      )}
+                      {executionResult.attempt_id && (
+                        <div className="font-mono">attempt_id : {executionResult.attempt_id}</div>
+                      )}
+                      {executionResult.control_mode && (
+                        <div className="font-mono">mode appliqué : {executionResult.control_mode}</div>
+                      )}
+                      {executionResult.history_linked === false && (
+                        <div className="text-rose-300 font-mono mt-1">
+                          suivi non relié à l'historique : {executionResult.history_link_error}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {planComparison.plans.map((plan) => (
+                      <div
+                        key={plan.plan_id}
+                        className={`rounded-xl border p-4 space-y-2 ${
+                          approvedPlanId === plan.plan_id
+                            ? "border-emerald-500/50 bg-emerald-500/5"
+                            : "border-slate-800 bg-slate-950/60"
+                        }`}
+                      >
+                        <div className="text-xs uppercase tracking-wider text-cyan-300">{plan.plan_type}</div>
+                        <div className="text-sm font-semibold text-slate-100">{plan.title}</div>
+                        <div className="text-xs text-slate-400 font-mono">{plan.plan_id}</div>
+                        <dl className="text-xs text-slate-300 space-y-1 pt-2">
+                          <div className="flex justify-between">
+                            <dt>Coût estimé</dt>
+                            <dd className="font-mono text-cyan-300">{fmt(plan.estimated_cost_eur, 2)} €</dd>
+                          </div>
+                          <div className="flex justify-between">
+                            <dt>Délai total</dt>
+                            <dd className="font-mono">{fmt(plan.total_time_to_result_minutes, 1)} min</dd>
+                          </div>
+                          <div className="flex justify-between">
+                            <dt>Forme</dt>
+                            <dd className="font-mono">{plan.machine_type} · {plan.cpu} vCPU</dd>
+                          </div>
+                          <div className="flex justify-between">
+                            <dt>Approvisionnement</dt>
+                            <dd className="font-mono">{plan.provisioning_model}</dd>
+                          </div>
+                          {plan.cost_basis && (
+                            <div className="flex justify-between">
+                              <dt>Base de coût</dt>
+                              <dd className="font-mono text-amber-300">{plan.cost_basis}</dd>
+                            </div>
+                          )}
+                        </dl>
+                        <p className="text-xs text-slate-400 pt-1">{plan.ranking_rationale}</p>
+                        <div className="flex items-center space-x-2 pt-2">
+                          <button
+                            onClick={() => handleApprovePlan(plan.plan_id)}
+                            disabled={approvingPlanId === plan.plan_id}
+                            className="flex-1 px-2 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                          >
+                            {approvedPlanId === plan.plan_id
+                              ? "✓ Approuvé"
+                              : approvingPlanId === plan.plan_id
+                              ? "Envoi…"
+                              : "Approuver"}
+                          </button>
+                          <button
+                            onClick={() => handleExecutePlan(plan)}
+                            disabled={executingPlanId === plan.plan_id}
+                            className="flex-1 px-2 py-1.5 text-xs rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 disabled:opacity-50"
+                          >
+                            {executingPlanId === plan.plan_id ? "Soumission…" : "Exécuter"}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!loadingPlans && !planError && !planComparison && (
+                <div className="text-sm text-slate-500 py-8 text-center">
+                  Aucun plan calculé pour l'instant.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Capacity search (feature 1) */}
+          {activeTab === 'capacity' && (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                  Recherche de capacité compatible
+                </h2>
+                <button
+                  onClick={fetchCapacityCandidates}
+                  disabled={loadingCandidates}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                >
+                  {loadingCandidates ? "Recherche…" : "Relancer la recherche"}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-end gap-3 text-xs">
+                <label className="flex flex-col space-y-1">
+                  <span className="text-slate-400 uppercase tracking-wider">vCPU</span>
+                  <input
+                    type="number"
+                    min="1"
+                    value={cpuRequested}
+                    onChange={(e) => setCpuRequested(Number(e.target.value))}
+                    className="w-24 bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-slate-100"
+                  />
+                </label>
+                <label className="flex flex-col space-y-1">
+                  <span className="text-slate-400 uppercase tracking-wider">Mémoire (Go)</span>
+                  <input
+                    type="number"
+                    min="1"
+                    value={memoryGbRequested}
+                    onChange={(e) => setMemoryGbRequested(Number(e.target.value))}
+                    className="w-24 bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-slate-100"
+                  />
+                </label>
+              </div>
+
+              {loadingCandidates && (
+                <div className="text-sm text-slate-400 py-8 text-center">Interrogation des sources de capacité…</div>
+              )}
+
+              {!loadingCandidates && capacityError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
+                  <div className="font-semibold mb-1">Recherche impossible</div>
+                  <div className="font-mono text-xs break-words">{capacityError}</div>
+                </div>
+              )}
+
+              {!loadingCandidates && !capacityError && capacityCandidates.length === 0 && (
+                <div className="text-sm text-slate-500 py-8 text-center">
+                  Aucune capacité compatible trouvée pour ces contraintes.
+                </div>
+              )}
+
+              {!loadingCandidates && !capacityError && capacityCandidates.length > 0 && (
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full text-xs">
+                    <thead className="text-slate-400 uppercase tracking-wider">
+                      <tr className="border-b border-slate-800">
+                        <th className="text-left py-2">Machine</th>
+                        <th className="text-left py-2">Région / zone</th>
+                        <th className="text-right py-2">vCPU</th>
+                        <th className="text-left py-2">Approvisionnement</th>
+                        <th className="text-left py-2">Palier</th>
+                        <th className="text-left py-2">Quota</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-slate-200">
+                      {capacityCandidates.map((c, i) => (
+                        <tr key={i} className="border-b border-slate-800/60">
+                          <td className="py-2 font-mono">{c.machine_type}</td>
+                          <td className="py-2 font-mono">{c.region}{c.zone ? ` / ${c.zone}` : ""}</td>
+                          <td className="py-2 text-right font-mono">{c.cpu}</td>
+                          <td className="py-2 font-mono">{c.provisioning_model}</td>
+                          <td className="py-2">
+                            <span className="px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono">
+                              {c.state_stage}
+                            </span>
+                          </td>
+                          <td className="py-2 font-mono text-slate-400">
+                            {c.quota_status || c.quota_state || "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Blocker diagnostics (feature 2) */}
+          {activeTab === 'diagnostics' && (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                  Diagnostic des blocages
+                </h2>
+                <button
+                  onClick={fetchDiagnostics}
+                  disabled={loadingDiagnostics}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                >
+                  {loadingDiagnostics ? "Analyse…" : "Relancer le diagnostic"}
+                </button>
+              </div>
+
+              {loadingDiagnostics && (
+                <div className="text-sm text-slate-400 py-8 text-center">Analyse des signaux…</div>
+              )}
+
+              {!loadingDiagnostics && diagnosticsError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
+                  <div className="font-semibold mb-1">Diagnostic indisponible</div>
+                  <div className="font-mono text-xs break-words">{diagnosticsError}</div>
+                </div>
+              )}
+
+              {!loadingDiagnostics && !diagnosticsError && diagnosticsList.length === 0 && (
+                <div className="text-sm text-slate-500 py-8 text-center">
+                  Aucun blocage détecté sur les signaux disponibles.
+                </div>
+              )}
+
+              {!loadingDiagnostics && !diagnosticsError && diagnosticsList.length > 0 && (
+                <div className="space-y-3">
+                  {diagnosticsList.map((d, i) => (
+                    <div key={i} className="rounded-lg border border-slate-800 bg-slate-950/60 p-4 space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-slate-100">{d.title || d.category}</span>
+                        <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-amber-300">
+                          source : {d.source || "inconnue"}
+                        </span>
+                      </div>
+                      {d.severity && (
+                        <div className="text-xs text-slate-400">Sévérité : <span className="font-mono">{d.severity}</span></div>
+                      )}
+                      {d.detail && <p className="text-xs text-slate-300">{d.detail}</p>}
+                      {d.evidence && (
+                        <p className="text-[11px] text-slate-500 font-mono break-words">{d.evidence}</p>
+                      )}
+                      {d.recommended_action && (
+                        <p className="text-xs text-cyan-300">→ {d.recommended_action}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Cost history and reconciliation (feature 6) */}
+          {activeTab === 'history' && (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                  Coûts réels, historique et écart aux estimations
+                </h2>
+                <button
+                  onClick={fetchHistory}
+                  disabled={loadingHistory}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                >
+                  {loadingHistory ? "Chargement…" : "Rafraîchir"}
+                </button>
+              </div>
+
+              {loadingHistory && (
+                <div className="text-sm text-slate-400 py-8 text-center">Lecture de l'historique…</div>
+              )}
+
+              {!loadingHistory && historyError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
+                  <div className="font-semibold mb-1">Historique indisponible</div>
+                  <div className="font-mono text-xs break-words">{historyError}</div>
+                </div>
+              )}
+
+              {!loadingHistory && !historyError && historyRecords.length === 0 && (
+                <div className="text-sm text-slate-500 py-8 text-center">
+                  Aucune exécution enregistrée. Approuvez puis exécutez un plan pour alimenter l'historique.
+                </div>
+              )}
+
+              {!loadingHistory && !historyError && historyRecords.length > 0 && (
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full text-xs">
+                    <thead className="text-slate-400 uppercase tracking-wider">
+                      <tr className="border-b border-slate-800">
+                        <th className="text-left py-2">Workload</th>
+                        <th className="text-left py-2">État</th>
+                        <th className="text-right py-2">Tentatives</th>
+                        <th className="text-right py-2">Coût estimé</th>
+                        <th className="text-right py-2">Coût observé</th>
+                        <th className="text-right py-2">Écart</th>
+                        <th className="text-right py-2">Durée</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-slate-200">
+                      {historyRecords.map((r, i) => {
+                        const est = r.estimated_cost_eur;
+                        const obs = r.observed_calculated_cost_eur;
+                        const delta = est != null && obs != null ? obs - est : null;
+                        return (
+                          <tr key={i} className="border-b border-slate-800/60">
+                            <td className="py-2 font-mono">{r.workload_id}</td>
+                            <td className="py-2 font-mono">{r.state}</td>
+                            <td className="py-2 text-right font-mono">{r.total_attempts ?? "—"}</td>
+                            <td className="py-2 text-right font-mono">{est != null ? `${fmt(est, 2)} €` : "—"}</td>
+                            <td className="py-2 text-right font-mono">{obs != null ? `${fmt(obs, 2)} €` : "inconnu"}</td>
+                            <td
+                              className={`py-2 text-right font-mono ${
+                                delta == null ? "text-slate-500" : delta > 0 ? "text-rose-400" : "text-emerald-400"
+                              }`}
+                            >
+                              {delta == null ? "—" : `${delta > 0 ? "+" : ""}${fmt(delta, 2)} €`}
+                            </td>
+                            <td className="py-2 text-right font-mono">
+                              {r.actual_duration_minutes != null ? `${fmt(r.actual_duration_minutes, 1)} min` : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
 
         </div>
       );

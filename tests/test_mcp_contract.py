@@ -282,6 +282,11 @@ def test_mcp_resize_workload_reports_truthful_status(monkeypatch):
         "mcp-test", "delegation", DelegationPolicy(max_budget_eur=100.0)
     )
 
+    # Offline test: no Slurm controller is reachable. snapshot() now refuses to
+    # invent cluster state when it cannot talk to the controller, so mock mode
+    # is declared explicitly instead of being relied upon implicitly.
+    monkeypatch.setenv("MOCK_SLURM", "true")
+
     slurm_rt = SlurmRuntime(job_id="mcp-test")
     slurm_rt.job_status = "PENDING"
     monkeypatch.setattr(mcp_mod, "_runtime", slurm_rt)
