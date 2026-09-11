@@ -304,9 +304,22 @@ class ExecutionController:
                 "verified": False,
             }
 
+        # The submission identity is needed before the policy check, because the
+        # cumulative budget is derived from the ledger and this submission must
+        # not be made to count against itself when a request is replayed.
+        fingerprint = plan_fingerprint(p_plan, command=command)
+        key = submission_key(workload_id, fingerprint)
+
         if mode == "delegation":
+            # A ceiling that only counts what the caller volunteers is not a
+            # ceiling. Take the larger of the caller's figure and the spend the
+            # server can prove, so a caller may only ever tighten the bound.
+            commitments = self.governance.get_commitments(workload_id, exclude_key=key)
+            server_committed = commitments["committed_cost_eur"]
+            effective_accumulated = max(accumulated_cost_eur, server_committed)
+
             within, policy_reason = self.check_policy_bounds(
-                p_plan, policy, accumulated_cost_eur=accumulated_cost_eur
+                p_plan, policy, accumulated_cost_eur=effective_accumulated
             )
             if not within:
                 return {
@@ -318,12 +331,18 @@ class ExecutionController:
                     "workload_id": workload_id,
                     "job_id": None,
                     "verified": False,
+                    "accumulated_cost_eur": effective_accumulated,
+                    "accumulated_cost_source": (
+                        "server_submission_ledger"
+                        if server_committed >= accumulated_cost_eur
+                        else "caller_supplied"
+                    ),
+                    "prior_submissions_counted": commitments["submission_count"],
+                    "unpriced_prior_submissions": commitments["unpriced_submissions"],
                 }
 
         # 3. Claim the submission slot. The ledger, not a local dict, is the
         #    authority, so idempotency survives request boundaries and restarts.
-        fingerprint = plan_fingerprint(p_plan, command=command)
-        key = submission_key(workload_id, fingerprint)
 
         if allow_resubmit:
             # An explicitly authorised retry after a terminal failure. A replay
@@ -333,7 +352,11 @@ class ExecutionController:
                 self.governance.release_submission(key)
 
         won, existing = self.governance.claim_submission(
-            key=key, workload_id=workload_id, plan_id=p_plan.plan_id, fingerprint=fingerprint
+            key=key,
+            workload_id=workload_id,
+            plan_id=p_plan.plan_id,
+            fingerprint=fingerprint,
+            estimated_cost_eur=p_plan.estimated_cost_eur,
         )
 
         if not won:
@@ -683,11 +706,19 @@ class ExecutionController:
         # cannot execute in a mode the operator did not grant.
         effective_mode = control_mode
         effective_policy = delegation_policy
+        accumulated_source = "caller_supplied"
         if workload_id:
             effective_mode, resolved_policy, _ = self.resolve_control(
                 workload_id, requested_mode=control_mode, requested_policy=delegation_policy
             )
             effective_policy = resolved_policy
+
+            # Same rule as the first submission: the cumulative figure is the
+            # larger of what the caller claims and what the ledger proves.
+            commitments = self.governance.get_commitments(workload_id)
+            if commitments["committed_cost_eur"] > accumulated_cost_eur:
+                accumulated_cost_eur = commitments["committed_cost_eur"]
+                accumulated_source = "server_submission_ledger"
 
         if effective_mode is not None and normalize_control_mode(effective_mode) == "advisory":
             return {
@@ -718,6 +749,8 @@ class ExecutionController:
                     "rejected_plan_id": cand.plan_id,
                     "projected_cost_eur": projected_total,
                     "budget_limit_eur": budget_limit_eur,
+                    "accumulated_cost_eur": accumulated_cost_eur,
+                    "accumulated_cost_source": accumulated_source,
                     "reason": (
                         f"Fallback plan '{cand.plan_id}' ({cand.title}) rejected: "
                         f"projected total cost {projected_total:.2f}EUR exceeds remaining budget "
@@ -738,6 +771,8 @@ class ExecutionController:
                         "rejected_plan_id": cand.plan_id,
                         "projected_cost_eur": projected_total,
                         "budget_limit_eur": budget_limit_eur,
+                        "accumulated_cost_eur": accumulated_cost_eur,
+                        "accumulated_cost_source": accumulated_source,
                         "reason": (
                             f"Fallback plan '{cand.plan_id}' is not authorised by the delegated "
                             f"policy: {policy_reason} Stopping for human validation."
@@ -749,6 +784,8 @@ class ExecutionController:
                 "plan": cand,
                 "projected_cost_eur": projected_total,
                 "budget_limit_eur": budget_limit_eur,
+                "accumulated_cost_eur": accumulated_cost_eur,
+                "accumulated_cost_source": accumulated_source,
                 "reason": f"Fallback to plan '{cand.plan_id}' within remaining budget and policy.",
             }
 

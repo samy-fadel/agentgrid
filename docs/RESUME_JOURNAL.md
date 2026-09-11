@@ -27,6 +27,8 @@
 - [x] Approbation persistée serveur ; booléen du modèle non suffisant
 - [x] Modification matérielle du plan approuvé invalide l'approbation
 - [x] `delegation` : plafonds cumulés + restrictions appliqués à chaque action ET repli
+      — le cumul est **dérivé du registre de soumissions serveur** (`get_commitments`), pas
+      fourni par l'appelant ; celui-ci ne peut que resserrer la borne (défaut §3-F reproduit)
 - [x] Paramètres incompatibles rejetés explicitement
 
 ### §4 Faux succès / doublons
@@ -103,6 +105,8 @@ Tous reproduits sur le SHA de départ `26bc86c` avant toute correction.
 | §6-E | **Perte d'historique** | `track_workload_lifecycle` ré-enregistrait tout workload absent de la mémoire du process : après redémarrage, un run terminé passait de 7,50 € / 1 tentative / COMPLETED à 0,00 € / 0 tentative / DEFINED |
 | §6-F | Estimation de durée nulle | un plan sans ETA calculée donnait `estimated_duration_minutes = 0` -> 65 minutes observées devenaient un dépassement de 100 % |
 | §1 | Dépendances de test non déclarées | `pip install -e ".[dev]"` puis `pytest` échouait sur un poste neuf : ni `httpx` (requis par `fastapi.testclient`) ni `dukpy` (requis par la porte JSX) n'étaient déclarés |
+| §3-F | **Plafond délégué non cumulatif** | mode `delegation`, `max_budget_eur = 10,00 €` : trois plans distincts à 8,00 € ont tous été acceptés (`submitted` × 3, trois job ids réels) soit 24,00 € engagés sous un plafond de 10,00 €. `check_policy_bounds` acceptait bien un `accumulated_cost_eur`, mais aucun appelant hors échelle de repli n'en fournissait : le plafond ne voyait jamais qu'un plan isolé. Même famille que les drapeaux d'approbation auto-déclarés — une borne qui dépend du bon vouloir de l'appelant n'est pas une borne |
+| §2-A | **Enregistrement Slurm ignoré** | `slurm_job_details` figurait dans la signature de `diagnose_blockers`, l'outil MCP le transmettait, et la fonction ne le lisait jamais. Un enregistrement slurmrestd complet (`state_reason: BadConstraints`, `admin_comment: ZONE_RESOURCE_POOL_EXHAUSTED…`, `dependency: afterok:4700`) renvoyait `category: unknown`, `observed_facts: "Job state: UNKNOWN, Reason: None"`, `confirmed: false`. De plus `POST /api/diagnose` ne transmettait pas du tout le champ : deux façons de perdre la même preuve. Slurm-GCP écrit les erreurs du fournisseur dans `admin_comment` — c'est souvent le seul endroit où une pénurie est consignée |
 
 ## Décisions
 - **D1** : Node.js absent de l'environnement. La compilation JSX est vérifiée hors-ligne via le
@@ -151,6 +155,8 @@ Tous reproduits sur le SHA de départ `26bc86c` avant toute correction.
 | `tests/test_checkpoint_verification.py` | 6 | vérification réelle du checkpoint (5/6 échouent avant correction) |
 | `tests/test_cost_accounting_journey.py` | 5 | coût compté une fois par tentative, reprise honnête (5/5 échouent avant correction) |
 | `tests/test_slurm_telemetry_defects.py` | 9 | les 7 défauts §7 (6/9 échouent avant correction) |
+| `tests/test_delegation_budget_ceiling.py` | 11 | plafond délégué réellement cumulatif, dérivé du registre serveur (9/10 échouent avant correction ; le 10e est un garde-fou de non-régression sur le rejeu) |
+| `tests/test_diagnostics_slurm_record.py` | 14 | `slurm_job_details` réellement lu, `admin_comment` classé, scalaires slurmrestd non inventés (8/14 échouent avant correction ; les 6 autres sont des garde-fous) |
 | `tests/test_mcp_contract.py` | 15 | contrat MCP + outils historiques soumis à la gouvernance |
 | `tests/test_slurm.py` | 23 | adaptateur Slurm |
 | **Suite complète** | **136 passed** (run du 2026-09-11T20:09Z, 4 min 36 s) | |

@@ -186,6 +186,7 @@ class GovernanceStore:
                     state TEXT NOT NULL,
                     detail TEXT,
                     attempt_id TEXT,
+                    estimated_cost_eur REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -194,6 +195,20 @@ class GovernanceStore:
                     ON submission_ledger (workload_id);
                 """
             )
+
+            # Migration for databases created before the ledger priced its
+            # rows. CREATE TABLE IF NOT EXISTS silently keeps the old shape, so
+            # the column has to be added explicitly or every cumulative-spend
+            # query would raise "no such column" on an existing install.
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(submission_ledger)").fetchall()
+            }
+            if "estimated_cost_eur" not in existing_columns:
+                conn.execute(
+                    "ALTER TABLE submission_ledger ADD COLUMN estimated_cost_eur REAL"
+                )
+
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -455,6 +470,7 @@ class GovernanceStore:
         workload_id: str,
         plan_id: str,
         fingerprint: str,
+        estimated_cost_eur: float | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """Atomically claim the right to submit.
 
@@ -464,18 +480,25 @@ class GovernanceStore:
 
         The INSERT is the lock: SQLite's primary key constraint makes concurrent
         double-clicks resolve to exactly one winner.
+
+        ``estimated_cost_eur`` is stored on the row so that :meth:`get_commitments`
+        can rebuild the cumulative committed spend from the server's own records
+        instead of trusting a figure supplied by the caller.
         """
         now = time.time()
+        if estimated_cost_eur is None:
+            estimated_cost_eur = self._registered_plan_cost(plan_id)
         with self._connect() as conn:
             try:
                 conn.execute(
                     """
                     INSERT INTO submission_ledger
                         (submission_key, workload_id, plan_id, fingerprint,
-                         job_id, state, detail, attempt_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, NULL, 'claimed', NULL, NULL, ?, ?)
+                         job_id, state, detail, attempt_id, estimated_cost_eur,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, NULL, 'claimed', NULL, NULL, ?, ?, ?)
                     """,
-                    (key, workload_id, plan_id, fingerprint, now, now),
+                    (key, workload_id, plan_id, fingerprint, estimated_cost_eur, now, now),
                 )
                 conn.commit()
                 won = True
@@ -487,6 +510,74 @@ class GovernanceStore:
             ).fetchone()
 
         return won, dict(row) if row else {}
+
+    def _registered_plan_cost(self, plan_id: str) -> Optional[float]:
+        """Best-effort price for a plan that was registered before submission."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT plan_json FROM registered_plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return float(json.loads(row["plan_json"]).get("estimated_cost_eur"))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    #: Ledger states that represent money the operator is already on the hook
+    #: for. ``failed`` is excluded because nothing was created; ``uncertain`` is
+    #: included precisely because it may have created something.
+    COMMITTING_STATES = ("claimed", "submitted", "uncertain")
+
+    def get_commitments(
+        self, workload_id: str, exclude_key: str | None = None
+    ) -> dict[str, Any]:
+        """Rebuild what a workload has already committed, from the ledger.
+
+        This exists because a delegated budget that only counts what the caller
+        volunteers is not a ceiling at all: an agent can submit plan after plan,
+        each individually under the limit, and never hit the cap. The figure
+        returned here is derived from the server's own submission records, so
+        the caller cannot understate it.
+
+        ``exclude_key`` omits one submission key, which is what makes a replay
+        of an already-claimed submission avoid counting itself twice.
+        """
+        placeholders = ", ".join("?" for _ in self.COMMITTING_STATES)
+        sql = (
+            f"SELECT submission_key, plan_id, state, estimated_cost_eur "
+            f"FROM submission_ledger "
+            f"WHERE workload_id = ? AND state IN ({placeholders})"
+        )
+        params: list[Any] = [workload_id, *self.COMMITTING_STATES]
+        if exclude_key:
+            sql += " AND submission_key != ?"
+            params.append(exclude_key)
+
+        with self._connect() as conn:
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+        committed = 0.0
+        unpriced = 0
+        for row in rows:
+            cost = row.get("estimated_cost_eur")
+            if cost is None:
+                # Row written before the ledger priced submissions, or a plan
+                # whose price was never known. Try the registered plan, then
+                # admit ignorance rather than silently treating it as free.
+                cost = self._registered_plan_cost(row["plan_id"])
+            if cost is None:
+                unpriced += 1
+                continue
+            committed += float(cost)
+
+        return {
+            "workload_id": workload_id,
+            "committed_cost_eur": round(committed, 4),
+            "submission_count": len(rows),
+            "unpriced_submissions": unpriced,
+            "counted_states": list(self.COMMITTING_STATES),
+        }
 
     def record_submission(
         self,

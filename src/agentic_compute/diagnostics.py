@@ -6,6 +6,74 @@ from typing import Any
 from .models import DiagnosticItem, WorkloadProfile
 
 
+def _slurm_number(value: Any) -> int | None:
+    """Unwrap a slurmrestd scalar.
+
+    slurmrestd does not return bare numbers: it returns
+    ``{"number": 64, "set": true, "infinite": false}``. Reading ``["number"]``
+    without checking ``set`` is how an unset field becomes a confident zero.
+    """
+    if isinstance(value, dict):
+        if value.get("infinite"):
+            return None
+        if value.get("set") is False:
+            return None
+        value = value.get("number")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _slurm_state(value: Any) -> str | None:
+    """Normalise ``job_state``, which slurmrestd returns as a list."""
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _slurm_exit_code(detail: dict[str, Any]) -> int | None:
+    """Read the return code from a job record, without inventing a zero."""
+    raw = detail.get("exit_code")
+    if isinstance(raw, dict) and "return_code" in raw:
+        raw = raw["return_code"]
+    return _slurm_number(raw)
+
+
+def _slurm_evidence(detail: dict[str, Any], include_admin_comment: bool = True) -> str:
+    """Summarise the parts of a job record that support a diagnosis.
+
+    Only fields actually present are reported: an absent partition must not be
+    printed as an empty one. ``include_admin_comment`` is turned off where the
+    comment is already the headline fact, so it is not printed twice.
+    """
+    if not detail:
+        return ""
+
+    parts: list[str] = []
+    job_id = detail.get("job_id")
+    if job_id is not None:
+        parts.append(f"job {job_id}")
+    if detail.get("partition"):
+        parts.append(f"partition '{detail['partition']}'")
+
+    cpus = _slurm_number(detail.get("cpus"))
+    if cpus is not None:
+        parts.append(f"{cpus} vCPU requested")
+    nodes = _slurm_number(detail.get("node_count"))
+    if nodes is not None:
+        parts.append(f"{nodes} node(s) requested")
+    if detail.get("qos"):
+        parts.append(f"QoS '{detail['qos']}'")
+    if detail.get("dependency"):
+        parts.append(f"dependency '{detail['dependency']}'")
+    if include_admin_comment and detail.get("admin_comment"):
+        parts.append(f"admin_comment: {str(detail['admin_comment'])[:200]}")
+
+    return f" Slurm record: {'; '.join(parts)}." if parts else ""
+
+
 def diagnose_blockers(
     job_state: str | None = None,
     state_reason: str | None = None,
@@ -33,8 +101,37 @@ def diagnose_blockers(
     ts = timestamp or time.time()
     findings: list[DiagnosticItem] = []
 
+    # ``slurm_job_details`` used to be accepted and then never read. A caller
+    # that passed a complete slurmrestd job record -- state BadConstraints, an
+    # admin_comment carrying ZONE_RESOURCE_POOL_EXHAUSTED -- got back
+    # "Job state: UNKNOWN, Reason: None". The record is now the source of
+    # anything the caller did not spell out, and its evidence is attached to the
+    # findings it supports.
+    detail = slurm_job_details if isinstance(slurm_job_details, dict) else {}
+
+    job_state = job_state or _slurm_state(detail.get("job_state"))
+    state_reason = state_reason or detail.get("state_reason") or None
+    if exit_code is None:
+        exit_code = _slurm_exit_code(detail)
+
+    # Slurm-GCP writes cloud provider failures from the resume script into
+    # admin_comment. Ignoring it is how a stockout came back as "unknown".
+    admin_comment = detail.get("admin_comment") or ""
+
+    slurm_evidence = _slurm_evidence(detail)
+    # Used where admin_comment is already the headline fact.
+    slurm_evidence_terse = _slurm_evidence(detail, include_admin_comment=False)
+
     # 1. Check for Quota Errors (GCP Provider Error or Slurm Reason)
-    err_text = ((gcp_error or "") + " " + (state_reason or "") + " " + (error_log or "")).lower()
+    err_text = (
+        (gcp_error or "")
+        + " "
+        + (state_reason or "")
+        + " "
+        + (error_log or "")
+        + " "
+        + admin_comment
+    ).lower()
     is_quota = (
         "quota_exceeded" in err_text
         or "quota exceeded" in err_text
@@ -49,7 +146,11 @@ def diagnose_blockers(
         findings.append(
             DiagnosticItem(
                 category="quota",
-                observed_facts=gcp_error or f"Quota limit reached. Slurm state reason: {state_reason}",
+                observed_facts=(
+                    gcp_error
+                    or admin_comment
+                    or f"Quota limit reached. Slurm state reason: {state_reason}"
+                ) + (slurm_evidence_terse if admin_comment else slurm_evidence),
                 source="gcp_compute_quota",
                 timestamp=ts,
                 confirmed=True,
@@ -81,7 +182,11 @@ def diagnose_blockers(
         findings.append(
             DiagnosticItem(
                 category="capacity_shortage",
-                observed_facts=gcp_error or f"Cloud capacity unavailable in target zone/region. Reason: {state_reason}",
+                observed_facts=(
+                    gcp_error
+                    or admin_comment
+                    or f"Cloud capacity unavailable in target zone/region. Reason: {state_reason}"
+                ) + (slurm_evidence_terse if admin_comment else slurm_evidence),
                 source="gcp_capacity_advisor",
                 timestamp=ts,
                 confirmed=True,
@@ -109,6 +214,7 @@ def diagnose_blockers(
         facts = f"Workload terminated with exit code {exit_code}. Job state: {job_state}."
         if error_log:
             facts += f" Diagnostic log: {error_log[:300]}"
+        facts += slurm_evidence
 
         actions = [
             {
@@ -153,7 +259,9 @@ def diagnose_blockers(
         findings.append(
             DiagnosticItem(
                 category="incompatible_configuration",
-                observed_facts=gcp_error or f"Job configuration rejected by scheduler: {state_reason}",
+                observed_facts=(
+                    gcp_error or f"Job configuration rejected by scheduler: {state_reason}"
+                ) + slurm_evidence,
                 source="slurm_controller",
                 timestamp=ts,
                 confirmed=True,
@@ -168,11 +276,18 @@ def diagnose_blockers(
         )
 
     # 5. Check for Dependencies Wait
-    if state_reason and state_reason.startswith("Dependency"):
+    has_dependency = bool(state_reason and state_reason.startswith("Dependency")) or (
+        bool(detail.get("dependency"))
+        and (job_state or "").upper() in ("PENDING", "", "UNKNOWN")
+    )
+    if has_dependency:
         findings.append(
             DiagnosticItem(
                 category="dependencies",
-                observed_facts=f"Job is waiting on upstream job dependencies. State reason: {state_reason}",
+                observed_facts=(
+                    f"Job is waiting on upstream job dependencies. "
+                    f"State reason: {state_reason}"
+                ) + slurm_evidence,
                 source="slurm_controller",
                 timestamp=ts,
                 confirmed=True,
@@ -191,7 +306,10 @@ def diagnose_blockers(
         findings.append(
             DiagnosticItem(
                 category="priority",
-                observed_facts=f"Job queued behind higher priority workloads. State reason: {state_reason}",
+                observed_facts=(
+                    f"Job queued behind higher priority workloads. "
+                    f"State reason: {state_reason}"
+                ) + slurm_evidence,
                 source="slurm_controller",
                 timestamp=ts,
                 confirmed=True,
@@ -219,7 +337,10 @@ def diagnose_blockers(
         findings.append(
             DiagnosticItem(
                 category="resource_waiting",
-                observed_facts=f"Job is waiting for available cluster capacity. Slurm state reason: {state_reason or 'Resources'}",
+                observed_facts=(
+                    f"Job is waiting for available cluster capacity. "
+                    f"Slurm state reason: {state_reason or 'Resources'}"
+                ) + slurm_evidence,
                 source="slurm_controller",
                 timestamp=ts,
                 confirmed=True,
@@ -239,7 +360,9 @@ def diagnose_blockers(
 
     # Fallback if no specific condition matched
     if not findings:
-        status_str = f"Job state: {job_state or 'UNKNOWN'}, Reason: {state_reason or 'None'}"
+        status_str = (
+            f"Job state: {job_state or 'UNKNOWN'}, Reason: {state_reason or 'None'}"
+        ) + slurm_evidence
         findings.append(
             DiagnosticItem(
                 category="unknown",

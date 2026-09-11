@@ -197,7 +197,20 @@ Structured taxonomy classifying execution impediments into:
 * **3 Operator Control Modes**:
   * **Advisory (`advisory`)**: Strictly read-only suggestions. All mutations/submissions are rejected.
   * **Validation (`validation`)**: Human-in-the-loop approval. Plan execution blocked until operator clicks "Approve".
-  * **Delegation (`delegation`)**: Autonomous execution strictly bounded by `DelegationPolicy` guardrails (max budget ceiling, allowed machine types, allowed regions, allowed provisioning models).
+  * **Delegation (`delegation`)**: Execution bounded by `DelegationPolicy` guardrails (budget
+    ceiling, allowed machine types, allowed regions, allowed provisioning models, retry count)
+    without stopping for each approval.
+* **The delegated budget is a cumulative ceiling, reconstructed server-side.** It is not a
+  per-action check. Before each submission the server sums what this workload has already
+  committed — every ledger row in `claimed`, `submitted` or `uncertain` state, priced at claim
+  time — and adds the plan being proposed. A caller may pass its own `accumulated_cost_eur`, but
+  the server takes `max(caller, ledger)`, so a caller can only ever *tighten* the bound. Three
+  distinct 8 EUR plans under a 10 EUR delegation therefore yield one submission and two refusals,
+  not three jobs. `GET /api/workloads/{id}/control` reports `committed_cost_eur` and
+  `remaining_delegated_budget_eur` so the headroom is visible. A `failed` submission created
+  nothing and is not charged; an `uncertain` one may have, so it is. Ledger rows written before
+  submissions were priced are surfaced as `unpriced_prior_submissions` rather than counted as
+  free. The same rule applies to every rung of the fallback ladder.
 * **Execution Safety**:
   * **Ordered Fallback Ladder**: Automatic failover (e.g., Spot → Standard On-Demand) when stockouts occur, staying within remaining budget.
   * **Idempotent Anti-Duplicate Submission**: A submission is claimed in a persistent SQLite
@@ -237,6 +250,7 @@ Being precise about this matters more than the feature list. As of the current c
 | Area | Status | How it was checked |
 | :--- | :--- | :--- |
 | Governance (advisory / validation / delegation), plan registration, fingerprint-bound approval, idempotent submission | **Verified** | `tests/test_http_journey.py`, `tests/test_mcp_http_governance.py`, plus a full journey run with `curl` against a live server |
+| Cumulative delegated budget ceiling (server-derived, caller cannot understate it) | **Verified** | `tests/test_delegation_budget_ceiling.py` — 9 of its 10 controller tests fail against the previous code |
 | Plan comparison, infeasibility explanations, constraint rejection | **Verified** | `tests/test_evolved_capabilities.py`, `tests/test_agentgrid_evolutions.py` |
 | Location constraints and quota staging | **Verified** | `tests/test_capacity_location_constraints.py` |
 | Lifecycle, checkpoint verification, cost accounting across attempts and restarts | **Verified** | `tests/test_checkpoint_verification.py`, `tests/test_cost_accounting_journey.py` |

@@ -329,6 +329,15 @@ async def diagnose_endpoint(request: Request) -> dict[str, Any]:
         data = dict(request.query_params)
 
     exit_code = int(data["exit_code"]) if data.get("exit_code") is not None else None
+
+    # The MCP surface forwarded these; this route dropped them, so the same
+    # request diagnosed through the dashboard lost the Slurm-side evidence
+    # (partition, requested resources, priority) and produced a thinner answer.
+    # A query string cannot carry a nested object, hence the type check.
+    slurm_job_details = data.get("slurm_job_details")
+    if not isinstance(slurm_job_details, dict):
+        slurm_job_details = None
+
     items = diagnose_blockers(
         job_state=data.get("job_state"),
         state_reason=data.get("state_reason"),
@@ -336,6 +345,7 @@ async def diagnose_endpoint(request: Request) -> dict[str, Any]:
         gcp_error=data.get("gcp_error"),
         error_log=data.get("error_log"),
         workload_profile=data.get("workload_profile"),
+        slurm_job_details=slurm_job_details,
     )
     return {"diagnostics": items}
 
@@ -448,11 +458,35 @@ def get_workload_control_endpoint(workload_id: str) -> dict[str, Any]:
     from agentic_compute.governance import get_governance_store
 
     state = get_governance_store().get_workload_control(workload_id)
+    return _control_state_payload(state)
+
+
+def _control_state_payload(state: dict[str, Any]) -> dict[str, Any]:
+    """Describe a control state, including the budget already committed.
+
+    A delegated ceiling is only meaningful next to what has already been spent
+    against it, so the operator sees the headroom and not just the limit. The
+    committed figure is derived from the submission ledger, never supplied by
+    the caller.
+    """
+    from agentic_compute.governance import get_governance_store
+
+    policy = state["delegation_policy"]
+    commitments = get_governance_store().get_commitments(state["workload_id"])
+    committed = commitments["committed_cost_eur"]
+
     return {
         "workload_id": state["workload_id"],
         "control_mode": state["control_mode"],
-        "delegation_policy": state["delegation_policy"].model_dump(),
+        "delegation_policy": policy.model_dump(),
         "source": state["source"],
+        "committed_cost_eur": committed,
+        "remaining_delegated_budget_eur": round(
+            max(policy.max_budget_eur - committed, 0.0), 4
+        ),
+        "prior_submissions_counted": commitments["submission_count"],
+        "unpriced_prior_submissions": commitments["unpriced_submissions"],
+        "committed_cost_source": "server_submission_ledger",
     }
 
 
@@ -481,12 +515,7 @@ async def set_workload_control_endpoint(workload_id: str, request: Request) -> d
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid delegation policy: {exc}") from exc
 
-    return {
-        "workload_id": state["workload_id"],
-        "control_mode": state["control_mode"],
-        "delegation_policy": state["delegation_policy"].model_dump(),
-        "source": state["source"],
-    }
+    return _control_state_payload(state)
 
 
 @app.post("/api/execute-plan")

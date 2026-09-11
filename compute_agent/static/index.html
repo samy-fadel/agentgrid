@@ -726,6 +726,30 @@
                   Délégation
                 </button>
               </div>
+              {/* A ceiling means nothing without the spend already charged
+                  against it. Both figures come from the server's submission
+                  ledger, not from this page. */}
+              {serverControl && serverControl.control_mode === "delegation" && (
+                <div className="pl-2 ml-1 border-l border-slate-800 text-[11px] leading-tight">
+                  <div className="text-slate-400">
+                    Engagé :{" "}
+                    <span className="font-mono text-slate-200">
+                      {Number(serverControl.committed_cost_eur ?? 0).toFixed(2)} €
+                    </span>
+                  </div>
+                  <div className="text-slate-400">
+                    Reste :{" "}
+                    <span className="font-mono text-emerald-300">
+                      {Number(serverControl.remaining_delegated_budget_eur ?? 0).toFixed(2)} €
+                    </span>
+                  </div>
+                  {serverControl.unpriced_prior_submissions > 0 && (
+                    <div className="text-amber-400">
+                      {serverControl.unpriced_prior_submissions} soumission(s) sans coût connu
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
