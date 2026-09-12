@@ -81,6 +81,7 @@ You access compute infrastructure only through MCP tools across 6 core capabilit
 1. Capacity Search & Quota Validation (search_capacity, get_capacity_advice):
    - Trace capacity candidates across 4 stages: catalog_proposed, quota_authorized, capacity_estimated, actually_allocated.
    - Maintain clear data provenance (gcp_live_api, simulated_demo, unavailable, unknown).
+   - Inspect location_note before concluding on an empty candidates list: location constraints excluding all regions is distinct from hardware incompatibility. Always check searched_regions to know what was actually queried.
 2. Blocker Diagnostics (diagnose_blockers_tool):
    - Categorize execution impediments into: resource_waiting, priority, dependencies, quota, capacity_shortage, incompatible_configuration, application_error.
    - Separate confirmed facts from hypotheses, identify origins, and formulate concrete actions with consequences.

@@ -133,6 +133,31 @@ _execution_controller = ExecutionController(_runtime)
 _history_store = get_history_store()
 
 
+def _describe_searched_regions(
+    allowed_regions: list[str] | None,
+    target_region: str | None,
+    allow_region_change: bool,
+) -> tuple[list[str], str | None]:
+    """Report which regions a capacity search covered, and why.
+
+    The HTTP dashboard route already returned this; the MCP surfaces returned
+    only ``candidates``. An agent handed an empty list could not tell "your
+    location constraints exclude everything" from "nothing in the catalogue fits
+    your hardware", and would report the wrong blocker to the operator.
+
+    Delegates to the same resolver the search uses, so the answer and the
+    explanation cannot drift apart.
+    """
+    from .capacity_advisor import resolve_search_regions
+
+    profile = WorkloadProfile(
+        workload_id="capacity-search-metadata",
+        allowed_regions=list(allowed_regions) if allowed_regions else [],
+        allow_region_change=allow_region_change,
+    )
+    return resolve_search_regions(profile, target_region)
+
+
 @mcp.custom_route("/search-capacity", methods=["POST", "GET"])
 async def search_capacity_route(request):
     """Search compatible capacity candidates across catalog, quotas, and availability signals."""
@@ -145,17 +170,35 @@ async def search_capacity_route(request):
     else:
         body = dict(request.query_params)
 
+    allowed = body.get("allowed_regions") if isinstance(body.get("allowed_regions"), list) else None
+    target_region = body.get("target_region") or body.get("region")
+    allow_region_change = str(body.get("allow_region_change", "false")).lower() in ("true", "1")
+
     candidates = search_compatible_capacity(
         workload_profile=body.get("workload_profile"),
         cpu_requested=int(body.get("cpu_requested", 4)),
         gpu_requested=int(body.get("gpu_requested", 0)),
         memory_gb_requested=float(body.get("memory_gb_requested", 16.0)),
-        allowed_regions=body.get("allowed_regions") if isinstance(body.get("allowed_regions"), list) else None,
+        allowed_regions=allowed,
+        target_region=target_region,
         allow_spot=str(body.get("allow_spot", "true")).lower() in ("true", "1"),
         allow_standard=str(body.get("allow_standard", "true")).lower() in ("true", "1"),
         demo_mode=str(body.get("demo_mode", "false")).lower() in ("true", "1") if "demo_mode" in body else None,
     )
-    return JSONResponse({"candidates": [c.model_dump() for c in candidates]})
+    searched_regions, location_note = _describe_searched_regions(
+        allowed_regions=allowed,
+        target_region=target_region,
+        allow_region_change=allow_region_change,
+    )
+    return JSONResponse(
+        {
+            "candidates": [c.model_dump() for c in candidates],
+            "searched_regions": searched_regions,
+            "allowed_regions": allowed or [],
+            "allow_region_change": allow_region_change,
+            "location_note": location_note,
+        }
+    )
 
 
 @mcp.custom_route("/diagnose", methods=["POST", "GET"])
@@ -541,6 +584,8 @@ def search_capacity(
     gpu_requested: int = 0,
     memory_gb_requested: float = 16.0,
     allowed_regions: list[str] | None = None,
+    target_region: str | None = None,
+    allow_region_change: bool = False,
     allow_spot: bool = True,
     allow_standard: bool = True,
     demo_mode: bool | None = None,
@@ -552,18 +597,45 @@ def search_capacity(
     2. quota_authorized (vCPU and region limits)
     3. capacity_estimated (preemption risk and obtainability score)
     4. actually_allocated (scheduled onto runtime)
+
+    Every region in ``allowed_regions`` is searched, up to a cap. Pass
+    ``target_region`` to look at exactly one; combine it with
+    ``allow_region_change=True`` to look outside the allow-list.
+
+    Read ``location_note`` before concluding anything from an empty
+    ``candidates`` list: an empty result caused by the operator's location
+    constraints is a different blocker from "no machine fits the hardware", and
+    only the note tells the two apart. ``searched_regions`` says which regions
+    were actually queried -- do not report on a region that is not in it.
     """
+    profile: dict[str, Any] = {
+        "workload_id": workload_id,
+        "cpu_requested": cpu_requested,
+        "allow_region_change": allow_region_change,
+    }
     candidates = search_compatible_capacity(
-        workload_profile={"workload_id": workload_id, "cpu_requested": cpu_requested},
+        workload_profile=profile,
         cpu_requested=cpu_requested,
         gpu_requested=gpu_requested,
         memory_gb_requested=memory_gb_requested,
         allowed_regions=allowed_regions,
+        target_region=target_region,
         allow_spot=allow_spot,
         allow_standard=allow_standard,
         demo_mode=demo_mode,
     )
-    return {"candidates": [c.model_dump() for c in candidates]}
+    searched_regions, location_note = _describe_searched_regions(
+        allowed_regions=allowed_regions,
+        target_region=target_region,
+        allow_region_change=allow_region_change,
+    )
+    return {
+        "candidates": [c.model_dump() for c in candidates],
+        "searched_regions": searched_regions,
+        "allowed_regions": allowed_regions or [],
+        "allow_region_change": allow_region_change,
+        "location_note": location_note,
+    }
 
 
 @mcp.tool()
