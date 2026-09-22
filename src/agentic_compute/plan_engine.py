@@ -575,6 +575,31 @@ def evaluate_and_compare_plans(
         plan.fallback_chain = chain
         plan.fallback_plan_id = chain[0] if chain else None
 
+    # Fourth comparison dimension & resilience: 4D Pareto Frontier (Cost, Latency, Risk, Carbon)
+    # and Young-Daly mathematically optimal checkpointing schedule.
+    from .pareto_optimizer import analyze_pareto_frontier, simulate_what_if_scenarios
+
+    pareto_analysis = analyze_pareto_frontier(plans_list, workload_profile=workload)
+    enriched_by_id = {item["plan_id"]: item for item in pareto_analysis["plans"]}
+    for plan in plans_list:
+        enriched = enriched_by_id.get(plan.plan_id, {})
+        carb = enriched.get("carbon_metrics", {})
+        resil = enriched.get("resilience_metrics", {})
+        plan.carbon_emissions_g_co2 = float(carb.get("carbon_emissions_g_co2", 0.0))
+        plan.energy_kwh = float(carb.get("energy_kwh", 0.0))
+        plan.carbon_intensity_g_per_kwh = float(carb.get("carbon_intensity_g_per_kwh", 0.0))
+        plan.green_tier = str(carb.get("green_tier", "MODERATE_CARBON"))
+        plan.young_daly_optimal_checkpoint_minutes = resil.get("young_daly_optimal_interval_minutes")
+        plan.expected_cost_with_preemption_eur = resil.get("expected_total_cost_with_preemption_eur")
+        plan.interruption_risk_score = float(resil.get("interruption_risk_score", 0.0))
+        plan.is_pareto_optimal = bool(enriched.get("is_pareto_optimal", True))
+        plan.pareto_rank = int(enriched.get("pareto_rank", 1))
+        plan.utility_scores = dict(enriched.get("utility_scores", {}))
+        plan.carbon_metrics = carb
+        plan.resilience_metrics = resil
+
+    what_if_summary = simulate_what_if_scenarios(plans_list, workload_profile=workload)
+
     return {
         "is_feasible": True,
         "plans": [p.model_dump() for p in plans_list],
@@ -593,4 +618,11 @@ def evaluate_and_compare_plans(
             else "Quota was not consulted for these plans (capacity check disabled), so every "
             "plan reports NOT_CHECKED rather than an assumed availability."
         ),
+        "pareto_frontier": {
+            "pareto_frontier_plan_ids": pareto_analysis["pareto_frontier_plan_ids"],
+            "pareto_optimal_count": pareto_analysis["pareto_optimal_count"],
+            "recommendations_by_objective": pareto_analysis["recommendations_by_objective"],
+        },
+        "what_if_summary": what_if_summary,
     }
+

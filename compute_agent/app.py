@@ -49,12 +49,15 @@ app = FastAPI(
     version="0.2.0",
 )
 
+from agentic_compute.security import clamp_pagination_limit, resolve_cors_policy
+
+_cors_cfg = resolve_cors_policy()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_cfg["allow_origins"],
+    allow_credentials=_cors_cfg["allow_credentials"],
+    allow_methods=_cors_cfg["allow_methods"],
+    allow_headers=_cors_cfg["allow_headers"],
 )
 
 runner = InMemoryRunner(agent=root_agent, app_name="agentic-compute")
@@ -427,6 +430,7 @@ async def approve_plan_endpoint(request: Request) -> dict[str, Any]:
     error: returning 200 with ``status: not_found`` previously let the UI
     display a phantom approval.
     """
+    verify_agent_auth(request)
     from agentic_compute.governance import get_governance_store
     from agentic_compute.history import get_history_store
 
@@ -502,6 +506,7 @@ def _control_state_payload(state: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/workloads/{workload_id}/control")
 async def set_workload_control_endpoint(workload_id: str, request: Request) -> dict[str, Any]:
     """Set the control mode/policy for a workload. Only the operator does this."""
+    verify_agent_auth(request)
     from agentic_compute.governance import get_governance_store, normalize_control_mode
 
     try:
@@ -541,6 +546,7 @@ async def evaluate_fallback_endpoint(workload_id: str, request: Request) -> dict
     go through ``/api/execute-plan``, which is where the control mode, the
     approval and the ceilings are enforced.
     """
+    verify_agent_auth(request)
     from agentic_compute.execution_controller import ExecutionController
     from agentic_compute.governance import get_governance_store
     from agentic_compute.mcp_server import _runtime
@@ -617,6 +623,7 @@ async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
     persisted, so the journey submit -> track -> history is continuous instead
     of ending in a 404.
     """
+    verify_agent_auth(request)
     from agentic_compute.execution_controller import ExecutionController
     from agentic_compute.lifecycle_manager import LifecycleManager
     from agentic_compute.models import ExecutionPlan, WorkloadProfile
@@ -640,16 +647,19 @@ async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="plan.plan_id is required")
 
     controller = ExecutionController(_runtime)
-    res = controller.submit_plan(
-        profile=profile,
-        plan=plan,
-        control_mode=control_mode,
-        delegation_policy=delegation_policy,
-        is_operator_approved=is_approved,
-        approved_plan_id=approved_plan_id,
-        runtime=_runtime,
-        allow_resubmit=bool(body.get("allow_resubmit", False)),
-    )
+    try:
+        res = controller.submit_plan(
+            profile=profile,
+            plan=plan,
+            control_mode=control_mode,
+            delegation_policy=delegation_policy,
+            is_operator_approved=is_approved,
+            approved_plan_id=approved_plan_id,
+            runtime=_runtime,
+            allow_resubmit=bool(body.get("allow_resubmit", False)),
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid workload or plan payload: {exc}") from exc
 
     if res.get("status") == "submitted" and res.get("job_id"):
         try:
@@ -674,10 +684,147 @@ async def execute_plan_endpoint(request: Request) -> dict[str, Any]:
     return res
 
 
+@app.post("/api/plans/pareto")
+async def analyze_pareto_endpoint(request: Request) -> dict[str, Any]:
+    """Analyze 4D Pareto Frontier (Cost, Latency, Interruption Risk, Carbon) & Young-Daly checkpoints."""
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.pareto_optimizer import analyze_pareto_frontier
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    workload_id = body.get("workload_id")
+    plans = body.get("plans")
+    profile = body.get("workload_profile")
+
+    if plans is None and workload_id:
+        reg = get_governance_store().list_registered_plans(workload_id)
+        plans = [r["plan"] for r in reg]
+
+    if not plans:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide 'plans' list or a 'workload_id' with registered plans.",
+        )
+
+    return analyze_pareto_frontier(plans=plans, workload_profile=profile)
+
+
+@app.post("/api/plans/what-if")
+async def simulate_what_if_endpoint(request: Request) -> dict[str, Any]:
+    """Run What-If stress scenarios (Spot preemption storm, budget shock, deadline compression)."""
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.history import get_history_store
+    from agentic_compute.pareto_optimizer import simulate_what_if_scenarios
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    workload_id = body.get("workload_id")
+    plans = body.get("plans")
+    profile = body.get("workload_profile")
+
+    if plans is None and workload_id:
+        reg = get_governance_store().list_registered_plans(workload_id)
+        plans = [r["plan"] for r in reg]
+    if profile is None and workload_id:
+        profile = get_history_store().get_workload_profile(workload_id)
+
+    if not plans:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide 'plans' list or a 'workload_id' with registered plans.",
+        )
+
+    return simulate_what_if_scenarios(
+        plans=plans,
+        workload_profile=profile,
+        forced_preemptions=int(body.get("forced_preemptions", 2)),
+        budget_shock_pct=float(body.get("budget_shock_pct", -20.0)),
+        deadline_compression_pct=float(body.get("deadline_compression_pct", -25.0)),
+    )
+
+
+@app.get("/api/workloads/{workload_id}/anomalies")
+@app.post("/api/workloads/{workload_id}/anomalies")
+async def detect_anomalies_endpoint(workload_id: str, request: Request) -> dict[str, Any]:
+    """Detect live cost burn-rate drift, zombie progress stalls, and Young-Daly checkpoint exposure."""
+    from agentic_compute.anomaly_detector import detect_workload_anomalies
+    from agentic_compute.governance import get_governance_store
+    from agentic_compute.history import get_history_store
+
+    body: dict[str, Any] = {}
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    else:
+        body = dict(request.query_params)
+
+    store = get_history_store()
+    profile = body.get("workload_profile") or store.get_workload_profile(workload_id)
+    plan = body.get("plan")
+    if plan is None:
+        reg = get_governance_store().list_registered_plans(workload_id)
+        if reg:
+            plan = reg[0]["plan"]
+
+    rec = store.get_history_record(workload_id)
+    elapsed_min = float(body.get("elapsed_minutes", rec.final_actual_duration_minutes if rec else 0.0))
+    cost_eur = float(body.get("current_cost_eur", rec.final_calculated_cost_eur if rec else 0.0))
+    progress_pct = float(body["progress_pct"]) if body.get("progress_pct") is not None else None
+    ckpt_age = (
+        float(body["minutes_since_last_checkpoint"])
+        if body.get("minutes_since_last_checkpoint") is not None
+        else None
+    )
+
+    return detect_workload_anomalies(
+        workload_id=workload_id,
+        profile=profile,
+        plan=plan,
+        elapsed_minutes=elapsed_min,
+        current_cost_eur=cost_eur,
+        progress_pct=progress_pct,
+        minutes_since_last_checkpoint=ckpt_age,
+    )
+
+
+@app.get("/api/portfolio/finops")
+def get_portfolio_finops_endpoint(limit: int = 100) -> dict[str, Any]:
+    """Compute executive FinOps, 3-tier reconciliation, Spot savings, and Carbon footprint metrics."""
+    from agentic_compute.anomaly_detector import compute_portfolio_finops_analytics
+    from agentic_compute.history import get_history_store
+
+    clamped = clamp_pagination_limit(limit)
+    store = get_history_store()
+    records = store.list_history_records(limit=clamped)
+    return compute_portfolio_finops_analytics(records=records)
+
+
+@app.post("/api/security/validate-command")
+async def validate_command_endpoint(request: Request) -> dict[str, Any]:
+    """Validate a workload command string against shell injection and decompose into safe argv."""
+    from agentic_compute.security import validate_command_safety
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    return validate_command_safety(body.get("command"))
+
+
 @app.get("/api/history")
 def get_history_endpoint(workload_id: Optional[str] = None, limit: int = 50) -> dict[str, Any]:
     """Fetch persistent execution history and cost reconciliations."""
     from agentic_compute.history import get_history_store
+    clamped_limit = clamp_pagination_limit(limit)
     store = get_history_store()
     if workload_id:
         rec = store.get_history_record(workload_id)
@@ -685,8 +832,8 @@ def get_history_endpoint(workload_id: Optional[str] = None, limit: int = 50) -> 
             raise HTTPException(status_code=404, detail=f"Workload '{workload_id}' not found")
         comp = store.reconcile_costs(workload_id)
         return {"record": rec.model_dump(), "comparison": comp}
-    records = store.list_history_records(limit=limit)
-    return {"records": [r.model_dump() for r in records]}
+    records = store.list_history_records(limit=clamped_limit)
+    return {"records": [r.model_dump() for r in records], "applied_limit": clamped_limit}
 
 
 @app.get("/api/benchmarks")

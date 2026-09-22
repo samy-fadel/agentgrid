@@ -884,6 +884,104 @@ def get_cost_history(
     return {"records": [r.model_dump() for r in records]}
 
 
+@mcp.tool()
+def analyze_pareto_frontier_tool(
+    workload_id: str | None = None,
+    plans: list[dict] | None = None,
+    workload_profile: dict | None = None,
+) -> dict:
+    """Analyze 4D Pareto Frontier dominance (Cost, Latency, Interruption Risk, Carbon gCO2eq)
+    and compute the mathematically optimal Young-Daly checkpoint interval for candidate plans.
+    """
+    from .pareto_optimizer import analyze_pareto_frontier
+
+    target_plans = plans
+    if target_plans is None and workload_id:
+        reg = get_governance_store().list_registered_plans(workload_id)
+        target_plans = [r["plan"] for r in reg]
+    if not target_plans:
+        return {
+            "status": "no_plans",
+            "reason": "Provide 'plans' or a 'workload_id' with registered plans (call compare_plans first).",
+        }
+    return analyze_pareto_frontier(plans=target_plans, workload_profile=workload_profile)
+
+
+@mcp.tool()
+def simulate_what_if_scenarios_tool(
+    workload_id: str | None = None,
+    plans: list[dict] | None = None,
+    workload_profile: dict | None = None,
+    forced_preemptions: int = 2,
+    budget_shock_pct: float = -20.0,
+    deadline_compression_pct: float = -25.0,
+) -> dict:
+    """Run deterministic What-If stress tests across execution plans:
+    1. Spot Preemption Storm (forced mid-flight preemptions with Young-Daly checkpoint recovery).
+    2. Budget Shock (e.g. -20% cut to declared budget).
+    3. Deadline Compression (e.g. -25% SLA deadline tightening).
+    """
+    from .pareto_optimizer import simulate_what_if_scenarios
+
+    target_plans = plans
+    if target_plans is None and workload_id:
+        reg = get_governance_store().list_registered_plans(workload_id)
+        target_plans = [r["plan"] for r in reg]
+    if workload_profile is None and workload_id:
+        workload_profile = _history_store.get_workload_profile(workload_id)
+    if not target_plans:
+        return {
+            "status": "no_plans",
+            "reason": "Provide 'plans' or a 'workload_id' with registered plans.",
+        }
+    return simulate_what_if_scenarios(
+        plans=target_plans,
+        workload_profile=workload_profile,
+        forced_preemptions=forced_preemptions,
+        budget_shock_pct=budget_shock_pct,
+        deadline_compression_pct=deadline_compression_pct,
+    )
+
+
+@mcp.tool()
+def detect_workload_anomalies_tool(
+    workload_id: str,
+    elapsed_minutes: float = 0.0,
+    current_cost_eur: float = 0.0,
+    progress_pct: float | None = None,
+    minutes_since_last_checkpoint: float | None = None,
+) -> dict:
+    """Detect live cost burn-rate drift, projected budget breach, throughput stalls (zombie compute),
+    and Young-Daly checkpoint exposure windows for a running workload.
+    """
+    from .anomaly_detector import detect_workload_anomalies
+
+    profile = _history_store.get_workload_profile(workload_id)
+    reg = get_governance_store().list_registered_plans(workload_id)
+    plan = reg[0]["plan"] if reg else None
+    return detect_workload_anomalies(
+        workload_id=workload_id,
+        profile=profile,
+        plan=plan,
+        elapsed_minutes=elapsed_minutes,
+        current_cost_eur=current_cost_eur,
+        progress_pct=progress_pct,
+        minutes_since_last_checkpoint=minutes_since_last_checkpoint,
+    )
+
+
+@mcp.tool()
+def get_portfolio_finops_tool(limit: int = 100) -> dict:
+    """Compute fleet-wide FinOps, 3-tier reconciliation totals, Spot savings vs Standard baseline,
+    and regional Carbon footprint metrics across all tracked workloads.
+    """
+    from .anomaly_detector import compute_portfolio_finops_analytics
+    from .security import clamp_pagination_limit
+
+    records = _history_store.list_history_records(limit=clamp_pagination_limit(limit))
+    return compute_portfolio_finops_analytics(records=records)
+
+
 # Expose ASGI application for Uvicorn / Cloud Run
 app = mcp.sse_app()
 

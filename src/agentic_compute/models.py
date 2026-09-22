@@ -276,6 +276,21 @@ class ExecutionPlan(BaseModel):
     fallback_plan_id: str | None = None
     fallback_chain: list[str] = Field(default_factory=list)
 
+    # 4D Pareto Frontier, Regional Carbon Telemetry & Young-Daly Resilience
+    carbon_emissions_g_co2: float = 0.0
+    energy_kwh: float = 0.0
+    carbon_intensity_g_per_kwh: float = 0.0
+    green_tier: str = "MODERATE_CARBON"
+    young_daly_optimal_checkpoint_minutes: float | None = None
+    expected_cost_with_preemption_eur: float | None = None
+    interruption_risk_score: float = 0.0
+    is_pareto_optimal: bool = True
+    pareto_rank: int = 1
+    utility_scores: dict[str, float] = Field(default_factory=dict)
+    carbon_metrics: dict[str, Any] = Field(default_factory=dict)
+    resilience_metrics: dict[str, Any] = Field(default_factory=dict)
+
+
 
 class DelegationPolicy(BaseModel):
     """Operator-defined guardrail policy for delegated execution mode."""

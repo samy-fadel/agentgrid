@@ -114,8 +114,15 @@ You access compute infrastructure only through MCP tools across 6 core capabilit
 5. Lifecycle Tracking & Resumption (track_workload_lifecycle):
    - Separate compute identity (workload_id) from attempts (attempt_id).
    - Checkpoint resume for interruptible workloads; reject checkpoint resume for non-interruptible workloads.
-6. Cost Reconciliation & Persistent History (get_cost_history):
+6. Cost Reconciliation & Persistent History (get_cost_history, get_portfolio_finops_tool):
    - Clearly distinguish 3-tier costs: estimated, calculated from usage, and reconciled billed figures.
+   - Use get_portfolio_finops_tool to summarize fleet-wide Spot savings, SLA compliance rates, and regional carbon emissions.
+7. 4D Pareto Frontier, Carbon Telemetry & What-If Stress Testing (analyze_pareto_frontier_tool, simulate_what_if_scenarios_tool):
+   - Evaluate candidate plans across 4 objectives: Cost (EUR), Latency (minutes), Interruption Risk, and Carbon Emissions (gCO2eq / kWh).
+   - Compute Young-Daly optimal checkpoint intervals (tau_opt = sqrt(2 * C * MTBI) - C) and expected total cost under Spot preemption.
+   - Use simulate_what_if_scenarios_tool to stress-test plans against mid-flight Spot preemption storms, budget shocks (-20%), and deadline compressions (-25%).
+8. Live Burn-Rate Drift & Zombie Stall Detection (detect_workload_anomalies_tool):
+   - Continuously monitor active workloads for cost burn-rate drift, projected budget breaches, progress stalls, and uncommitted checkpoint exposure windows.
 
 Never assume the underlying runtime is a simulator, Slurm, Ray, or Kubernetes.
 

@@ -1476,7 +1476,14 @@
                             : "border-slate-800 bg-slate-950/60"
                         }`}
                       >
-                        <div className="text-xs uppercase tracking-wider text-cyan-300">{plan.plan_type}</div>
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs uppercase tracking-wider text-cyan-300">{plan.plan_type}</div>
+                          {plan.is_pareto_optimal && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950/90 text-emerald-300 border border-emerald-700/60 font-mono">
+                              ★ Pareto Optimal
+                            </span>
+                          )}
+                        </div>
                         <div className="text-sm font-semibold text-slate-100">{plan.title}</div>
                         <div className="text-xs text-slate-400 font-mono">{plan.plan_id}</div>
                         <dl className="text-xs text-slate-300 space-y-1 pt-2">
@@ -1484,6 +1491,12 @@
                             <dt>Coût estimé</dt>
                             <dd className="font-mono text-cyan-300">{fmt(plan.estimated_cost_eur, 2)} €</dd>
                           </div>
+                          {plan.expected_cost_with_preemption_eur !== undefined && plan.expected_cost_with_preemption_eur !== null && (
+                            <div className="flex justify-between">
+                              <dt title="Coût espéré incluant le surcoût de préemption Spot (modèle Young-Daly)">Coût espéré (Spot/Reprise)</dt>
+                              <dd className="font-mono text-sky-300">{fmt(plan.expected_cost_with_preemption_eur, 2)} €</dd>
+                            </div>
+                          )}
                           <div className="flex justify-between">
                             <dt>Délai total</dt>
                             <dd className="font-mono">{fmt(plan.total_time_to_result_minutes, 1)} min</dd>
@@ -1496,6 +1509,20 @@
                             <dt>Approvisionnement</dt>
                             <dd className="font-mono">{plan.provisioning_model}</dd>
                           </div>
+                          {plan.carbon_emissions_g_co2 !== undefined && (
+                            <div className="flex justify-between">
+                              <dt>Empreinte Carbone</dt>
+                              <dd className={`font-mono ${plan.green_tier === "LOW_CARBON" ? "text-emerald-300" : plan.green_tier === "HIGH_CARBON" ? "text-amber-300" : "text-slate-200"}`}>
+                                {fmt(plan.carbon_emissions_g_co2, 1)} gCO₂ ({fmt(plan.energy_kwh, 3)} kWh)
+                              </dd>
+                            </div>
+                          )}
+                          {plan.young_daly_optimal_checkpoint_minutes && (
+                            <div className="flex justify-between">
+                              <dt>Checkpoint Young-Daly</dt>
+                              <dd className="font-mono text-cyan-300">t_opt = {fmt(plan.young_daly_optimal_checkpoint_minutes, 1)} min</dd>
+                            </div>
+                          )}
                           {plan.cost_basis && (
                             <div className="flex justify-between">
                               <dt>Base de coût</dt>
@@ -1562,6 +1589,42 @@
                       </div>
                     ))}
                   </div>
+
+                  {planComparison.what_if_summary && Array.isArray(planComparison.what_if_summary.plan_stress_results) && (
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 space-y-2 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold uppercase tracking-wider text-cyan-300">
+                          Simulateur de Stress What-If (Tempête Spot 2x · Choc Budget -20% · Compression SLA -25%)
+                        </span>
+                        {planComparison.what_if_summary.most_resilient_plan_id && (
+                          <span className="font-mono text-emerald-300">
+                            Plus résilient : {planComparison.what_if_summary.most_resilient_plan_id}
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-1">
+                        {planComparison.what_if_summary.plan_stress_results.map((sr) => (
+                          <div key={sr.plan_id} className="rounded-lg border border-slate-800/80 bg-slate-900/60 p-2.5 space-y-1">
+                            <div className="flex items-center justify-between font-mono">
+                              <span className="text-slate-200 font-semibold truncate">{sr.plan_id}</span>
+                              <span className={sr.resilience_verdict === "HIGHLY_RESILIENT" ? "text-emerald-400" : sr.resilience_verdict === "MODERATELY_RESILIENT" ? "text-amber-300" : "text-rose-400"}>
+                                {sr.resilience_verdict}
+                              </span>
+                            </div>
+                            <div className="text-slate-400 font-mono text-[11px]">
+                              Tempête Spot (2x) : {fmt(sr.spot_storm_scenario.storm_cost_eur, 2)} € · {fmt(sr.spot_storm_scenario.storm_duration_minutes, 1)}m{" "}
+                              {sr.spot_storm_scenario.survives ? "✓" : "✗"}
+                            </div>
+                            {Array.isArray(sr.mitigation_recommendations) && sr.mitigation_recommendations.length > 0 && (
+                              <div className="text-[11px] text-amber-200/90 pt-0.5">
+                                💡 {sr.mitigation_recommendations[0]}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   {fallbackVerdict && (
                     <div

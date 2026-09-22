@@ -358,10 +358,33 @@ class ExecutionController:
         workload_id = p_profile.workload_id
         command = p_profile.command or p_profile.script
 
+        # 0. Validate command argument safety (prevent shell injection on execution path).
+        from .security import validate_command_safety
+
+        cmd_safety = validate_command_safety(p_profile.command)
+        if not cmd_safety["is_safe"]:
+            mode, _, mode_source = self.resolve_control(
+                workload_id, requested_mode=control_mode, requested_policy=delegation_policy
+            )
+            return {
+                "status": "blocked",
+                "control_mode": mode,
+                "control_mode_source": mode_source,
+                "reason": f"Execution blocked by security policy: {cmd_safety['reason']}",
+                "violated_constraint": "command_security",
+                "command_security_status": cmd_safety["status"],
+                "blocked_patterns": cmd_safety["blocked_patterns"],
+                "plan_id": p_plan.plan_id,
+                "workload_id": workload_id,
+                "job_id": None,
+                "verified": False,
+            }
+
         # 1. Resolve the governing mode/policy from the server.
         mode, policy, mode_source = self.resolve_control(
             workload_id, requested_mode=control_mode, requested_policy=delegation_policy
         )
+
 
         # 2. Authorise this exact plan.
         allowed, reason = self.evaluate_control_gate(
@@ -625,6 +648,8 @@ class ExecutionController:
             "verified": verified,
             "verification_details": verification_details,
             "submission_details": submission_details,
+            "command_security_status": cmd_safety["status"],
+            "safe_argv": cmd_safety["safe_argv"],
         }
 
     def _invoke_submit(
