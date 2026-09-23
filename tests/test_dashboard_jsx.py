@@ -392,8 +392,8 @@ def test_what_if_sliders_send_the_operator_shock_parameters():
     ):
         assert setter in html, f"missing slider wiring: {setter}"
     # A live run must be distinguishable from the seeded default run.
-    assert "scénario opérateur" in html
-    assert "scénario par défaut" in html
+    assert "operator scenario" in html
+    assert "default scenario" in html
 
 
 def test_what_if_panel_reads_every_scenario_the_simulator_returns():
@@ -436,11 +436,11 @@ def test_execution_opens_an_impact_preview_before_submitting():
 def test_impact_preview_states_the_server_enforced_envelope():
     """The preview must show the mode and approval the server holds."""
     html = DEFAULT_TARGET.read_text(encoding="utf-8")
-    assert "Mode appliqué par le serveur" in html
-    assert "Approbation enregistrée" in html
+    assert "Server-applied mode" in html
+    assert "Approval recorded" in html
     assert "remaining_delegated_budget_eur" in html
     # And it must not claim to be the gate.
-    assert "Le serveur revérifiera" in html
+    assert "The server will re-check" in html
 
 
 # ---------------------------------------------------------------------------
@@ -572,16 +572,16 @@ def _live_seeds() -> dict:
 
 
 _POPULATED_MARKERS = {
-    "mission": ["Santé du workload en direct", "CRITICAL_DRIFT", "Young-Daly"],
-    "plans": ["Frontière de Pareto 4D", "Simulateur de stress What-If", "scénario opérateur"],
-    "capacity": ["Recherche de capacité compatible"],
-    "diagnostics": ["Diagnostic des blocages"],
-    "history": ["Coûts réels"],
+    "mission": ["Live workload health", "CRITICAL_DRIFT", "Young-Daly"],
+    "plans": ["4D Pareto frontier", "What-If stress simulator", "operator scenario"],
+    "capacity": ["Compatible capacity search"],
+    "diagnostics": ["Blocker diagnostics"],
+    "history": ["Actual costs"],
     "finops": [
-        "Portefeuille FinOps",
-        "Réconciliation financière à 3 tiers",
-        "Bilan carbone et routage vert",
-        "Répartition des modes de gouvernance",
+        "GreenOps portfolio",
+        "3-tier financial reconciliation",
+        "Carbon balance and green routing",
+        "Governance mode distribution",
     ],
 }
 
@@ -601,7 +601,7 @@ def test_populated_panels_render_without_error():
         for marker in markers:
             if marker not in text:
                 problems.append(f"[{tab}] expected {marker!r} in the rendered output")
-        if "Prévisualisation d'impact" not in text:
+        if "Impact preview" not in text:
             problems.append(f"[{tab}] the impact preview modal did not render")
         # A NaN in a coordinate or a figure is a rendered defect, not a warning.
         if "NaN" in text:

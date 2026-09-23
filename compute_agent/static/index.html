@@ -224,7 +224,7 @@
               fontSize="11"
               fill="#94a3b8"
             >
-              Temps jusqu'au résultat (min)
+              Time to result (min)
             </text>
             <text
               x={14}
@@ -234,7 +234,7 @@
               fill="#94a3b8"
               transform={`rotate(-90 14 ${M.top + ih / 2})`}
             >
-              Coût estimé (€)
+              Estimated cost (€)
             </text>
 
             {/* Pareto frontier polyline */}
@@ -250,7 +250,7 @@
               return (
                 <g key={p.plan_id} onClick={() => onSelect && onSelect(p.plan_id)} style={{ cursor: "pointer" }}>
                   <title>
-                    {`${p.title || p.plan_id}\n${fmtNum(costOf(p), 2)} € · ${fmtNum(timeOf(p), 1)} min\nRisque Spot : ${(num(p.interruption_risk_score) * 100).toFixed(0)}%\nCarbone : ${fmtNum(p.carbon_emissions_g_co2, 1)} gCO₂ (${p.green_tier || "n/a"})`}
+                    {`${p.title || p.plan_id}\n${fmtNum(costOf(p), 2)} € · ${fmtNum(timeOf(p), 1)} min\nSpot risk: ${(num(p.interruption_risk_score) * 100).toFixed(0)}%\nCarbon: ${fmtNum(p.carbon_emissions_g_co2, 1)} gCO₂ (${p.green_tier || "n/a"})`}
                   </title>
                   {isSel && (
                     <circle cx={cx} cy={cy} r={radiusOf(p) + 6} fill="none" stroke="#f1f5f9" strokeWidth="1.5" opacity="0.8" />
@@ -278,18 +278,18 @@
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-slate-400">
             <span className="flex items-center gap-1.5">
               <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400/60 border border-emerald-400" />
-              Faible carbone
+              Low carbon
             </span>
             <span className="flex items-center gap-1.5">
               <span className="inline-block w-2.5 h-2.5 rounded-full bg-sky-400/60 border border-sky-400" />
-              Carbone modéré
+              Moderate carbon
             </span>
             <span className="flex items-center gap-1.5">
               <span className="inline-block w-2.5 h-2.5 rounded-full bg-orange-400/60 border border-orange-400" />
-              Carbone élevé
+              High carbon
             </span>
-            <span>★ = non dominé (frontière de Pareto)</span>
-            <span>Rayon de la bulle ∝ risque de préemption Spot</span>
+            <span>★ = non-dominated (Pareto frontier)</span>
+            <span>Bubble radius ∝ Spot preemption risk</span>
           </div>
         </div>
       );
@@ -744,7 +744,7 @@
       const runWhatIf = async (plansOverride) => {
         const plans = plansOverride || (planComparison && planComparison.plans) || [];
         if (plans.length === 0) {
-          setWhatIfError("Comparez d'abord des plans : aucun plan à mettre sous stress.");
+          setWhatIfError("Compare plans first: there is no plan to stress-test.");
           setWhatIfResult(null);
           return;
         }
@@ -1053,7 +1053,7 @@
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
                 }`}
               >
-                <span>⚡ Mission & Exécution</span>
+                <span>⚡ Mission & Execution</span>
               </button>
               <button
                 onClick={() => setActiveTab("plans")}
@@ -1063,7 +1063,7 @@
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
                 }`}
               >
-                <span>📊 Comparaison de Plans</span>
+                <span>📊 Plan Comparison</span>
               </button>
               <button
                 onClick={() => setActiveTab("capacity")}
@@ -1073,7 +1073,7 @@
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
                 }`}
               >
-                <span>🌐 Recherche de Capacité (4 Paliers)</span>
+                <span>🌐 Capacity Search (4 Tiers)</span>
               </button>
               <button
                 onClick={() => setActiveTab("diagnostics")}
@@ -1083,7 +1083,7 @@
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
                 }`}
               >
-                <span>🔍 Diagnostic Blocages</span>
+                <span>🔍 Blocker Diagnostics</span>
               </button>
               <button
                 onClick={() => setActiveTab("history")}
@@ -1093,7 +1093,7 @@
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
                 }`}
               >
-                <span>📈 Coûts Réels & Historique</span>
+                <span>📈 Actual Costs & History</span>
               </button>
               <button
                 onClick={() => setActiveTab("finops")}
@@ -1109,7 +1109,7 @@
 
             {/* Operator Control Mode Selector */}
             <div className="flex items-center space-x-2 bg-slate-950/80 border border-slate-800 rounded-lg px-2.5 py-1.5 self-start md:self-auto">
-              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Mode de contrôle :</span>
+              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Control mode:</span>
               <div className="flex items-center space-x-1">
                 <button
                   onClick={() => applyControlMode("advisory")}
@@ -1118,7 +1118,7 @@
                       ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
                       : "text-slate-400 hover:text-slate-200"
                   }`}
-                  title="Advisory: Lecture seule, aucune mutation permise"
+                  title="Advisory: read-only, no mutation permitted"
                 >
                   Advisory
                 </button>
@@ -1129,7 +1129,7 @@
                       ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
                       : "text-slate-400 hover:text-slate-200"
                   }`}
-                  title="Validation: Approbation humaine explicite requise pour chaque plan"
+                  title="Validation: explicit human approval required for every plan"
                 >
                   Validation
                 </button>
@@ -1140,9 +1140,9 @@
                       ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
                       : "text-slate-400 hover:text-slate-200"
                   }`}
-                  title="Delegation: Exécution autonome sous politique de garde-fous"
+                  title="Delegation: autonomous execution under a guardrail policy"
                 >
-                  Délégation
+                  Delegation
                 </button>
               </div>
               {/* A ceiling means nothing without the spend already charged
@@ -1151,20 +1151,20 @@
               {serverControl && serverControl.control_mode === "delegation" && (
                 <div className="pl-2 ml-1 border-l border-slate-800 text-[11px] leading-tight">
                   <div className="text-slate-400">
-                    Engagé :{" "}
+                    Committed:{" "}
                     <span className="font-mono text-slate-200">
                       {Number(serverControl.committed_cost_eur ?? 0).toFixed(2)} €
                     </span>
                   </div>
                   <div className="text-slate-400">
-                    Reste :{" "}
+                    Remaining:{" "}
                     <span className="font-mono text-emerald-300">
                       {Number(serverControl.remaining_delegated_budget_eur ?? 0).toFixed(2)} €
                     </span>
                   </div>
                   {serverControl.unpriced_prior_submissions > 0 && (
                     <div className="text-amber-400">
-                      {serverControl.unpriced_prior_submissions} soumission(s) sans coût connu
+                      {serverControl.unpriced_prior_submissions} submission(s) with no known cost
                     </div>
                   )}
                 </div>
@@ -1267,7 +1267,7 @@
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
                   <PulseIcon />
-                  <span>Santé du workload en direct</span>
+                  <span>Live workload health</span>
                   {anomalyReport && (
                     <span
                       className={`text-[11px] px-2 py-0.5 rounded-full font-mono border ${
@@ -1287,17 +1287,17 @@
                   disabled={loadingAnomalies}
                   className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                 >
-                  {loadingAnomalies ? "Analyse…" : "Réévaluer la dérive"}
+                  {loadingAnomalies ? "Analyzing…" : "Re-evaluate drift"}
                 </button>
               </div>
 
               {loadingAnomalies && (
-                <div className="text-sm text-slate-400 py-4 text-center">Analyse de la télémétrie…</div>
+                <div className="text-sm text-slate-400 py-4 text-center">Analyzing telemetry…</div>
               )}
 
               {!loadingAnomalies && anomaliesError && (
                 <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
-                  <div className="font-semibold mb-1">Détection d'anomalies indisponible</div>
+                  <div className="font-semibold mb-1">Anomaly detection unavailable</div>
                   <div className="font-mono break-words">{anomaliesError}</div>
                 </div>
               )}
@@ -1308,7 +1308,7 @@
                       progress lag, and unsaved work exposed to preemption. */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <DriftGauge
-                      label="Taux de consommation"
+                      label="Burn rate"
                       value={anomalyReport.telemetry.actual_burn_rate_eur_hr}
                       max={Math.max(
                         num(anomalyReport.telemetry.planned_burn_rate_eur_hr) * 2,
@@ -1322,12 +1322,12 @@
                           ? "warn"
                           : "ok"
                       }
-                      caption={`Plan : ${fmt(anomalyReport.telemetry.planned_burn_rate_eur_hr, 2)} €/h · dérive ${
+                      caption={`Plan: ${fmt(anomalyReport.telemetry.planned_burn_rate_eur_hr, 2)} €/h · drift ${
                         num(anomalyReport.telemetry.burn_rate_drift_pct) >= 0 ? "+" : ""
                       }${fmt(anomalyReport.telemetry.burn_rate_drift_pct, 1)} %`}
                     />
                     <DriftGauge
-                      label="Coût final projeté"
+                      label="Projected final cost"
                       value={anomalyReport.telemetry.projected_total_cost_eur}
                       max={Math.max(num(budget), num(anomalyReport.telemetry.projected_total_cost_eur))}
                       unit="€"
@@ -1338,10 +1338,10 @@
                           ? "warn"
                           : "ok"
                       }
-                      caption={`Plafond déclaré : ${fmt(budget, 2)} €`}
+                      caption={`Declared cap: ${fmt(budget, 2)} €`}
                     />
                     <DriftGauge
-                      label="Avancement observé"
+                      label="Observed progress"
                       value={anomalyReport.telemetry.actual_progress_pct}
                       max={100}
                       unit="%"
@@ -1352,13 +1352,13 @@
                           ? "danger"
                           : "ok"
                       }
-                      caption={`Attendu à cet instant : ${fmt(
+                      caption={`Expected at this point: ${fmt(
                         anomalyReport.telemetry.expected_progress_pct,
                         1
                       )} %`}
                     />
                     <DriftGauge
-                      label="Travail non sauvegardé"
+                      label="Unsaved work"
                       value={anomalyReport.telemetry.uncommitted_minutes_at_risk}
                       max={Math.max(
                         num(anomalyReport.telemetry.young_daly_optimal_checkpoint_minutes) * 2,
@@ -1371,20 +1371,20 @@
                           ? "danger"
                           : "ok"
                       }
-                      caption={`Optimum Young-Daly : ${fmt(
+                      caption={`Young-Daly optimum: ${fmt(
                         anomalyReport.telemetry.young_daly_optimal_checkpoint_minutes,
                         1
                       )} min · ${fmt(
                         anomalyReport.telemetry.uncommitted_cost_at_risk_eur,
                         3
-                      )} € exposés à une préemption`}
+                      )} € exposed to a preemption`}
                     />
                   </div>
 
                   {anomalyReport.anomaly_count === 0 && (
                     <div className="text-xs text-emerald-300/90 flex items-center gap-1.5">
                       <CheckCircleIcon />
-                      Aucune anomalie : trajectoire de coût, de progression et de checkpoint conformes au plan.
+                      No anomaly: cost, progress and checkpoint trajectories all match the plan.
                     </div>
                   )}
 
@@ -1407,7 +1407,7 @@
                       </div>
                       <div className="text-slate-300/90">{a.observed_facts}</div>
                       <div className="text-slate-400">
-                        <span className="uppercase tracking-wider text-[10px]">Action recommandée : </span>
+                        <span className="uppercase tracking-wider text-[10px]">Recommended action: </span>
                         {a.recommended_action}
                       </div>
                       <div className="font-mono text-[10px] text-slate-500">{a.code}</div>
@@ -1687,8 +1687,8 @@
                 <div className="space-y-2">
                   {capacityAdvice && capacityAdvice.status === 'unavailable' ? (
                     <div className="bg-slate-950 border border-rose-900/40 rounded-lg p-3 text-xs font-mono text-center space-y-1">
-                      <div className="text-rose-400 font-semibold">GCP Capacity Advisor Indisponible</div>
-                      <div className="text-slate-400 text-[11px]">{capacityAdvice.error || 'Connexion API GCP non disponible en mode hors-ligne.'}</div>
+                      <div className="text-rose-400 font-semibold">GCP Capacity Advisor Unavailable</div>
+                      <div className="text-slate-400 text-[11px]">{capacityAdvice.error || 'GCP API connection not available in offline mode.'}</div>
                     </div>
                   ) : capacityAdvice && (capacityAdvice.machine_types && capacityAdvice.machine_types.length > 0 || capacityAdvice.recommendations && capacityAdvice.recommendations.length > 0) ? (
                     (capacityAdvice.machine_types || capacityAdvice.recommendations).map((m) => (
@@ -1938,46 +1938,46 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-                  Comparaison de plans — coût, délai, capacité
+                  Plan comparison — cost, latency, capacity
                 </h2>
                 <button
                   onClick={fetchPlanComparison}
                   disabled={loadingPlans}
                   className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                 >
-                  {loadingPlans ? "Calcul en cours…" : "Recalculer avec les paramètres actuels"}
+                  {loadingPlans ? "Computing…" : "Recompute with current parameters"}
                 </button>
               </div>
 
               <p className="text-xs text-slate-400">
-                Budget <span className="text-cyan-300 font-mono">{budget} €</span>, délai{" "}
+                Budget <span className="text-cyan-300 font-mono">{budget} €</span>, deadline{" "}
                 <span className="text-cyan-300 font-mono">{deadline} min</span>, {cpuRequested} vCPU,{" "}
-                {memoryGbRequested} Go. Mode appliqué par le serveur :{" "}
+                {memoryGbRequested} GB. Server-applied mode:{" "}
                 <span className="text-amber-300 font-mono">
                   {serverControl ? serverControl.control_mode : "…"}
                 </span>
               </p>
 
               {loadingPlans && (
-                <div className="text-sm text-slate-400 py-8 text-center">Évaluation des plans…</div>
+                <div className="text-sm text-slate-400 py-8 text-center">Evaluating plans…</div>
               )}
 
               {!loadingPlans && planError && (
                 <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
-                  <div className="font-semibold mb-1">Comparaison indisponible</div>
+                  <div className="font-semibold mb-1">Comparison unavailable</div>
                   <div className="font-mono text-xs break-words">{planError}</div>
                 </div>
               )}
 
               {!loadingPlans && !planError && planComparison && !planComparison.is_feasible && (
                 <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-100 space-y-2">
-                  <div className="font-semibold">Aucun plan compatible avec les contraintes déclarées</div>
+                  <div className="font-semibold">No plan satisfies the declared constraints</div>
                   {(planComparison.blocking_constraints || []).map((b, i) => (
                     <div key={i} className="text-xs font-mono">• {typeof b === "string" ? b : JSON.stringify(b)}</div>
                   ))}
                   {(planComparison.suggested_relaxations || []).length > 0 && (
                     <div className="pt-2">
-                      <div className="font-semibold text-xs uppercase tracking-wider">Assouplissements possibles</div>
+                      <div className="font-semibold text-xs uppercase tracking-wider">Possible relaxations</div>
                       {planComparison.suggested_relaxations.map((r, i) => (
                         <div key={i} className="text-xs font-mono">• {typeof r === "string" ? r : JSON.stringify(r)}</div>
                       ))}
@@ -1990,7 +1990,7 @@
                 <div className="space-y-3">
                   {approvalError && (
                     <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
-                      Approbation refusée : <span className="font-mono">{approvalError}</span>
+                      Approval refused: <span className="font-mono">{approvalError}</span>
                     </div>
                   )}
                   {executionResult && (
@@ -2012,11 +2012,11 @@
                         <div className="font-mono">attempt_id : {executionResult.attempt_id}</div>
                       )}
                       {executionResult.control_mode && (
-                        <div className="font-mono">mode appliqué : {executionResult.control_mode}</div>
+                        <div className="font-mono">applied mode: {executionResult.control_mode}</div>
                       )}
                       {executionResult.history_linked === false && (
                         <div className="text-rose-300 font-mono mt-1">
-                          suivi non relié à l'historique : {executionResult.history_link_error}
+                          tracking not linked to history: {executionResult.history_link_error}
                         </div>
                       )}
                     </div>
@@ -2029,11 +2029,11 @@
                   <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                        Frontière de Pareto 4D — coût × temps × risque Spot × carbone
+                        4D Pareto frontier — cost × time × Spot risk × carbon
                       </h3>
                       {planComparison.pareto_frontier && (
                         <span className="text-[11px] font-mono text-slate-400">
-                          {planComparison.pareto_frontier.pareto_optimal_count} non dominé(s) sur{" "}
+                          {planComparison.pareto_frontier.pareto_optimal_count} non-dominated out of{" "}
                           {planComparison.pareto_frontier.total_evaluated}
                         </span>
                       )}
@@ -2049,11 +2049,11 @@
                       planComparison.pareto_frontier.recommendations_by_objective && (
                         <div className="grid grid-cols-2 md:grid-cols-5 gap-2 pt-2 border-t border-slate-800">
                           {[
-                            ["min_cost", "Coût minimal"],
-                            ["min_latency", "Plus rapide"],
-                            ["max_resilience", "Plus résilient"],
-                            ["min_carbon", "Plus sobre"],
-                            ["balanced_utility", "Meilleur compromis"],
+                            ["min_cost", "Lowest cost"],
+                            ["min_latency", "Fastest"],
+                            ["max_resilience", "Most resilient"],
+                            ["min_carbon", "Greenest"],
+                            ["balanced_utility", "Best trade-off"],
                           ].map(([key, label]) => {
                             const pid =
                               planComparison.pareto_frontier.recommendations_by_objective[key];
@@ -2104,17 +2104,17 @@
                         <div className="text-xs text-slate-400 font-mono">{plan.plan_id}</div>
                         <dl className="text-xs text-slate-300 space-y-1 pt-2">
                           <div className="flex justify-between">
-                            <dt>Coût estimé</dt>
+                            <dt>Estimated cost</dt>
                             <dd className="font-mono text-cyan-300">{fmt(plan.estimated_cost_eur, 2)} €</dd>
                           </div>
                           {plan.expected_cost_with_preemption_eur !== undefined && plan.expected_cost_with_preemption_eur !== null && (
                             <div className="flex justify-between">
-                              <dt title="Coût espéré incluant le surcoût de préemption Spot (modèle Young-Daly)">Coût espéré (Spot/Reprise)</dt>
+                              <dt title="Expected cost including Spot preemption overhead (Young-Daly model)">Expected cost (Spot/restart)</dt>
                               <dd className="font-mono text-sky-300">{fmt(plan.expected_cost_with_preemption_eur, 2)} €</dd>
                             </div>
                           )}
                           <div className="flex justify-between">
-                            <dt>Délai total</dt>
+                            <dt>Total latency</dt>
                             <dd className="font-mono">{fmt(plan.total_time_to_result_minutes, 1)} min</dd>
                           </div>
                           <div className="flex justify-between">
@@ -2127,7 +2127,7 @@
                           </div>
                           {plan.carbon_emissions_g_co2 !== undefined && (
                             <div className="flex justify-between">
-                              <dt>Empreinte Carbone</dt>
+                              <dt>Carbon footprint</dt>
                               <dd className={`font-mono ${plan.green_tier === "LOW_CARBON" ? "text-emerald-300" : plan.green_tier === "HIGH_CARBON" ? "text-amber-300" : "text-slate-200"}`}>
                                 {fmt(plan.carbon_emissions_g_co2, 1)} gCO₂ ({fmt(plan.energy_kwh, 3)} kWh)
                               </dd>
@@ -2141,12 +2141,12 @@
                           )}
                           {plan.cost_basis && (
                             <div className="flex justify-between">
-                              <dt>Base de coût</dt>
+                              <dt>Cost basis</dt>
                               <dd className="font-mono text-amber-300">{plan.cost_basis}</dd>
                             </div>
                           )}
                           <div className="flex justify-between">
-                            <dt>Capacité</dt>
+                            <dt>Capacity</dt>
                             <dd
                               className={`font-mono ${
                                 plan.capacity_status === "QUOTA_AVAILABLE"
@@ -2155,7 +2155,7 @@
                                   ? "text-rose-300"
                                   : "text-slate-400"
                               }`}
-                              title={plan.capacity_detail || "Aucun quota consulté pour ce plan."}
+                              title={plan.capacity_detail || "No quota was checked for this plan."}
                             >
                               {plan.capacity_status || "NOT_CHECKED"}
                             </dd>
@@ -2169,8 +2169,8 @@
                         {(plan.capacity_status === "QUOTA_UNKNOWN" ||
                           plan.capacity_status === "NOT_CHECKED") && (
                           <p className="text-xs text-slate-500 pt-1">
-                            Quota non vérifié pour ce plan — ce n'est pas une garantie de
-                            disponibilité.
+                            Quota not verified for this plan — this is not a guarantee of
+                            availability.
                           </p>
                         )}
                         <p className="text-xs text-slate-400 pt-1">{plan.ranking_rationale}</p>
@@ -2181,27 +2181,27 @@
                             className="flex-1 px-2 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                           >
                             {approvedPlanId === plan.plan_id
-                              ? "✓ Approuvé"
+                              ? "✓ Approved"
                               : approvingPlanId === plan.plan_id
-                              ? "Envoi…"
-                              : "Approuver"}
+                              ? "Sending…"
+                              : "Approve"}
                           </button>
                           <button
                             onClick={() => setPendingExecution(plan)}
                             disabled={executingPlanId === plan.plan_id}
                             className="flex-1 px-2 py-1.5 text-xs rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 disabled:opacity-50"
-                            title="Ouvre un récapitulatif d'impact ; rien n'est soumis avant confirmation."
+                            title="Opens an impact summary; nothing is submitted before confirmation."
                           >
-                            {executingPlanId === plan.plan_id ? "Soumission…" : "Exécuter…"}
+                            {executingPlanId === plan.plan_id ? "Submitting…" : "Execute…"}
                           </button>
                         </div>
                         <button
                           onClick={() => handleProposeFallback(plan)}
                           disabled={fallbackPlanId === plan.plan_id}
                           className="w-full px-2 py-1.5 text-xs rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-50"
-                          title="Demande au serveur quel plan de repli est autorisé si celui-ci échoue. N'exécute rien."
+                          title="Asks the server which fallback plan is allowed if this one fails. Executes nothing."
                         >
-                          {fallbackPlanId === plan.plan_id ? "Évaluation…" : "Proposer un repli"}
+                          {fallbackPlanId === plan.plan_id ? "Evaluating…" : "Propose a fallback"}
                         </button>
                       </div>
                     ))}
@@ -2237,7 +2237,7 @@
                       <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 space-y-3 text-xs">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <span className="font-semibold uppercase tracking-wider text-cyan-300">
-                            Simulateur de stress What-If
+                            What-If stress simulator
                           </span>
                           <div className="flex items-center gap-2">
                             <span
@@ -2247,11 +2247,11 @@
                                   : "bg-slate-900 text-slate-400 border-slate-700"
                               }`}
                             >
-                              {isLive ? "scénario opérateur" : "scénario par défaut"}
+                              {isLive ? "operator scenario" : "default scenario"}
                             </span>
                             {wi.most_resilient_plan_id && (
                               <span className="font-mono text-emerald-300">
-                                Plus résilient : {wi.most_resilient_plan_id}
+                                Most resilient: {wi.most_resilient_plan_id}
                               </span>
                             )}
                           </div>
@@ -2261,7 +2261,7 @@
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-1 pb-2 border-y border-slate-800 py-3">
                           <div className="space-y-1">
                             <div className="flex justify-between">
-                              <span className="text-slate-400">Tempête Spot (préemptions forcées)</span>
+                              <span className="text-slate-400">Spot storm (forced preemptions)</span>
                               <span className="text-cyan-400 font-mono font-medium">
                                 {whatIfPreemptions}×
                               </span>
@@ -2279,7 +2279,7 @@
 
                           <div className="space-y-1">
                             <div className="flex justify-between">
-                              <span className="text-slate-400">Choc budgétaire</span>
+                              <span className="text-slate-400">Budget shock</span>
                               <span className="text-cyan-400 font-mono font-medium">
                                 {whatIfBudgetShock} %
                               </span>
@@ -2297,7 +2297,7 @@
 
                           <div className="space-y-1">
                             <div className="flex justify-between">
-                              <span className="text-slate-400">Compression de deadline</span>
+                              <span className="text-slate-400">Deadline compression</span>
                               <span className="text-cyan-400 font-mono font-medium">
                                 {whatIfDeadlineCompression} %
                               </span>
@@ -2318,18 +2318,18 @@
                           <span className="text-slate-500 text-[11px]">
                             {wi.parameters && (
                               <>
-                                Budget choqué :{" "}
+                                Shocked budget:{" "}
                                 <span className="font-mono text-slate-300">
                                   {wi.parameters.shocked_budget_eur === null ||
                                   wi.parameters.shocked_budget_eur === undefined
-                                    ? "non déclaré"
+                                    ? "not declared"
                                     : fmt(wi.parameters.shocked_budget_eur, 2) + " €"}
                                 </span>{" "}
-                                · Deadline comprimée :{" "}
+                                · Compressed deadline:{" "}
                                 <span className="font-mono text-slate-300">
                                   {wi.parameters.compressed_deadline_minutes === null ||
                                   wi.parameters.compressed_deadline_minutes === undefined
-                                    ? "non déclarée"
+                                    ? "not declared"
                                     : fmt(wi.parameters.compressed_deadline_minutes, 1) + " min"}
                                 </span>
                               </>
@@ -2347,7 +2347,7 @@
                                 }}
                                 className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300"
                               >
-                                Réinitialiser
+                                Reset
                               </button>
                             )}
                             <button
@@ -2355,14 +2355,14 @@
                               disabled={loadingWhatIf}
                               className="px-3 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 border border-cyan-500/50 text-white font-medium disabled:opacity-50"
                             >
-                              {loadingWhatIf ? "Simulation…" : "Rejouer les scénarios"}
+                              {loadingWhatIf ? "Simulating…" : "Replay scenarios"}
                             </button>
                           </div>
                         </div>
 
                         {whatIfError && (
                           <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-rose-200">
-                            <div className="font-semibold mb-1">Simulation impossible</div>
+                            <div className="font-semibold mb-1">Simulation failed</div>
                             <div className="font-mono break-words">{whatIfError}</div>
                           </div>
                         )}
@@ -2418,17 +2418,17 @@
                                 </div>
 
                                 <div className="text-slate-400 font-mono text-[11px] leading-relaxed">
-                                  Sous tempête : {fmt(sr.spot_storm_scenario.storm_cost_eur, 2)} € ·{" "}
+                                  Under storm: {fmt(sr.spot_storm_scenario.storm_cost_eur, 2)} € ·{" "}
                                   {fmt(sr.spot_storm_scenario.storm_duration_minutes, 1)} min
                                   {num(sr.spot_storm_scenario.extra_delay_minutes) > 0 && (
                                     <span className="text-amber-300">
                                       {" "}
-                                      (+{fmt(sr.spot_storm_scenario.extra_delay_minutes, 1)} min perdues)
+                                      (+{fmt(sr.spot_storm_scenario.extra_delay_minutes, 1)} min lost)
                                     </span>
                                   )}
                                 </div>
                                 <div className="text-slate-500 font-mono text-[10px]">
-                                  Base : {fmt(sr.baseline_cost_eur, 2)} € ·{" "}
+                                  Baseline: {fmt(sr.baseline_cost_eur, 2)} € ·{" "}
                                   {fmt(sr.baseline_duration_minutes, 1)} min · {sr.provisioning_model}
                                 </div>
 
@@ -2455,7 +2455,7 @@
                       }`}
                     >
                       <div className="font-semibold text-slate-100">
-                        Repli · {fallbackVerdict.status}
+                        Fallback · {fallbackVerdict.status}
                       </div>
                       <div className="text-slate-300">{fallbackVerdict.reason}</div>
                       {fallbackVerdict.plan && (
@@ -2466,7 +2466,7 @@
                       )}
                       {fallbackVerdict.requires_approval && (
                         <div className="text-amber-300">
-                          Ce plan doit encore être approuvé avant toute soumission.
+                          This plan still needs approval before any submission.
                         </div>
                       )}
                       {Array.isArray(fallbackVerdict.skipped_candidates) &&
@@ -2480,8 +2480,8 @@
                           </ul>
                         )}
                       <div className="text-slate-500">
-                        Aucune soumission n'a eu lieu ({fallbackVerdict.candidates_considered ?? 0}{" "}
-                        candidat(s) examiné(s)).
+                        No submission took place ({fallbackVerdict.candidates_considered ?? 0}{" "}
+                        candidate(s) examined).
                       </div>
                     </div>
                   )}
@@ -2490,7 +2490,7 @@
 
               {!loadingPlans && !planError && !planComparison && (
                 <div className="text-sm text-slate-500 py-8 text-center">
-                  Aucun plan calculé pour l'instant.
+                  No plan computed yet.
                 </div>
               )}
             </div>
@@ -2501,14 +2501,14 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-                  Recherche de capacité compatible
+                  Compatible capacity search
                 </h2>
                 <button
                   onClick={fetchCapacityCandidates}
                   disabled={loadingCandidates}
                   className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                 >
-                  {loadingCandidates ? "Recherche…" : "Relancer la recherche"}
+                  {loadingCandidates ? "Searching…" : "Re-run the search"}
                 </button>
               </div>
 
@@ -2524,7 +2524,7 @@
                   />
                 </label>
                 <label className="flex flex-col space-y-1">
-                  <span className="text-slate-400 uppercase tracking-wider">Mémoire (Go)</span>
+                  <span className="text-slate-400 uppercase tracking-wider">Memory (GB)</span>
                   <input
                     type="number"
                     min="1"
@@ -2535,7 +2535,7 @@
                 </label>
                 <label className="flex flex-col space-y-1">
                   <span className="text-slate-400 uppercase tracking-wider">
-                    Régions autorisées
+                    Allowed regions
                   </span>
                   <input
                     type="text"
@@ -2553,7 +2553,7 @@
                     className="accent-cyan-500"
                   />
                   <span className="text-slate-400 uppercase tracking-wider">
-                    Autoriser un changement de région
+                    Allow a region change
                   </span>
                 </label>
               </div>
@@ -2562,17 +2562,17 @@
                 <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs text-slate-300 space-y-1">
                   <div>
                     {capacityMeta.searched_regions.length > 1
-                      ? "Régions interrogées : "
-                      : "Région interrogée : "}
+                      ? "Regions queried: "
+                      : "Region queried: "}
                     <span className="font-mono text-cyan-300">
                       {capacityMeta.searched_regions.length > 0
                         ? capacityMeta.searched_regions.join(", ")
-                        : "aucune"}
+                        : "none"}
                     </span>
                     {capacityMeta.allowed_regions.length > 0 && (
                       <span className="text-slate-400">
                         {" "}
-                        — autorisées : {capacityMeta.allowed_regions.join(", ")}
+                        — allowed: {capacityMeta.allowed_regions.join(", ")}
                       </span>
                     )}
                   </div>
@@ -2583,19 +2583,19 @@
               )}
 
               {loadingCandidates && (
-                <div className="text-sm text-slate-400 py-8 text-center">Interrogation des sources de capacité…</div>
+                <div className="text-sm text-slate-400 py-8 text-center">Querying capacity sources…</div>
               )}
 
               {!loadingCandidates && capacityError && (
                 <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
-                  <div className="font-semibold mb-1">Recherche impossible</div>
+                  <div className="font-semibold mb-1">Search failed</div>
                   <div className="font-mono text-xs break-words">{capacityError}</div>
                 </div>
               )}
 
               {!loadingCandidates && !capacityError && capacityCandidates.length === 0 && (
                 <div className="text-sm text-slate-500 py-8 text-center">
-                  Aucune capacité compatible trouvée pour ces contraintes.
+                  No compatible capacity found for these constraints.
                 </div>
               )}
 
@@ -2605,9 +2605,9 @@
                     <thead className="text-slate-400 uppercase tracking-wider">
                       <tr className="border-b border-slate-800">
                         <th className="text-left py-2">Machine</th>
-                        <th className="text-left py-2">Région / zone</th>
+                        <th className="text-left py-2">Region / zone</th>
                         <th className="text-right py-2">vCPU</th>
-                        <th className="text-right py-2">Mémoire</th>
+                        <th className="text-right py-2">Memory</th>
                         <th className="text-left py-2">Approvisionnement</th>
                         <th className="text-left py-2">Palier</th>
                         <th className="text-left py-2">Quota</th>
@@ -2642,9 +2642,9 @@
                             {c.quota_project_source === "built_in_default" && (
                               <span
                                 className="ml-1 text-amber-300"
-                                title={`Quota lue dans le projet par défaut « ${c.quota_project} » : aucun GOOGLE_CLOUD_PROJECT n'est configuré, ce n'est pas nécessairement votre quota.`}
+                                title={`Quota read from the default project « ${c.quota_project} » : no GOOGLE_CLOUD_PROJECT is configured, so this is not necessarily your quota.`}
                               >
-                                ⚠ projet par défaut
+                                ⚠ default project
                               </span>
                             )}
                           </td>
@@ -2664,31 +2664,31 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-                  Diagnostic des blocages
+                  Blocker diagnostics
                 </h2>
                 <button
                   onClick={fetchDiagnostics}
                   disabled={loadingDiagnostics}
                   className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                 >
-                  {loadingDiagnostics ? "Analyse…" : "Relancer le diagnostic"}
+                  {loadingDiagnostics ? "Analyzing…" : "Re-run diagnostics"}
                 </button>
               </div>
 
               {loadingDiagnostics && (
-                <div className="text-sm text-slate-400 py-8 text-center">Analyse des signaux…</div>
+                <div className="text-sm text-slate-400 py-8 text-center">Analyzing signals…</div>
               )}
 
               {!loadingDiagnostics && diagnosticsError && (
                 <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
-                  <div className="font-semibold mb-1">Diagnostic indisponible</div>
+                  <div className="font-semibold mb-1">Diagnostics unavailable</div>
                   <div className="font-mono text-xs break-words">{diagnosticsError}</div>
                 </div>
               )}
 
               {!loadingDiagnostics && !diagnosticsError && diagnosticsList.length === 0 && (
                 <div className="text-sm text-slate-500 py-8 text-center">
-                  Aucun blocage détecté sur les signaux disponibles.
+                  No blocker detected in the available signals.
                 </div>
               )}
 
@@ -2703,7 +2703,7 @@
                               GCP quota are different problems with different
                               remedies, and must never be merged. */}
                           <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-amber-300">
-                            source : {d.source}
+                            source: {d.source}
                           </span>
                           <span
                             className={`text-[11px] font-mono px-2 py-0.5 rounded ${
@@ -2712,7 +2712,7 @@
                                 : "bg-slate-800 text-slate-400"
                             }`}
                           >
-                            {d.confirmed ? "constaté" : "hypothèse"}
+                            {d.confirmed ? "confirmed" : "hypothesis"}
                           </span>
                         </span>
                       </div>
@@ -2744,31 +2744,31 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-                  Coûts réels, historique et écart aux estimations
+                  Actual costs, history and variance against estimates
                 </h2>
                 <button
                   onClick={fetchHistory}
                   disabled={loadingHistory}
                   className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                 >
-                  {loadingHistory ? "Chargement…" : "Rafraîchir"}
+                  {loadingHistory ? "Loading…" : "Refresh"}
                 </button>
               </div>
 
               {loadingHistory && (
-                <div className="text-sm text-slate-400 py-8 text-center">Lecture de l'historique…</div>
+                <div className="text-sm text-slate-400 py-8 text-center">Reading history…</div>
               )}
 
               {!loadingHistory && historyError && (
                 <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
-                  <div className="font-semibold mb-1">Historique indisponible</div>
+                  <div className="font-semibold mb-1">History unavailable</div>
                   <div className="font-mono text-xs break-words">{historyError}</div>
                 </div>
               )}
 
               {!loadingHistory && !historyError && historyRecords.length === 0 && (
                 <div className="text-sm text-slate-500 py-8 text-center">
-                  Aucune exécution enregistrée. Approuvez puis exécutez un plan pour alimenter l'historique.
+                  No execution recorded. Approve then execute a plan to populate the history.
                 </div>
               )}
 
@@ -2778,13 +2778,13 @@
                     <thead className="text-slate-400 uppercase tracking-wider">
                       <tr className="border-b border-slate-800">
                         <th className="text-left py-2">Workload</th>
-                        <th className="text-left py-2">État</th>
+                        <th className="text-left py-2">Status</th>
                         <th className="text-right py-2">Tentatives</th>
-                        <th className="text-right py-2">Coût estimé</th>
-                        <th className="text-right py-2">Coût observé</th>
-                        <th className="text-right py-2">Écart</th>
-                        <th className="text-right py-2">Durée</th>
-                        <th className="text-left py-2">Base du coût</th>
+                        <th className="text-right py-2">Estimated cost</th>
+                        <th className="text-right py-2">Observed cost</th>
+                        <th className="text-right py-2">Variance</th>
+                        <th className="text-right py-2">Duration</th>
+                        <th className="text-left py-2">Cost basis</th>
                       </tr>
                     </thead>
                     <tbody className="text-slate-200">
@@ -2813,14 +2813,14 @@
                                   className="ml-1 text-amber-400"
                                   title={
                                     declared.length +
-                                    " tentative(s) sur " +
+                                    " attempt(s) out of " +
                                     attempts.length +
-                                    " rapportent un coût déclaré, non mesuré (" +
+                                    " report a declared, unmeasured cost (" +
                                     declared.map((a) => a.cost_status).join(", ") +
                                     ")"
                                   }
                                 >
-                                  déclaré
+                                  declared
                                 </span>
                               )}
                             </td>
@@ -2854,34 +2854,34 @@
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-                  Portefeuille FinOps &amp; GreenOps — flotte complète
+                  FinOps &amp; GreenOps portfolio — entire fleet
                 </h2>
                 <button
                   onClick={fetchFinops}
                   disabled={loadingFinops}
                   className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
                 >
-                  {loadingFinops ? "Agrégation…" : "Rafraîchir"}
+                  {loadingFinops ? "Aggregating…" : "Refresh"}
                 </button>
               </div>
 
               {loadingFinops && (
                 <div className="text-sm text-slate-400 py-8 text-center">
-                  Agrégation du portefeuille…
+                  Aggregating the portfolio…
                 </div>
               )}
 
               {!loadingFinops && finopsError && (
                 <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
-                  <div className="font-semibold mb-1">Analytique de portefeuille indisponible</div>
+                  <div className="font-semibold mb-1">Portfolio analytics unavailable</div>
                   <div className="font-mono text-xs break-words">{finopsError}</div>
                 </div>
               )}
 
               {!loadingFinops && !finopsError && finops && finops.total_workloads === 0 && (
                 <div className="text-sm text-slate-500 py-8 text-center">
-                  Aucun workload dans l'historique. Exécutez un plan pour alimenter le portefeuille :
-                  les montants affichés proviennent exclusivement des exécutions enregistrées.
+                  No workload in the history. Execute a plan to populate the portfolio:
+                  the amounts shown come exclusively from recorded executions.
                 </div>
               )}
 
@@ -2891,7 +2891,7 @@
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <KpiTile
                       icon={<WalletIcon />}
-                      label="Dépense effective"
+                      label="Actual spend"
                       value={fmt(
                         finops.financial_tiers.tier2_verified_usage_total_eur > 0
                           ? finops.financial_tiers.tier2_verified_usage_total_eur
@@ -2901,37 +2901,37 @@
                       unit="€"
                       sub={`${finops.total_workloads} workload(s) · ${
                         finops.financial_tiers.tier2_verified_usage_total_eur > 0
-                          ? "coût mesuré sur allocation observée"
-                          : "estimations seules, aucun usage vérifié"
+                          ? "cost measured on observed allocation"
+                          : "estimates only, no verified usage"
                       }`}
                     />
                     <KpiTile
                       icon={<WalletIcon />}
-                      label="Économies Spot"
+                      label="Spot savings"
                       value={fmt(finops.financial_tiers.spot_hedging_savings_eur, 2)}
                       unit="€"
                       tone={finops.financial_tiers.spot_hedging_savings_eur > 0 ? "green" : undefined}
                       sub={`${fmt(
                         finops.financial_tiers.spot_hedging_savings_pct,
                         1
-                      )} % sous la référence 100 % Standard (${fmt(
+                      )} % below the 100% Standard baseline (${fmt(
                         finops.financial_tiers.on_demand_baseline_equivalent_eur,
                         2
                       )} €)`}
                     />
                     <KpiTile
                       icon={<LeafIcon />}
-                      label="Empreinte carbone"
+                      label="Carbon footprint"
                       value={fmt(finops.sustainability_metrics.total_carbon_emissions_g_co2, 1)}
                       unit="gCO₂"
                       sub={`${fmt(finops.sustainability_metrics.total_energy_kwh, 4)} kWh · ${fmt(
                         finops.sustainability_metrics.potential_green_routing_savings_g_co2,
                         1
-                      )} gCO₂ évitables par routage vert`}
+                      )} gCO₂ avoidable via green routing`}
                     />
                     <KpiTile
                       icon={<ShieldCheckIcon />}
-                      label="Conformité SLA"
+                      label="SLA compliance"
                       value={fmt(finops.reliability_and_governance.sla_compliance_rate_pct, 1)}
                       unit="%"
                       tone={
@@ -2943,8 +2943,8 @@
                       }
                       sub={
                         finops.reliability_and_governance.sla_evaluated_workloads === 0
-                          ? "aucun workload ne déclare de deadline : rien à évaluer"
-                          : `${finops.reliability_and_governance.sla_compliant_workloads}/${finops.reliability_and_governance.sla_evaluated_workloads} dans les délais`
+                          ? "no workload declares a deadline: nothing to evaluate"
+                          : `${finops.reliability_and_governance.sla_compliant_workloads}/${finops.reliability_and_governance.sla_evaluated_workloads} on time`
                       }
                     />
                   </div>
@@ -2953,11 +2953,11 @@
                   <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-4">
                     <div>
                       <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                        Réconciliation financière à 3 tiers
+                        3-tier financial reconciliation
                       </h3>
                       <p className="text-[11px] text-slate-500 mt-0.5">
-                        Estimé, mesuré et facturé restent séparés : un montant estimé n'est pas un
-                        montant observé, et un montant observé n'est pas une facture.
+                        Estimated, measured and billed stay separate: an estimated amount is not an
+                        observed amount, and an observed amount is not an invoice.
                       </p>
                     </div>
 
@@ -2973,35 +2973,35 @@
                       return (
                         <div className="space-y-3">
                           <ReconciliationBar
-                            label="Référence 100 % Standard (contrefactuel)"
+                            label="100% Standard baseline (counterfactual)"
                             value={t.on_demand_baseline_equivalent_eur}
                             max={scale}
                             colorClass="bg-slate-600"
-                            hint="Ce que la même flotte aurait coûté sans arbitrage Spot."
+                            hint="What the same fleet would have cost without Spot arbitrage."
                           />
                           <ReconciliationBar
-                            label="Tier 1 · Estimé au moment du plan"
+                            label="Tier 1 · Estimated at plan time"
                             value={t.tier1_estimated_total_eur}
                             max={scale}
                             colorClass="bg-sky-500"
-                            hint="Hypothèse déterministe produite par le moteur de plans."
+                            hint="Deterministic assumption produced by the planning engine."
                           />
                           <ReconciliationBar
-                            label="Tier 2 · Mesuré sur allocation observée"
+                            label="Tier 2 · Measured on observed allocation"
                             value={t.tier2_verified_usage_total_eur}
                             max={scale}
                             colorClass="bg-cyan-400"
-                            hint="Calculé depuis la télémétrie contrôleur, jamais depuis la demande."
+                            hint="Computed from controller telemetry, never from the request."
                           />
                           <ReconciliationBar
-                            label="Tier 3 · Réconcilié avec la facturation"
+                            label="Tier 3 · Reconciled with billing"
                             value={t.tier3_reconciled_billed_total_eur}
                             max={scale}
                             colorClass="bg-emerald-400"
                             hint={
                               num(t.tier3_reconciled_billed_total_eur) === 0
-                                ? "Aucune exécution n'a encore été rapprochée d'une facture."
-                                : "Montants confirmés par la source de facturation."
+                                ? "No execution has been reconciled against an invoice yet."
+                                : "Amounts confirmed by the billing source."
                             }
                           />
                         </div>
@@ -3014,7 +3014,7 @@
                     <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
                       <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
                         <LeafIcon />
-                        <span>Bilan carbone et routage vert</span>
+                        <span>Carbon balance and green routing</span>
                       </h3>
                       {(() => {
                         const s = finops.sustainability_metrics;
@@ -3024,7 +3024,7 @@
                         return (
                           <div className="space-y-3">
                             <div className="flex items-baseline justify-between text-xs">
-                              <span className="text-slate-400">Émis</span>
+                              <span className="text-slate-400">Emitted</span>
                               <span className="font-mono text-slate-100">{fmt(emitted, 1)} gCO₂</span>
                             </div>
                             <div className="w-full bg-slate-800 h-3 rounded-md overflow-hidden flex">
@@ -3037,22 +3037,22 @@
                             <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-slate-400">
                               <span className="flex items-center gap-1.5">
                                 <span className="inline-block w-2.5 h-2.5 rounded-sm bg-emerald-500/80" />
-                                Incompressible à région constante
+                                Irreducible at constant region
                               </span>
                               <span className="flex items-center gap-1.5">
                                 <span className="inline-block w-2.5 h-2.5 rounded-sm bg-amber-500/80" />
-                                Évitable par routage vert ({fmt(pct, 0)} %)
+                                Avoidable via green routing ({fmt(pct, 0)} %)
                               </span>
                             </div>
                             <div className="text-xs text-slate-400 pt-2 border-t border-slate-800">
-                              Énergie consommée :{" "}
+                              Energy consumed:{" "}
                               <span className="font-mono text-slate-200">
                                 {fmt(s.total_energy_kwh, 4)} kWh
                               </span>
                               <div className="text-[11px] text-slate-500 mt-1">
-                                Le gain de routage suppose un déplacement autorisé de la charge ; il
-                                n'est pas applicable tant que le profil interdit le changement de
-                                région.
+                                The routing gain assumes the workload is allowed to move; it
+                                does not apply while the profile forbids changing
+                                region.
                               </div>
                             </div>
                           </div>
@@ -3064,7 +3064,7 @@
                     <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
                       <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
                         <ShieldCheckIcon />
-                        <span>Répartition des modes de gouvernance</span>
+                        <span>Governance mode distribution</span>
                       </h3>
                       {(() => {
                         const dist =
@@ -3074,9 +3074,9 @@
                           1
                         );
                         const rows = [
-                          ["advisory", "Advisory (lecture seule)", "bg-amber-400"],
-                          ["validation", "Validation (approbation humaine)", "bg-cyan-400"],
-                          ["delegation", "Délégation (autonomie bornée)", "bg-emerald-400"],
+                          ["advisory", "Advisory (read-only)", "bg-amber-400"],
+                          ["validation", "Validation (human approval)", "bg-cyan-400"],
+                          ["delegation", "Delegation (bounded autonomy)", "bg-emerald-400"],
                         ];
                         return (
                           <div className="space-y-3">
@@ -3097,8 +3097,8 @@
                               </div>
                             ))}
                             <div className="text-[11px] text-slate-500 pt-1 border-t border-slate-800">
-                              Le mode indiqué est celui que le serveur a réellement appliqué à
-                              l'exécution, pas celui demandé par l'appelant.
+                              The mode shown is the one the server actually applied to
+                              the execution, not the one requested by the caller.
                             </div>
                           </div>
                         );
@@ -3134,35 +3134,35 @@
             const warnings = [];
             if (plan.executable_on_runtime === false) {
               warnings.push(
-                "Ce plan n'est pas exécutable sur le runtime actuellement attaché : la soumission sera refusée."
+                "This plan is not executable on the currently attached runtime: the submission will be refused."
               );
             }
             if (mode === "advisory") {
               warnings.push(
-                "Mode advisory : le serveur n'autorise aucune mutation. La soumission sera refusée."
+                "Advisory mode: the server allows no mutation. The submission will be refused."
               );
             }
             if (mode === "validation" && !isApproved) {
               warnings.push(
-                "Mode validation : ce plan n'a pas d'approbation enregistrée côté serveur. Approuvez-le d'abord."
+                "Validation mode: this plan has no approval recorded server-side. Approve it first."
               );
             }
             if (mode === "delegation" && remaining !== null && cost > remaining) {
               warnings.push(
-                `Plafond délégué dépassé : ${fmt(cost, 2)} € demandés pour ${fmt(
+                `Delegated ceiling exceeded: ${fmt(cost, 2)} € requested against ${fmt(
                   remaining,
                   2
-                )} € restants.`
+                )} € remaining.`
               );
             }
             if (cost > num(budget)) {
               warnings.push(
-                `Coût estimé (${fmt(cost, 2)} €) au-dessus du budget déclaré (${fmt(budget, 2)} €).`
+                `Estimated cost (${fmt(cost, 2)} €) above the declared budget (${fmt(budget, 2)} €).`
               );
             }
             if (eta > num(deadline)) {
               warnings.push(
-                `Durée projetée (${fmt(eta, 1)} min) au-delà du délai déclaré (${fmt(
+                `Projected duration (${fmt(eta, 1)} min) beyond the declared deadline (${fmt(
                   deadline,
                   0
                 )} min).`
@@ -3170,8 +3170,8 @@
             }
             if (plan.capacity_status && plan.capacity_status !== "QUOTA_AVAILABLE") {
               warnings.push(
-                `Capacité non confirmée (${plan.capacity_status}) : ${
-                  plan.capacity_detail || "aucun quota n'a été vérifié pour cette forme."
+                `Capacity not confirmed (${plan.capacity_status}) : ${
+                  plan.capacity_detail || "no quota was verified for this shape."
                 }`
               );
             }
@@ -3188,11 +3188,11 @@
                   <div className="flex items-start justify-between gap-4 p-5 border-b border-slate-800">
                     <div>
                       <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-200">
-                        Prévisualisation d'impact
+                        Impact preview
                       </h3>
                       <p className="text-xs text-slate-400 mt-1">
-                        Rien n'a encore été soumis. Le serveur revérifiera le mode, l'approbation et
-                        les plafonds avant toute mutation.
+                        Nothing has been submitted yet. The server will re-check the mode, the approval and
+                        the ceilings before any mutation.
                       </p>
                     </div>
                     <button
@@ -3215,10 +3215,10 @@
                       {[
                         ["Machine", plan.machine_type],
                         ["vCPU", `${plan.cpu}${num(plan.gpu) > 0 ? ` · ${plan.gpu} GPU` : ""}`],
-                        ["Quantité", plan.quantity || 1],
-                        ["Région", plan.zone ? `${plan.region} / ${plan.zone}` : plan.region],
-                        ["Provisionnement", plan.provisioning_model],
-                        ["Capacité", plan.capacity_status || "NOT_CHECKED"],
+                        ["Quantity", plan.quantity || 1],
+                        ["Region", plan.zone ? `${plan.region} / ${plan.zone}` : plan.region],
+                        ["Provisioning", plan.provisioning_model],
+                        ["Capacity", plan.capacity_status || "NOT_CHECKED"],
                       ].map(([k, v]) => (
                         <div key={k} className="rounded-lg border border-slate-800 bg-slate-950/60 p-2.5">
                           <div className="text-[10px] uppercase tracking-wider text-slate-500">{k}</div>
@@ -3230,24 +3230,24 @@
                     {/* Financial and temporal envelope */}
                     <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 space-y-2 text-xs">
                       <div className="flex justify-between">
-                        <span className="text-slate-400">Coût estimé</span>
+                        <span className="text-slate-400">Estimated cost</span>
                         <span className="font-mono text-cyan-300">{fmt(cost, 2)} €</span>
                       </div>
                       {stressCost !== null && (
                         <div className="flex justify-between">
-                          <span className="text-slate-400">Coût attendu avec préemptions</span>
+                          <span className="text-slate-400">Expected cost with preemptions</span>
                           <span className="font-mono text-amber-300">{fmt(stressCost, 2)} €</span>
                         </div>
                       )}
                       <div className="flex justify-between">
-                        <span className="text-slate-400">Durée jusqu'au résultat</span>
+                        <span className="text-slate-400">Time to result</span>
                         <span className="font-mono text-slate-200">
-                          {fmt(eta, 1)} min / {fmt(deadline, 0)} min déclarées
+                          {fmt(eta, 1)} min / {fmt(deadline, 0)} min declared
                         </span>
                       </div>
                       {num(plan.carbon_emissions_g_co2) > 0 && (
                         <div className="flex justify-between">
-                          <span className="text-slate-400">Empreinte carbone</span>
+                          <span className="text-slate-400">Carbon footprint</span>
                           <span
                             className={`font-mono ${
                               plan.green_tier === "LOW_CARBON"
@@ -3262,7 +3262,7 @@
                         </div>
                       )}
                       <div className="flex justify-between pt-2 border-t border-slate-800">
-                        <span className="text-slate-400">Base du coût</span>
+                        <span className="text-slate-400">Cost basis</span>
                         <span className="font-mono text-slate-400">
                           {plan.cost_basis || "modelled_flat_rate_hypothesis"}
                         </span>
@@ -3272,28 +3272,28 @@
                     {/* Governance envelope enforced by the server */}
                     <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 space-y-2 text-xs">
                       <div className="flex justify-between">
-                        <span className="text-slate-400">Mode appliqué par le serveur</span>
+                        <span className="text-slate-400">Server-applied mode</span>
                         <span className="font-mono text-amber-300 uppercase">{mode}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-slate-400">Approbation enregistrée</span>
+                        <span className="text-slate-400">Approval recorded</span>
                         <span className={`font-mono ${isApproved ? "text-emerald-300" : "text-rose-300"}`}>
-                          {isApproved ? "oui" : "non"}
+                          {isApproved ? "yes" : "no"}
                         </span>
                       </div>
                       {mode === "delegation" && serverControl && (
                         <div className="flex justify-between">
-                          <span className="text-slate-400">Reste du plafond délégué</span>
+                          <span className="text-slate-400">Remaining delegated ceiling</span>
                           <span className="font-mono text-emerald-300">
-                            {fmt(serverControl.remaining_delegated_budget_eur, 2)} € (engagé{" "}
+                            {fmt(serverControl.remaining_delegated_budget_eur, 2)} € (committed{" "}
                             {fmt(serverControl.committed_cost_eur, 2)} €)
                           </span>
                         </div>
                       )}
                       <div className="flex justify-between">
-                        <span className="text-slate-400">Plan de repli déclaré</span>
+                        <span className="text-slate-400">Declared fallback plan</span>
                         <span className="font-mono text-slate-200">
-                          {plan.fallback_plan_id || "aucun"}
+                          {plan.fallback_plan_id || "none"}
                         </span>
                       </div>
                     </div>
@@ -3301,7 +3301,7 @@
                     {warnings.length > 0 && (
                       <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-100 space-y-1">
                         <div className="font-semibold uppercase tracking-wider">
-                          À vérifier avant de soumettre
+                          Check before submitting
                         </div>
                         {warnings.map((w, i) => (
                           <div key={i}>• {w}</div>
@@ -3311,7 +3311,7 @@
 
                     {Array.isArray(plan.unverified_points) && plan.unverified_points.length > 0 && (
                       <div className="text-[11px] text-slate-500 space-y-0.5">
-                        <div className="uppercase tracking-wider">Points non vérifiés</div>
+                        <div className="uppercase tracking-wider">Unverified points</div>
                         {plan.unverified_points.map((u, i) => (
                           <div key={i} className="font-mono">• {u}</div>
                         ))}
@@ -3332,7 +3332,7 @@
                         disabled={approvingPlanId === plan.plan_id}
                         className="px-4 py-2 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 disabled:opacity-50"
                       >
-                        {approvingPlanId === plan.plan_id ? "Envoi…" : "Approuver d'abord"}
+                        {approvingPlanId === plan.plan_id ? "Sending…" : "Approve first"}
                       </button>
                     )}
                     <button
@@ -3343,7 +3343,7 @@
                       disabled={executingPlanId === plan.plan_id}
                       className="px-4 py-2 text-xs rounded-lg bg-cyan-600 hover:bg-cyan-500 border border-cyan-500/60 text-white font-semibold disabled:opacity-50"
                     >
-                      {executingPlanId === plan.plan_id ? "Soumission…" : "Confirmer et soumettre"}
+                      {executingPlanId === plan.plan_id ? "Submitting…" : "Confirm and submit"}
                     </button>
                   </div>
                 </div>

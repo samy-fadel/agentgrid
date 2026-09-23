@@ -196,11 +196,11 @@ def seed_state(source: str, seeds: dict) -> str:
 
 TAB_MARKERS = {
     "mission": ["Mission"],
-    "plans": ["Comparaison de plans"],
-    "capacity": ["Recherche de capacité compatible"],
-    "diagnostics": ["Diagnostic des blocages"],
-    "history": ["Coûts réels"],
-    "finops": ["Portefeuille FinOps"],
+    "plans": ["Plan comparison"],
+    "capacity": ["Compatible capacity search"],
+    "diagnostics": ["Blocker diagnostics"],
+    "history": ["Actual costs"],
+    "finops": ["GreenOps portfolio"],
 }
 
 
