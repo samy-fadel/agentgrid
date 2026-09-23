@@ -111,6 +111,257 @@
       </svg>
     );
 
+    const LeafIcon = () => (
+      <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 20s0-8 8-12 8-4 8-4 0 8-4 12-8 4-12 4zM4 20c2-4 5-6 8-8" />
+      </svg>
+    );
+
+    const WalletIcon = () => (
+      <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 7h14a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7zm0 0V6a2 2 0 012-2h11M17 13h.01" />
+      </svg>
+    );
+
+    const PulseIcon = () => (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12h4l2-7 4 14 2-7h6" />
+      </svg>
+    );
+
+    // --- Shared numeric helper (module scope so visual primitives can use it) ---
+    const num = (v, d = 0) => (v === null || v === undefined || isNaN(Number(v)) ? d : Number(v));
+
+    /**
+     * 4D Pareto frontier scatter plot.
+     *
+     * X = total time to result (min), Y = estimated cost (EUR),
+     * bubble radius = Spot interruption risk, fill colour = carbon tier.
+     * The dashed polyline joins the non-dominated (Pareto-optimal) plans.
+     */
+    function ParetoScatter({ plans, selectedPlanId, onSelect }) {
+      const pts = (plans || []).filter((p) => p && p.plan_id);
+      if (pts.length === 0) return null;
+
+      const W = 680;
+      const H = 300;
+      const M = { top: 16, right: 20, bottom: 42, left: 62 };
+      const iw = W - M.left - M.right;
+      const ih = H - M.top - M.bottom;
+
+      const timeOf = (p) => num(p.total_time_to_result_minutes || p.estimated_execution_minutes);
+      const costOf = (p) => num(p.estimated_cost_eur);
+
+      const xMax = Math.max(...pts.map(timeOf)) * 1.18 || 1;
+      const yMax = Math.max(...pts.map(costOf)) * 1.18 || 1;
+
+      const sx = (v) => M.left + (v / xMax) * iw;
+      const sy = (v) => M.top + ih - (v / yMax) * ih;
+
+      const carbonColor = (tier) =>
+        tier === "LOW_CARBON" ? "#34d399" : tier === "HIGH_CARBON" ? "#fb923c" : "#38bdf8";
+
+      // Risk drives the bubble radius so a cheap-but-fragile plan reads as fragile.
+      const radiusOf = (p) => 6 + num(p.interruption_risk_score) * 14;
+
+      const frontier = pts
+        .filter((p) => p.is_pareto_optimal)
+        .slice()
+        .sort((a, b) => timeOf(a) - timeOf(b));
+
+      const frontierPath = frontier
+        .map((p, i) => (i === 0 ? "M" : "L") + " " + sx(timeOf(p)) + " " + sy(costOf(p)))
+        .join(" ");
+
+      const ratios = [0, 0.25, 0.5, 0.75, 1];
+
+      return (
+        <div className="space-y-2">
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto select-none" role="img">
+            {/* Grid + Y axis ticks (cost) */}
+            {ratios.map((r, i) => (
+              <g key={`y${i}`}>
+                <line
+                  x1={M.left}
+                  y1={M.top + ih - r * ih}
+                  x2={M.left + iw}
+                  y2={M.top + ih - r * ih}
+                  stroke="#1e293b"
+                  strokeWidth="1"
+                />
+                <text
+                  x={M.left - 8}
+                  y={M.top + ih - r * ih + 4}
+                  textAnchor="end"
+                  fontSize="10"
+                  fill="#64748b"
+                  fontFamily="JetBrains Mono, monospace"
+                >
+                  {(yMax * r).toFixed(1)}
+                </text>
+              </g>
+            ))}
+
+            {/* X axis ticks (time) */}
+            {ratios.map((r, i) => (
+              <text
+                key={`x${i}`}
+                x={M.left + r * iw}
+                y={M.top + ih + 18}
+                textAnchor="middle"
+                fontSize="10"
+                fill="#64748b"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                {(xMax * r).toFixed(0)}
+              </text>
+            ))}
+
+            <text
+              x={M.left + iw / 2}
+              y={H - 6}
+              textAnchor="middle"
+              fontSize="11"
+              fill="#94a3b8"
+            >
+              Temps jusqu'au résultat (min)
+            </text>
+            <text
+              x={14}
+              y={M.top + ih / 2}
+              textAnchor="middle"
+              fontSize="11"
+              fill="#94a3b8"
+              transform={`rotate(-90 14 ${M.top + ih / 2})`}
+            >
+              Coût estimé (€)
+            </text>
+
+            {/* Pareto frontier polyline */}
+            {frontier.length > 1 && (
+              <path d={frontierPath} fill="none" stroke="#22d3ee" strokeWidth="1.5" strokeDasharray="5 4" opacity="0.75" />
+            )}
+
+            {/* Plan bubbles */}
+            {pts.map((p) => {
+              const cx = sx(timeOf(p));
+              const cy = sy(costOf(p));
+              const isSel = p.plan_id === selectedPlanId;
+              return (
+                <g key={p.plan_id} onClick={() => onSelect && onSelect(p.plan_id)} style={{ cursor: "pointer" }}>
+                  <title>
+                    {`${p.title || p.plan_id}\n${fmtNum(costOf(p), 2)} € · ${fmtNum(timeOf(p), 1)} min\nRisque Spot : ${(num(p.interruption_risk_score) * 100).toFixed(0)}%\nCarbone : ${fmtNum(p.carbon_emissions_g_co2, 1)} gCO₂ (${p.green_tier || "n/a"})`}
+                  </title>
+                  {isSel && (
+                    <circle cx={cx} cy={cy} r={radiusOf(p) + 6} fill="none" stroke="#f1f5f9" strokeWidth="1.5" opacity="0.8" />
+                  )}
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={radiusOf(p)}
+                    fill={carbonColor(p.green_tier)}
+                    fillOpacity={p.is_pareto_optimal ? 0.55 : 0.18}
+                    stroke={carbonColor(p.green_tier)}
+                    strokeWidth={p.is_pareto_optimal ? 2 : 1}
+                    strokeDasharray={p.is_pareto_optimal ? "" : "3 3"}
+                  />
+                  {p.is_pareto_optimal && (
+                    <text x={cx} y={cy - radiusOf(p) - 6} textAnchor="middle" fontSize="9" fill="#e2e8f0">
+                      ★
+                    </text>
+                  )}
+                </g>
+              );
+            })}
+          </svg>
+
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-slate-400">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400/60 border border-emerald-400" />
+              Faible carbone
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-2.5 h-2.5 rounded-full bg-sky-400/60 border border-sky-400" />
+              Carbone modéré
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-2.5 h-2.5 rounded-full bg-orange-400/60 border border-orange-400" />
+              Carbone élevé
+            </span>
+            <span>★ = non dominé (frontière de Pareto)</span>
+            <span>Rayon de la bulle ∝ risque de préemption Spot</span>
+          </div>
+        </div>
+      );
+    }
+
+    /** Linear gauge used for burn-rate drift and checkpoint exposure. */
+    function DriftGauge({ label, value, max, unit, tone, caption }) {
+      const pct = Math.max(0, Math.min(100, (num(value) / Math.max(num(max), 0.0001)) * 100));
+      const bar =
+        tone === "danger" ? "bg-rose-500" : tone === "warn" ? "bg-amber-400" : "bg-emerald-400";
+      return (
+        <div className="space-y-1">
+          <div className="flex items-baseline justify-between text-xs">
+            <span className="text-slate-400">{label}</span>
+            <span className="font-mono text-slate-100">
+              {fmtNum(value, 2)} {unit}
+            </span>
+          </div>
+          <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+            <div className={`h-full rounded-full transition-all duration-500 ${bar}`} style={{ width: `${pct}%` }} />
+          </div>
+          {caption && <div className="text-[10px] text-slate-500 leading-snug">{caption}</div>}
+        </div>
+      );
+    }
+
+    /** One row of the 3-tier financial reconciliation chart. */
+    function ReconciliationBar({ label, value, max, colorClass, hint }) {
+      const pct = Math.max(0, Math.min(100, (num(value) / Math.max(num(max), 0.0001)) * 100));
+      return (
+        <div className="space-y-1">
+          <div className="flex items-baseline justify-between text-xs">
+            <span className="text-slate-300">{label}</span>
+            <span className="font-mono text-slate-100">{fmtNum(value, 2)} €</span>
+          </div>
+          <div className="w-full bg-slate-800 h-3 rounded-md overflow-hidden">
+            <div className={`h-full rounded-md transition-all duration-700 ${colorClass}`} style={{ width: `${pct}%` }} />
+          </div>
+          {hint && <div className="text-[10px] text-slate-500">{hint}</div>}
+        </div>
+      );
+    }
+
+    /** Executive KPI tile for the FinOps board. */
+    function KpiTile({ icon, label, value, unit, sub, tone }) {
+      const ring =
+        tone === "green"
+          ? "border-emerald-800/60 bg-emerald-950/30"
+          : tone === "amber"
+          ? "border-amber-800/60 bg-amber-950/30"
+          : "border-slate-800 bg-slate-900/90";
+      return (
+        <div className={`rounded-xl border p-4 shadow-sm space-y-1 ${ring}`}>
+          <div className="text-xs font-medium text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+            {icon}
+            <span>{label}</span>
+          </div>
+          <div className="flex items-baseline space-x-1.5">
+            <span className="text-2xl font-bold tracking-tight text-white font-mono">{value}</span>
+            {unit && <span className="text-xs text-slate-400">{unit}</span>}
+          </div>
+          {sub && <div className="text-[11px] text-slate-400 leading-snug">{sub}</div>}
+        </div>
+      );
+    }
+
+    /** Module-scope formatter mirroring the in-component `fmt` helper. */
+    function fmtNum(val, digits = 1, fallback = "0.0") {
+      if (val === null || val === undefined || isNaN(Number(val))) return fallback;
+      return Number(val).toFixed(digits);
+    }
+
     function App() {
       const [objective, setObjective] = useState(
         "Run the compute workload autonomously. Meet its deadline and budget while minimizing cost. Continue observing and adapting until it finishes, then summarize the result."
@@ -173,6 +424,32 @@
       // exists only now that the backend honours it.
       const [allowedRegions, setAllowedRegions] = useState("");
       const [allowRegionChange, setAllowRegionChange] = useState(false);
+
+      // --- Executive FinOps / GreenOps board (/api/portfolio/finops) ---
+      const [finops, setFinops] = useState(null);
+      const [loadingFinops, setLoadingFinops] = useState(false);
+      const [finopsError, setFinopsError] = useState(null);
+
+      // --- Live drift & anomaly monitor (/api/workloads/{id}/anomalies) ---
+      const [anomalyReport, setAnomalyReport] = useState(null);
+      const [loadingAnomalies, setLoadingAnomalies] = useState(false);
+      const [anomaliesError, setAnomaliesError] = useState(null);
+
+      // --- Interactive What-If stress controls (/api/plans/what-if) ---
+      // Seeded with the same defaults the backend uses so the first render
+      // matches the summary already embedded in the plan comparison.
+      const [whatIfPreemptions, setWhatIfPreemptions] = useState(2);
+      const [whatIfBudgetShock, setWhatIfBudgetShock] = useState(-20);
+      const [whatIfDeadlineCompression, setWhatIfDeadlineCompression] = useState(-25);
+      const [whatIfResult, setWhatIfResult] = useState(null);
+      const [loadingWhatIf, setLoadingWhatIf] = useState(false);
+      const [whatIfError, setWhatIfError] = useState(null);
+
+      // Plan selected on the Pareto scatter; drives the highlighted plan card.
+      const [selectedPlanId, setSelectedPlanId] = useState(null);
+
+      // Impact-preview modal shown before any actuation leaves the browser.
+      const [pendingExecution, setPendingExecution] = useState(null);
 
       const WORKLOAD_ID = "workload-gui";
 
@@ -403,6 +680,103 @@
         }
       };
 
+      // Fleet-wide FinOps, 3-tier reconciliation and carbon telemetry. The
+      // backend has computed these since the analytics module landed; nothing
+      // in the UI read them, so the ROI of Spot hedging stayed invisible.
+      const fetchFinops = async () => {
+        setLoadingFinops(true);
+        setFinopsError(null);
+        try {
+          const res = await fetch(`${API_BASE}/api/portfolio/finops`);
+          if (!res.ok) {
+            setFinopsError(await describeError(res, "Portfolio FinOps unavailable"));
+            setFinops(null);
+            return;
+          }
+          setFinops(await res.json());
+        } catch (e) {
+          setFinopsError(`Unable to reach the API: ${e.message}`);
+          setFinops(null);
+        } finally {
+          setLoadingFinops(false);
+        }
+      };
+
+      // Live drift detection. Elapsed time, cost and progress are taken from the
+      // runtime snapshot so the report describes the run actually observed, not
+      // the one the form describes.
+      const fetchAnomalies = async () => {
+        setLoadingAnomalies(true);
+        setAnomaliesError(null);
+        try {
+          const wl = (snapshot && snapshot.workload) || {};
+          const clk = (snapshot && snapshot.cluster) || {};
+          const body = {
+            workload_profile: buildWorkloadProfile(),
+            elapsed_minutes: num(clk.current_time_minutes),
+            current_cost_eur: num(wl.accrued_cost_eur),
+          };
+          if (wl.remaining_work_units !== undefined && wl.remaining_work_units !== null) {
+            body.progress_pct = Math.max(0, Math.min(100, 100 - num(wl.remaining_work_units)));
+          }
+          const res = await fetch(`${API_BASE}/api/workloads/${WORKLOAD_ID}/anomalies`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!res.ok) {
+            setAnomaliesError(await describeError(res, "Anomaly detection failed"));
+            setAnomalyReport(null);
+            return;
+          }
+          setAnomalyReport(await res.json());
+        } catch (e) {
+          setAnomaliesError(`Unable to reach the API: ${e.message}`);
+          setAnomalyReport(null);
+        } finally {
+          setLoadingAnomalies(false);
+        }
+      };
+
+      // Re-run the stress simulator with the operator's own shock parameters.
+      // Plans are sent explicitly so the scenarios apply to exactly the set the
+      // page is displaying, even before anything has been registered.
+      const runWhatIf = async (plansOverride) => {
+        const plans = plansOverride || (planComparison && planComparison.plans) || [];
+        if (plans.length === 0) {
+          setWhatIfError("Comparez d'abord des plans : aucun plan à mettre sous stress.");
+          setWhatIfResult(null);
+          return;
+        }
+        setLoadingWhatIf(true);
+        setWhatIfError(null);
+        try {
+          const res = await fetch(`${API_BASE}/api/plans/what-if`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              workload_id: WORKLOAD_ID,
+              plans: plans,
+              workload_profile: buildWorkloadProfile(),
+              forced_preemptions: Number(whatIfPreemptions),
+              budget_shock_pct: Number(whatIfBudgetShock),
+              deadline_compression_pct: Number(whatIfDeadlineCompression),
+            }),
+          });
+          if (!res.ok) {
+            setWhatIfError(await describeError(res, "What-If simulation failed"));
+            setWhatIfResult(null);
+            return;
+          }
+          setWhatIfResult(await res.json());
+        } catch (e) {
+          setWhatIfError(`Unable to reach the API: ${e.message}`);
+          setWhatIfResult(null);
+        } finally {
+          setLoadingWhatIf(false);
+        }
+      };
+
       // The control mode is enforced by the server, so the selector must push
       // it there. Showing a mode the backend does not hold would be a lie.
       const syncControlMode = async (mode, budgetEur) => {
@@ -442,6 +816,9 @@
         if (activeTab === "diagnostics" && diagnosticsList.length === 0 && !loadingDiagnostics)
           fetchDiagnostics();
         if (activeTab === "history" && historyRecords.length === 0 && !loadingHistory) fetchHistory();
+        if (activeTab === "finops" && !finops && !loadingFinops) fetchFinops();
+        // The health ribbon belongs to the mission view, so it loads with it.
+        if (activeTab === "mission" && !anomalyReport && !loadingAnomalies) fetchAnomalies();
       }, [activeTab]);
 
 
@@ -718,6 +1095,16 @@
               >
                 <span>📈 Coûts Réels & Historique</span>
               </button>
+              <button
+                onClick={() => setActiveTab("finops")}
+                className={`px-3 py-2 rounded-lg transition-all flex items-center space-x-2 whitespace-nowrap ${
+                  activeTab === "finops"
+                    ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+                }`}
+              >
+                <span>💼 FinOps &amp; GreenOps</span>
+              </button>
             </div>
 
             {/* Operator Control Mode Selector */}
@@ -861,6 +1248,175 @@
               </div>
             </div>
           </div>
+
+          {/* Live Drift & Anomaly Ribbon. The backend has detected burn-rate
+              drift, throughput stalls and Young-Daly checkpoint exposure for a
+              while; without this strip the operator never saw any of it. */}
+          {activeTab === 'mission' && (
+            <div
+              className={`rounded-xl border p-4 shadow-sm space-y-3 ${
+                anomalyReport && anomalyReport.health_status === "CRITICAL_DRIFT"
+                  ? "border-rose-500/50 bg-rose-950/25"
+                  : anomalyReport && anomalyReport.health_status === "DEGRADED_DRIFT"
+                  ? "border-amber-500/50 bg-amber-950/25"
+                  : anomalyReport && anomalyReport.health_status === "WARNING_DRIFT"
+                  ? "border-yellow-500/40 bg-yellow-950/20"
+                  : "border-slate-800 bg-slate-900/90"
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                  <PulseIcon />
+                  <span>Santé du workload en direct</span>
+                  {anomalyReport && (
+                    <span
+                      className={`text-[11px] px-2 py-0.5 rounded-full font-mono border ${
+                        anomalyReport.health_status === "HEALTHY"
+                          ? "bg-emerald-950 text-emerald-400 border-emerald-800/60"
+                          : anomalyReport.health_status === "CRITICAL_DRIFT"
+                          ? "bg-rose-950 text-rose-300 border-rose-800/60"
+                          : "bg-amber-950 text-amber-300 border-amber-800/60"
+                      }`}
+                    >
+                      {anomalyReport.health_status}
+                    </span>
+                  )}
+                </h2>
+                <button
+                  onClick={fetchAnomalies}
+                  disabled={loadingAnomalies}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                >
+                  {loadingAnomalies ? "Analyse…" : "Réévaluer la dérive"}
+                </button>
+              </div>
+
+              {loadingAnomalies && (
+                <div className="text-sm text-slate-400 py-4 text-center">Analyse de la télémétrie…</div>
+              )}
+
+              {!loadingAnomalies && anomaliesError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">
+                  <div className="font-semibold mb-1">Détection d'anomalies indisponible</div>
+                  <div className="font-mono break-words">{anomaliesError}</div>
+                </div>
+              )}
+
+              {!loadingAnomalies && !anomaliesError && anomalyReport && (
+                <div className="space-y-3">
+                  {/* Four deterministic gauges: spend velocity, trajectory,
+                      progress lag, and unsaved work exposed to preemption. */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <DriftGauge
+                      label="Taux de consommation"
+                      value={anomalyReport.telemetry.actual_burn_rate_eur_hr}
+                      max={Math.max(
+                        num(anomalyReport.telemetry.planned_burn_rate_eur_hr) * 2,
+                        num(anomalyReport.telemetry.actual_burn_rate_eur_hr)
+                      )}
+                      unit="€/h"
+                      tone={
+                        num(anomalyReport.telemetry.burn_rate_drift_pct) > 35
+                          ? "danger"
+                          : num(anomalyReport.telemetry.burn_rate_drift_pct) > 15
+                          ? "warn"
+                          : "ok"
+                      }
+                      caption={`Plan : ${fmt(anomalyReport.telemetry.planned_burn_rate_eur_hr, 2)} €/h · dérive ${
+                        num(anomalyReport.telemetry.burn_rate_drift_pct) >= 0 ? "+" : ""
+                      }${fmt(anomalyReport.telemetry.burn_rate_drift_pct, 1)} %`}
+                    />
+                    <DriftGauge
+                      label="Coût final projeté"
+                      value={anomalyReport.telemetry.projected_total_cost_eur}
+                      max={Math.max(num(budget), num(anomalyReport.telemetry.projected_total_cost_eur))}
+                      unit="€"
+                      tone={
+                        num(anomalyReport.telemetry.projected_total_cost_eur) > num(budget)
+                          ? "danger"
+                          : num(anomalyReport.telemetry.projected_total_cost_eur) > num(budget) * 0.85
+                          ? "warn"
+                          : "ok"
+                      }
+                      caption={`Plafond déclaré : ${fmt(budget, 2)} €`}
+                    />
+                    <DriftGauge
+                      label="Avancement observé"
+                      value={anomalyReport.telemetry.actual_progress_pct}
+                      max={100}
+                      unit="%"
+                      tone={
+                        num(anomalyReport.telemetry.expected_progress_pct) -
+                          num(anomalyReport.telemetry.actual_progress_pct) >=
+                        25
+                          ? "danger"
+                          : "ok"
+                      }
+                      caption={`Attendu à cet instant : ${fmt(
+                        anomalyReport.telemetry.expected_progress_pct,
+                        1
+                      )} %`}
+                    />
+                    <DriftGauge
+                      label="Travail non sauvegardé"
+                      value={anomalyReport.telemetry.uncommitted_minutes_at_risk}
+                      max={Math.max(
+                        num(anomalyReport.telemetry.young_daly_optimal_checkpoint_minutes) * 2,
+                        num(anomalyReport.telemetry.uncommitted_minutes_at_risk)
+                      )}
+                      unit="min"
+                      tone={
+                        num(anomalyReport.telemetry.uncommitted_minutes_at_risk) >
+                        num(anomalyReport.telemetry.young_daly_optimal_checkpoint_minutes) * 1.1
+                          ? "danger"
+                          : "ok"
+                      }
+                      caption={`Optimum Young-Daly : ${fmt(
+                        anomalyReport.telemetry.young_daly_optimal_checkpoint_minutes,
+                        1
+                      )} min · ${fmt(
+                        anomalyReport.telemetry.uncommitted_cost_at_risk_eur,
+                        3
+                      )} € exposés à une préemption`}
+                    />
+                  </div>
+
+                  {anomalyReport.anomaly_count === 0 && (
+                    <div className="text-xs text-emerald-300/90 flex items-center gap-1.5">
+                      <CheckCircleIcon />
+                      Aucune anomalie : trajectoire de coût, de progression et de checkpoint conformes au plan.
+                    </div>
+                  )}
+
+                  {anomalyReport.anomalies.map((a, i) => (
+                    <div
+                      key={i}
+                      className={`rounded-lg border p-3 text-xs space-y-1 ${
+                        a.severity === "CRITICAL"
+                          ? "border-rose-500/40 bg-rose-500/10 text-rose-100"
+                          : a.severity === "HIGH"
+                          ? "border-amber-500/40 bg-amber-500/10 text-amber-100"
+                          : "border-yellow-500/30 bg-yellow-500/5 text-yellow-100"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-950/60 border border-slate-700">
+                          {a.severity}
+                        </span>
+                        <span className="font-semibold">{a.title}</span>
+                      </div>
+                      <div className="text-slate-300/90">{a.observed_facts}</div>
+                      <div className="text-slate-400">
+                        <span className="uppercase tracking-wider text-[10px]">Action recommandée : </span>
+                        {a.recommended_action}
+                      </div>
+                      <div className="font-mono text-[10px] text-slate-500">{a.code}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Main 2-Column Dashboard */}
           {activeTab === 'mission' && (
@@ -1466,14 +2022,74 @@
                     </div>
                   )}
 
+                  {/* 4D Pareto frontier. The dominance analysis was already
+                      computed server-side and surfaced only as a text badge;
+                      plotted, the trade-off between a cheap fragile plan and a
+                      fast green one becomes readable at a glance. */}
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                        Frontière de Pareto 4D — coût × temps × risque Spot × carbone
+                      </h3>
+                      {planComparison.pareto_frontier && (
+                        <span className="text-[11px] font-mono text-slate-400">
+                          {planComparison.pareto_frontier.pareto_optimal_count} non dominé(s) sur{" "}
+                          {planComparison.pareto_frontier.total_evaluated}
+                        </span>
+                      )}
+                    </div>
+
+                    <ParetoScatter
+                      plans={planComparison.plans}
+                      selectedPlanId={selectedPlanId}
+                      onSelect={setSelectedPlanId}
+                    />
+
+                    {planComparison.pareto_frontier &&
+                      planComparison.pareto_frontier.recommendations_by_objective && (
+                        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 pt-2 border-t border-slate-800">
+                          {[
+                            ["min_cost", "Coût minimal"],
+                            ["min_latency", "Plus rapide"],
+                            ["max_resilience", "Plus résilient"],
+                            ["min_carbon", "Plus sobre"],
+                            ["balanced_utility", "Meilleur compromis"],
+                          ].map(([key, label]) => {
+                            const pid =
+                              planComparison.pareto_frontier.recommendations_by_objective[key];
+                            if (!pid) return null;
+                            return (
+                              <button
+                                key={key}
+                                onClick={() => setSelectedPlanId(pid)}
+                                className={`text-left px-2 py-1.5 rounded-lg border transition-colors ${
+                                  selectedPlanId === pid
+                                    ? "border-cyan-500/50 bg-cyan-500/10"
+                                    : "border-slate-800 hover:border-slate-700 hover:bg-slate-900"
+                                }`}
+                              >
+                                <div className="text-[10px] uppercase tracking-wider text-slate-400">
+                                  {label}
+                                </div>
+                                <div className="text-[11px] font-mono text-cyan-300 truncate">{pid}</div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                  </div>
+
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     {planComparison.plans.map((plan) => (
                       <div
                         key={plan.plan_id}
-                        className={`rounded-xl border p-4 space-y-2 ${
-                          approvedPlanId === plan.plan_id
+                        onClick={() => setSelectedPlanId(plan.plan_id)}
+                        className={`rounded-xl border p-4 space-y-2 cursor-pointer transition-all ${
+                          selectedPlanId === plan.plan_id
+                            ? "border-cyan-400/70 bg-cyan-500/5 ring-1 ring-cyan-400/40"
+                            : approvedPlanId === plan.plan_id
                             ? "border-emerald-500/50 bg-emerald-500/5"
-                            : "border-slate-800 bg-slate-950/60"
+                            : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
                         }`}
                       >
                         <div className="flex items-center justify-between">
@@ -1571,11 +2187,12 @@
                               : "Approuver"}
                           </button>
                           <button
-                            onClick={() => handleExecutePlan(plan)}
+                            onClick={() => setPendingExecution(plan)}
                             disabled={executingPlanId === plan.plan_id}
                             className="flex-1 px-2 py-1.5 text-xs rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 disabled:opacity-50"
+                            title="Ouvre un récapitulatif d'impact ; rien n'est soumis avant confirmation."
                           >
-                            {executingPlanId === plan.plan_id ? "Soumission…" : "Exécuter"}
+                            {executingPlanId === plan.plan_id ? "Soumission…" : "Exécuter…"}
                           </button>
                         </div>
                         <button
@@ -1590,41 +2207,244 @@
                     ))}
                   </div>
 
-                  {planComparison.what_if_summary && Array.isArray(planComparison.what_if_summary.plan_stress_results) && (
-                    <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 space-y-2 text-xs">
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold uppercase tracking-wider text-cyan-300">
-                          Simulateur de Stress What-If (Tempête Spot 2x · Choc Budget -20% · Compression SLA -25%)
-                        </span>
-                        {planComparison.what_if_summary.most_resilient_plan_id && (
-                          <span className="font-mono text-emerald-300">
-                            Plus résilient : {planComparison.what_if_summary.most_resilient_plan_id}
+                  {/* Interactive What-If stress simulator. The engine accepted
+                      shock parameters from the start, but the dashboard only
+                      ever rendered the default run (2 preemptions / -20% /
+                      -25%). The sliders send the operator's own scenario and
+                      re-rank the plans by how many shocks they survive. */}
+                  {(() => {
+                    const staticSummary =
+                      planComparison.what_if_summary &&
+                      Array.isArray(planComparison.what_if_summary.plan_stress_results)
+                        ? planComparison.what_if_summary
+                        : null;
+                    // Live result wins; the comparison payload is the seed.
+                    const wi = whatIfResult || staticSummary;
+                    const isLive = Boolean(whatIfResult);
+                    if (!wi) return null;
+
+                    const survivalCount = (sr) =>
+                      (sr.spot_storm_scenario.survives ? 1 : 0) +
+                      (sr.budget_shock_scenario.survives ? 1 : 0) +
+                      (sr.deadline_compression_scenario.survives ? 1 : 0);
+
+                    // Most resilient first: the ranking is the point of the panel.
+                    const ranked = wi.plan_stress_results
+                      .slice()
+                      .sort((a, b) => survivalCount(b) - survivalCount(a));
+
+                    return (
+                      <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 space-y-3 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-semibold uppercase tracking-wider text-cyan-300">
+                            Simulateur de stress What-If
                           </span>
-                        )}
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-1">
-                        {planComparison.what_if_summary.plan_stress_results.map((sr) => (
-                          <div key={sr.plan_id} className="rounded-lg border border-slate-800/80 bg-slate-900/60 p-2.5 space-y-1">
-                            <div className="flex items-center justify-between font-mono">
-                              <span className="text-slate-200 font-semibold truncate">{sr.plan_id}</span>
-                              <span className={sr.resilience_verdict === "HIGHLY_RESILIENT" ? "text-emerald-400" : sr.resilience_verdict === "MODERATELY_RESILIENT" ? "text-amber-300" : "text-rose-400"}>
-                                {sr.resilience_verdict}
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`font-mono text-[10px] px-2 py-0.5 rounded-full border ${
+                                isLive
+                                  ? "bg-cyan-950 text-cyan-300 border-cyan-800/60"
+                                  : "bg-slate-900 text-slate-400 border-slate-700"
+                              }`}
+                            >
+                              {isLive ? "scénario opérateur" : "scénario par défaut"}
+                            </span>
+                            {wi.most_resilient_plan_id && (
+                              <span className="font-mono text-emerald-300">
+                                Plus résilient : {wi.most_resilient_plan_id}
                               </span>
-                            </div>
-                            <div className="text-slate-400 font-mono text-[11px]">
-                              Tempête Spot (2x) : {fmt(sr.spot_storm_scenario.storm_cost_eur, 2)} € · {fmt(sr.spot_storm_scenario.storm_duration_minutes, 1)}m{" "}
-                              {sr.spot_storm_scenario.survives ? "✓" : "✗"}
-                            </div>
-                            {Array.isArray(sr.mitigation_recommendations) && sr.mitigation_recommendations.length > 0 && (
-                              <div className="text-[11px] text-amber-200/90 pt-0.5">
-                                💡 {sr.mitigation_recommendations[0]}
-                              </div>
                             )}
                           </div>
-                        ))}
+                        </div>
+
+                        {/* Shock controls */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-1 pb-2 border-y border-slate-800 py-3">
+                          <div className="space-y-1">
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">Tempête Spot (préemptions forcées)</span>
+                              <span className="text-cyan-400 font-mono font-medium">
+                                {whatIfPreemptions}×
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="0"
+                              max="6"
+                              step="1"
+                              value={whatIfPreemptions}
+                              onChange={(e) => setWhatIfPreemptions(Number(e.target.value))}
+                              className="w-full accent-cyan-500 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">Choc budgétaire</span>
+                              <span className="text-cyan-400 font-mono font-medium">
+                                {whatIfBudgetShock} %
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="-80"
+                              max="0"
+                              step="5"
+                              value={whatIfBudgetShock}
+                              onChange={(e) => setWhatIfBudgetShock(Number(e.target.value))}
+                              className="w-full accent-amber-500 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">Compression de deadline</span>
+                              <span className="text-cyan-400 font-mono font-medium">
+                                {whatIfDeadlineCompression} %
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="-80"
+                              max="0"
+                              step="5"
+                              value={whatIfDeadlineCompression}
+                              onChange={(e) => setWhatIfDeadlineCompression(Number(e.target.value))}
+                              className="w-full accent-rose-500 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-slate-500 text-[11px]">
+                            {wi.parameters && (
+                              <>
+                                Budget choqué :{" "}
+                                <span className="font-mono text-slate-300">
+                                  {wi.parameters.shocked_budget_eur === null ||
+                                  wi.parameters.shocked_budget_eur === undefined
+                                    ? "non déclaré"
+                                    : fmt(wi.parameters.shocked_budget_eur, 2) + " €"}
+                                </span>{" "}
+                                · Deadline comprimée :{" "}
+                                <span className="font-mono text-slate-300">
+                                  {wi.parameters.compressed_deadline_minutes === null ||
+                                  wi.parameters.compressed_deadline_minutes === undefined
+                                    ? "non déclarée"
+                                    : fmt(wi.parameters.compressed_deadline_minutes, 1) + " min"}
+                                </span>
+                              </>
+                            )}
+                          </span>
+                          <div className="flex items-center gap-2">
+                            {isLive && (
+                              <button
+                                onClick={() => {
+                                  setWhatIfResult(null);
+                                  setWhatIfError(null);
+                                  setWhatIfPreemptions(2);
+                                  setWhatIfBudgetShock(-20);
+                                  setWhatIfDeadlineCompression(-25);
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300"
+                              >
+                                Réinitialiser
+                              </button>
+                            )}
+                            <button
+                              onClick={() => runWhatIf()}
+                              disabled={loadingWhatIf}
+                              className="px-3 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 border border-cyan-500/50 text-white font-medium disabled:opacity-50"
+                            >
+                              {loadingWhatIf ? "Simulation…" : "Rejouer les scénarios"}
+                            </button>
+                          </div>
+                        </div>
+
+                        {whatIfError && (
+                          <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-rose-200">
+                            <div className="font-semibold mb-1">Simulation impossible</div>
+                            <div className="font-mono break-words">{whatIfError}</div>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                          {ranked.map((sr) => {
+                            const survived = survivalCount(sr);
+                            return (
+                              <div
+                                key={sr.plan_id}
+                                onClick={() => setSelectedPlanId(sr.plan_id)}
+                                className={`rounded-lg border p-2.5 space-y-1.5 cursor-pointer transition-colors ${
+                                  selectedPlanId === sr.plan_id
+                                    ? "border-cyan-400/60 bg-cyan-500/5"
+                                    : "border-slate-800/80 bg-slate-900/60 hover:border-slate-700"
+                                }`}
+                              >
+                                <div className="flex items-center justify-between font-mono">
+                                  <span className="text-slate-200 font-semibold truncate">
+                                    {sr.plan_id}
+                                  </span>
+                                  <span
+                                    className={
+                                      sr.resilience_verdict === "HIGHLY_RESILIENT"
+                                        ? "text-emerald-400"
+                                        : sr.resilience_verdict === "MODERATELY_RESILIENT"
+                                        ? "text-amber-300"
+                                        : "text-rose-400"
+                                    }
+                                  >
+                                    {survived}/3
+                                  </span>
+                                </div>
+
+                                {/* One chip per scenario: pass/fail is the signal. */}
+                                <div className="flex items-center gap-1">
+                                  {[
+                                    ["Spot", sr.spot_storm_scenario.survives],
+                                    ["Budget", sr.budget_shock_scenario.survives],
+                                    ["SLA", sr.deadline_compression_scenario.survives],
+                                  ].map(([lbl, ok]) => (
+                                    <span
+                                      key={lbl}
+                                      className={`flex-1 text-center text-[10px] font-mono px-1 py-0.5 rounded border ${
+                                        ok
+                                          ? "bg-emerald-950/60 text-emerald-300 border-emerald-800/50"
+                                          : "bg-rose-950/60 text-rose-300 border-rose-800/50"
+                                      }`}
+                                    >
+                                      {lbl} {ok ? "✓" : "✗"}
+                                    </span>
+                                  ))}
+                                </div>
+
+                                <div className="text-slate-400 font-mono text-[11px] leading-relaxed">
+                                  Sous tempête : {fmt(sr.spot_storm_scenario.storm_cost_eur, 2)} € ·{" "}
+                                  {fmt(sr.spot_storm_scenario.storm_duration_minutes, 1)} min
+                                  {num(sr.spot_storm_scenario.extra_delay_minutes) > 0 && (
+                                    <span className="text-amber-300">
+                                      {" "}
+                                      (+{fmt(sr.spot_storm_scenario.extra_delay_minutes, 1)} min perdues)
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-slate-500 font-mono text-[10px]">
+                                  Base : {fmt(sr.baseline_cost_eur, 2)} € ·{" "}
+                                  {fmt(sr.baseline_duration_minutes, 1)} min · {sr.provisioning_model}
+                                </div>
+
+                                {Array.isArray(sr.mitigation_recommendations) &&
+                                  sr.mitigation_recommendations.length > 0 && (
+                                    <div className="text-[11px] text-amber-200/90 pt-0.5">
+                                      💡 {sr.mitigation_recommendations[0]}
+                                    </div>
+                                  )}
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    );
+                  })()}
 
                   {fallbackVerdict && (
                     <div
@@ -2025,6 +2845,511 @@
             </div>
           )}
 
+
+          {/* Executive FinOps & GreenOps board. Everything here is aggregated
+              server-side from the reconciliation store; the page only reads it.
+              The ROI of Spot hedging and the carbon cost of a region choice had
+              no surface before this tab existed. */}
+          {activeTab === 'finops' && (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                  Portefeuille FinOps &amp; GreenOps — flotte complète
+                </h2>
+                <button
+                  onClick={fetchFinops}
+                  disabled={loadingFinops}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 disabled:opacity-50"
+                >
+                  {loadingFinops ? "Agrégation…" : "Rafraîchir"}
+                </button>
+              </div>
+
+              {loadingFinops && (
+                <div className="text-sm text-slate-400 py-8 text-center">
+                  Agrégation du portefeuille…
+                </div>
+              )}
+
+              {!loadingFinops && finopsError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
+                  <div className="font-semibold mb-1">Analytique de portefeuille indisponible</div>
+                  <div className="font-mono text-xs break-words">{finopsError}</div>
+                </div>
+              )}
+
+              {!loadingFinops && !finopsError && finops && finops.total_workloads === 0 && (
+                <div className="text-sm text-slate-500 py-8 text-center">
+                  Aucun workload dans l'historique. Exécutez un plan pour alimenter le portefeuille :
+                  les montants affichés proviennent exclusivement des exécutions enregistrées.
+                </div>
+              )}
+
+              {!loadingFinops && !finopsError && finops && finops.total_workloads > 0 && (
+                <div className="space-y-6">
+                  {/* Executive KPI row */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <KpiTile
+                      icon={<WalletIcon />}
+                      label="Dépense effective"
+                      value={fmt(
+                        finops.financial_tiers.tier2_verified_usage_total_eur > 0
+                          ? finops.financial_tiers.tier2_verified_usage_total_eur
+                          : finops.financial_tiers.tier1_estimated_total_eur,
+                        2
+                      )}
+                      unit="€"
+                      sub={`${finops.total_workloads} workload(s) · ${
+                        finops.financial_tiers.tier2_verified_usage_total_eur > 0
+                          ? "coût mesuré sur allocation observée"
+                          : "estimations seules, aucun usage vérifié"
+                      }`}
+                    />
+                    <KpiTile
+                      icon={<WalletIcon />}
+                      label="Économies Spot"
+                      value={fmt(finops.financial_tiers.spot_hedging_savings_eur, 2)}
+                      unit="€"
+                      tone={finops.financial_tiers.spot_hedging_savings_eur > 0 ? "green" : undefined}
+                      sub={`${fmt(
+                        finops.financial_tiers.spot_hedging_savings_pct,
+                        1
+                      )} % sous la référence 100 % Standard (${fmt(
+                        finops.financial_tiers.on_demand_baseline_equivalent_eur,
+                        2
+                      )} €)`}
+                    />
+                    <KpiTile
+                      icon={<LeafIcon />}
+                      label="Empreinte carbone"
+                      value={fmt(finops.sustainability_metrics.total_carbon_emissions_g_co2, 1)}
+                      unit="gCO₂"
+                      sub={`${fmt(finops.sustainability_metrics.total_energy_kwh, 4)} kWh · ${fmt(
+                        finops.sustainability_metrics.potential_green_routing_savings_g_co2,
+                        1
+                      )} gCO₂ évitables par routage vert`}
+                    />
+                    <KpiTile
+                      icon={<ShieldCheckIcon />}
+                      label="Conformité SLA"
+                      value={fmt(finops.reliability_and_governance.sla_compliance_rate_pct, 1)}
+                      unit="%"
+                      tone={
+                        finops.reliability_and_governance.sla_compliance_rate_pct >= 95
+                          ? "green"
+                          : finops.reliability_and_governance.sla_compliance_rate_pct >= 80
+                          ? "amber"
+                          : undefined
+                      }
+                      sub={
+                        finops.reliability_and_governance.sla_evaluated_workloads === 0
+                          ? "aucun workload ne déclare de deadline : rien à évaluer"
+                          : `${finops.reliability_and_governance.sla_compliant_workloads}/${finops.reliability_and_governance.sla_evaluated_workloads} dans les délais`
+                      }
+                    />
+                  </div>
+
+                  {/* 3-tier financial reconciliation */}
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-4">
+                    <div>
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                        Réconciliation financière à 3 tiers
+                      </h3>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        Estimé, mesuré et facturé restent séparés : un montant estimé n'est pas un
+                        montant observé, et un montant observé n'est pas une facture.
+                      </p>
+                    </div>
+
+                    {(() => {
+                      const t = finops.financial_tiers;
+                      const scale = Math.max(
+                        num(t.on_demand_baseline_equivalent_eur),
+                        num(t.tier1_estimated_total_eur),
+                        num(t.tier2_verified_usage_total_eur),
+                        num(t.tier3_reconciled_billed_total_eur),
+                        0.01
+                      );
+                      return (
+                        <div className="space-y-3">
+                          <ReconciliationBar
+                            label="Référence 100 % Standard (contrefactuel)"
+                            value={t.on_demand_baseline_equivalent_eur}
+                            max={scale}
+                            colorClass="bg-slate-600"
+                            hint="Ce que la même flotte aurait coûté sans arbitrage Spot."
+                          />
+                          <ReconciliationBar
+                            label="Tier 1 · Estimé au moment du plan"
+                            value={t.tier1_estimated_total_eur}
+                            max={scale}
+                            colorClass="bg-sky-500"
+                            hint="Hypothèse déterministe produite par le moteur de plans."
+                          />
+                          <ReconciliationBar
+                            label="Tier 2 · Mesuré sur allocation observée"
+                            value={t.tier2_verified_usage_total_eur}
+                            max={scale}
+                            colorClass="bg-cyan-400"
+                            hint="Calculé depuis la télémétrie contrôleur, jamais depuis la demande."
+                          />
+                          <ReconciliationBar
+                            label="Tier 3 · Réconcilié avec la facturation"
+                            value={t.tier3_reconciled_billed_total_eur}
+                            max={scale}
+                            colorClass="bg-emerald-400"
+                            hint={
+                              num(t.tier3_reconciled_billed_total_eur) === 0
+                                ? "Aucune exécution n'a encore été rapprochée d'une facture."
+                                : "Montants confirmés par la source de facturation."
+                            }
+                          />
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    {/* Carbon detail */}
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                        <LeafIcon />
+                        <span>Bilan carbone et routage vert</span>
+                      </h3>
+                      {(() => {
+                        const s = finops.sustainability_metrics;
+                        const emitted = num(s.total_carbon_emissions_g_co2);
+                        const avoidable = num(s.potential_green_routing_savings_g_co2);
+                        const pct = emitted > 0 ? Math.min(100, (avoidable / emitted) * 100) : 0;
+                        return (
+                          <div className="space-y-3">
+                            <div className="flex items-baseline justify-between text-xs">
+                              <span className="text-slate-400">Émis</span>
+                              <span className="font-mono text-slate-100">{fmt(emitted, 1)} gCO₂</span>
+                            </div>
+                            <div className="w-full bg-slate-800 h-3 rounded-md overflow-hidden flex">
+                              <div
+                                className="h-full bg-emerald-500/80"
+                                style={{ width: `${100 - pct}%` }}
+                              />
+                              <div className="h-full bg-amber-500/80" style={{ width: `${pct}%` }} />
+                            </div>
+                            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-emerald-500/80" />
+                                Incompressible à région constante
+                              </span>
+                              <span className="flex items-center gap-1.5">
+                                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-amber-500/80" />
+                                Évitable par routage vert ({fmt(pct, 0)} %)
+                              </span>
+                            </div>
+                            <div className="text-xs text-slate-400 pt-2 border-t border-slate-800">
+                              Énergie consommée :{" "}
+                              <span className="font-mono text-slate-200">
+                                {fmt(s.total_energy_kwh, 4)} kWh
+                              </span>
+                              <div className="text-[11px] text-slate-500 mt-1">
+                                Le gain de routage suppose un déplacement autorisé de la charge ; il
+                                n'est pas applicable tant que le profil interdit le changement de
+                                région.
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+
+                    {/* Governance distribution */}
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                        <ShieldCheckIcon />
+                        <span>Répartition des modes de gouvernance</span>
+                      </h3>
+                      {(() => {
+                        const dist =
+                          finops.reliability_and_governance.control_mode_distribution || {};
+                        const total = Math.max(
+                          num(dist.advisory) + num(dist.validation) + num(dist.delegation),
+                          1
+                        );
+                        const rows = [
+                          ["advisory", "Advisory (lecture seule)", "bg-amber-400"],
+                          ["validation", "Validation (approbation humaine)", "bg-cyan-400"],
+                          ["delegation", "Délégation (autonomie bornée)", "bg-emerald-400"],
+                        ];
+                        return (
+                          <div className="space-y-3">
+                            {rows.map(([key, label, color]) => (
+                              <div key={key} className="space-y-1">
+                                <div className="flex items-baseline justify-between text-xs">
+                                  <span className="text-slate-300">{label}</span>
+                                  <span className="font-mono text-slate-100">
+                                    {num(dist[key])} ({fmt((num(dist[key]) / total) * 100, 0)} %)
+                                  </span>
+                                </div>
+                                <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                                  <div
+                                    className={`h-full rounded-full transition-all duration-700 ${color}`}
+                                    style={{ width: `${(num(dist[key]) / total) * 100}%` }}
+                                  />
+                                </div>
+                              </div>
+                            ))}
+                            <div className="text-[11px] text-slate-500 pt-1 border-t border-slate-800">
+                              Le mode indiqué est celui que le serveur a réellement appliqué à
+                              l'exécution, pas celui demandé par l'appelant.
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Pre-actuation impact preview. The server is still the only thing
+              that decides whether a submission is allowed; this dialog exists so
+              the operator sees what is about to be committed before the request
+              leaves the browser, instead of discovering it in the result banner. */}
+          {pendingExecution && (() => {
+            const plan = pendingExecution;
+            const mode = serverControl ? serverControl.control_mode : controlMode;
+            const isApproved = approvedPlanId === plan.plan_id;
+            const cost = num(plan.estimated_cost_eur);
+            const stressCost =
+              plan.expected_cost_with_preemption_eur === null ||
+              plan.expected_cost_with_preemption_eur === undefined
+                ? null
+                : num(plan.expected_cost_with_preemption_eur);
+            const eta = num(plan.total_time_to_result_minutes);
+            const remaining = serverControl
+              ? num(serverControl.remaining_delegated_budget_eur)
+              : null;
+
+            // Blocking conditions, stated before the request is sent. The
+            // server re-checks all of them; this is a preview, not a gate.
+            const warnings = [];
+            if (plan.executable_on_runtime === false) {
+              warnings.push(
+                "Ce plan n'est pas exécutable sur le runtime actuellement attaché : la soumission sera refusée."
+              );
+            }
+            if (mode === "advisory") {
+              warnings.push(
+                "Mode advisory : le serveur n'autorise aucune mutation. La soumission sera refusée."
+              );
+            }
+            if (mode === "validation" && !isApproved) {
+              warnings.push(
+                "Mode validation : ce plan n'a pas d'approbation enregistrée côté serveur. Approuvez-le d'abord."
+              );
+            }
+            if (mode === "delegation" && remaining !== null && cost > remaining) {
+              warnings.push(
+                `Plafond délégué dépassé : ${fmt(cost, 2)} € demandés pour ${fmt(
+                  remaining,
+                  2
+                )} € restants.`
+              );
+            }
+            if (cost > num(budget)) {
+              warnings.push(
+                `Coût estimé (${fmt(cost, 2)} €) au-dessus du budget déclaré (${fmt(budget, 2)} €).`
+              );
+            }
+            if (eta > num(deadline)) {
+              warnings.push(
+                `Durée projetée (${fmt(eta, 1)} min) au-delà du délai déclaré (${fmt(
+                  deadline,
+                  0
+                )} min).`
+              );
+            }
+            if (plan.capacity_status && plan.capacity_status !== "QUOTA_AVAILABLE") {
+              warnings.push(
+                `Capacité non confirmée (${plan.capacity_status}) : ${
+                  plan.capacity_detail || "aucun quota n'a été vérifié pour cette forme."
+                }`
+              );
+            }
+
+            return (
+              <div
+                className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4"
+                onClick={() => setPendingExecution(null)}
+              >
+                <div
+                  className="w-full max-w-2xl max-h-[88vh] overflow-y-auto custom-scrollbar rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex items-start justify-between gap-4 p-5 border-b border-slate-800">
+                    <div>
+                      <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-200">
+                        Prévisualisation d'impact
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Rien n'a encore été soumis. Le serveur revérifiera le mode, l'approbation et
+                        les plafonds avant toute mutation.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setPendingExecution(null)}
+                      className="text-slate-500 hover:text-slate-200 text-xl leading-none px-2"
+                      aria-label="Fermer"
+                    >
+                      ×
+                    </button>
+                  </div>
+
+                  <div className="p-5 space-y-4">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-100">{plan.title}</div>
+                      <div className="text-xs font-mono text-slate-400">{plan.plan_id}</div>
+                    </div>
+
+                    {/* What is actually being committed */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                      {[
+                        ["Machine", plan.machine_type],
+                        ["vCPU", `${plan.cpu}${num(plan.gpu) > 0 ? ` · ${plan.gpu} GPU` : ""}`],
+                        ["Quantité", plan.quantity || 1],
+                        ["Région", plan.zone ? `${plan.region} / ${plan.zone}` : plan.region],
+                        ["Provisionnement", plan.provisioning_model],
+                        ["Capacité", plan.capacity_status || "NOT_CHECKED"],
+                      ].map(([k, v]) => (
+                        <div key={k} className="rounded-lg border border-slate-800 bg-slate-950/60 p-2.5">
+                          <div className="text-[10px] uppercase tracking-wider text-slate-500">{k}</div>
+                          <div className="text-xs font-mono text-slate-200 break-words">{v}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Financial and temporal envelope */}
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 space-y-2 text-xs">
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Coût estimé</span>
+                        <span className="font-mono text-cyan-300">{fmt(cost, 2)} €</span>
+                      </div>
+                      {stressCost !== null && (
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">Coût attendu avec préemptions</span>
+                          <span className="font-mono text-amber-300">{fmt(stressCost, 2)} €</span>
+                        </div>
+                      )}
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Durée jusqu'au résultat</span>
+                        <span className="font-mono text-slate-200">
+                          {fmt(eta, 1)} min / {fmt(deadline, 0)} min déclarées
+                        </span>
+                      </div>
+                      {num(plan.carbon_emissions_g_co2) > 0 && (
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">Empreinte carbone</span>
+                          <span
+                            className={`font-mono ${
+                              plan.green_tier === "LOW_CARBON"
+                                ? "text-emerald-300"
+                                : plan.green_tier === "HIGH_CARBON"
+                                ? "text-amber-300"
+                                : "text-slate-200"
+                            }`}
+                          >
+                            {fmt(plan.carbon_emissions_g_co2, 1)} gCO₂
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex justify-between pt-2 border-t border-slate-800">
+                        <span className="text-slate-400">Base du coût</span>
+                        <span className="font-mono text-slate-400">
+                          {plan.cost_basis || "modelled_flat_rate_hypothesis"}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Governance envelope enforced by the server */}
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 space-y-2 text-xs">
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Mode appliqué par le serveur</span>
+                        <span className="font-mono text-amber-300 uppercase">{mode}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Approbation enregistrée</span>
+                        <span className={`font-mono ${isApproved ? "text-emerald-300" : "text-rose-300"}`}>
+                          {isApproved ? "oui" : "non"}
+                        </span>
+                      </div>
+                      {mode === "delegation" && serverControl && (
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">Reste du plafond délégué</span>
+                          <span className="font-mono text-emerald-300">
+                            {fmt(serverControl.remaining_delegated_budget_eur, 2)} € (engagé{" "}
+                            {fmt(serverControl.committed_cost_eur, 2)} €)
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Plan de repli déclaré</span>
+                        <span className="font-mono text-slate-200">
+                          {plan.fallback_plan_id || "aucun"}
+                        </span>
+                      </div>
+                    </div>
+
+                    {warnings.length > 0 && (
+                      <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-100 space-y-1">
+                        <div className="font-semibold uppercase tracking-wider">
+                          À vérifier avant de soumettre
+                        </div>
+                        {warnings.map((w, i) => (
+                          <div key={i}>• {w}</div>
+                        ))}
+                      </div>
+                    )}
+
+                    {Array.isArray(plan.unverified_points) && plan.unverified_points.length > 0 && (
+                      <div className="text-[11px] text-slate-500 space-y-0.5">
+                        <div className="uppercase tracking-wider">Points non vérifiés</div>
+                        {plan.unverified_points.map((u, i) => (
+                          <div key={i} className="font-mono">• {u}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 p-5 border-t border-slate-800">
+                    <button
+                      onClick={() => setPendingExecution(null)}
+                      className="px-4 py-2 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
+                    >
+                      Annuler
+                    </button>
+                    {!isApproved && mode === "validation" && (
+                      <button
+                        onClick={() => handleApprovePlan(plan.plan_id)}
+                        disabled={approvingPlanId === plan.plan_id}
+                        className="px-4 py-2 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 disabled:opacity-50"
+                      >
+                        {approvingPlanId === plan.plan_id ? "Envoi…" : "Approuver d'abord"}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => {
+                        setPendingExecution(null);
+                        handleExecutePlan(plan);
+                      }}
+                      disabled={executingPlanId === plan.plan_id}
+                      className="px-4 py-2 text-xs rounded-lg bg-cyan-600 hover:bg-cyan-500 border border-cyan-500/60 text-white font-semibold disabled:opacity-50"
+                    >
+                      {executingPlanId === plan.plan_id ? "Soumission…" : "Confirmer et soumettre"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
         </div>
       );

@@ -164,12 +164,43 @@ def render_tab(source: str, tab: str) -> dict:
     return json.loads(result)
 
 
+def seed_state(source: str, seeds: dict) -> str:
+    """Replace `useState(null)` initialisers so panels render populated.
+
+    The harness's ``useState`` returns whatever initial value the source
+    declares, so every data-driven panel otherwise renders its empty branch:
+    the Pareto scatter maths, the drift gauges and the reconciliation bars are
+    never executed, and a ``TypeError`` on a nested key would go unnoticed.
+    Seeding the initialiser is the only way to reach those paths without a
+    browser.
+
+    Raises ``RuntimeError`` when a name does not resolve to exactly one
+    ``useState(null)`` call, so a renamed state hook fails loudly instead of
+    silently reverting the test to the empty case.
+    """
+    seeded = source
+    for name, value in seeds.items():
+        setter = "set" + name[0].upper() + name[1:]
+        pattern = rf"(const \[{re.escape(name)}, {re.escape(setter)}\] = useState\()null(\))"
+        literal = json.dumps(value)
+        seeded, count = re.subn(
+            pattern, lambda m, lit=literal: m.group(1) + lit + m.group(2), seeded
+        )
+        if count != 1:
+            raise RuntimeError(
+                f"could not seed state `{name}`: matched {count} `useState(null)` "
+                f"declarations, expected exactly 1"
+            )
+    return seeded
+
+
 TAB_MARKERS = {
     "mission": ["Mission"],
     "plans": ["Comparaison de plans"],
     "capacity": ["Recherche de capacité compatible"],
     "diagnostics": ["Diagnostic des blocages"],
     "history": ["Coûts réels"],
+    "finops": ["Portefeuille FinOps"],
 }
 
 
