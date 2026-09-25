@@ -213,6 +213,7 @@ def compute_portfolio_finops_analytics(
     potential_green_savings_g = 0.0
     sla_met_count = 0
     sla_evaluated_count = 0
+    measured_count = 0
 
     control_counts = {"advisory": 0, "validation": 0, "delegation": 0}
 
@@ -225,10 +226,19 @@ def compute_portfolio_finops_analytics(
         est = float(r.get("initial_estimated_cost_eur") or 0.0)
         calc = float(r.get("final_calculated_cost_eur") or 0.0)
         rec_status = str(r.get("reconciliation_status") or "calculated_from_usage")
+        # A usage figure needs a usage measurement behind it. Rows written
+        # before the history record distinguished "estimated" carry
+        # "calculated_from_usage" with nothing observed; summing them made a
+        # queued run read as a measured 0.00.
+        measured_usage = rec_status == "reconciled_billed" or (
+            rec_status == "calculated_from_usage"
+            and float(r.get("final_actual_duration_minutes") or 0.0) > 0
+        )
 
         tier1_estimated_eur += est
-        if rec_status in ("calculated_from_usage", "reconciled_billed"):
+        if measured_usage:
             tier2_verified_eur += calc
+            measured_count += 1
         if rec_status == "reconciled_billed":
             tier3_billed_eur += calc
 
@@ -261,12 +271,16 @@ def compute_portfolio_finops_analytics(
         total_carbon_g += carb["carbon_emissions_g_co2"]
         potential_green_savings_g += carb["potential_co2_reduction_g"]
 
-        # SLA evaluation
+        # SLA evaluation. Only a measured duration says whether the deadline
+        # held: falling back to the estimate made every queued run "compliant"
+        # by construction, since plans are only offered when their estimate
+        # already fits the deadline.
         prof = r.get("profile") or {}
         deadline = prof.get("deadline_minutes_from_start")
-        if deadline is not None and dur > 0:
+        measured_dur = float(r.get("final_actual_duration_minutes") or 0.0)
+        if deadline is not None and measured_dur > 0:
             sla_evaluated_count += 1
-            if dur <= float(deadline):
+            if measured_dur <= float(deadline):
                 sla_met_count += 1
 
     effective_spend = tier2_verified_eur if tier2_verified_eur > 0 else tier1_estimated_eur
@@ -276,10 +290,11 @@ def compute_portfolio_finops_analytics(
         if standard_baseline_eur > 0
         else 0.0
     )
+    # No measured run means no compliance figure, not a perfect one.
     sla_rate = (
         round((sla_met_count / sla_evaluated_count) * 100.0, 1)
         if sla_evaluated_count > 0
-        else 100.0
+        else None
     )
 
     return {
@@ -287,6 +302,7 @@ def compute_portfolio_finops_analytics(
         "financial_tiers": {
             "tier1_estimated_total_eur": round(tier1_estimated_eur, 2),
             "tier2_verified_usage_total_eur": round(tier2_verified_eur, 2),
+            "measured_workloads": measured_count,
             "tier3_reconciled_billed_total_eur": round(tier3_billed_eur, 2),
             "on_demand_baseline_equivalent_eur": round(standard_baseline_eur, 2),
             "spot_hedging_savings_eur": spot_savings_eur,

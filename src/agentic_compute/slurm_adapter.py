@@ -448,9 +448,13 @@ class SlurmRuntime(RuntimeAdapter):
             "comment": comment_str,
             "admin_comment": comment_str,
         }
-        if req_mtype:
-            payload_job["features"] = req_mtype
-            payload_job["constraints"] = req_mtype
+        # No `features` / `constraints`: each partition maps to exactly one
+        # machine type, so the partition already pins the hardware, and a
+        # machine-type name is not a node feature on this cluster. Sending it
+        # made slurmctld reject every submission with ESLURM_INVALID_FEATURE
+        # (2029 "Invalid feature specification") on Slurm 25.11.8 / data_parser
+        # v0.0.41, where `features` is not even a job_desc field (it is ignored
+        # with a warning). The requested type is still recorded in `comment`.
         if memory_mb:
             payload_job["memory_per_node"] = memory_mb
         if gpu > 0:
@@ -983,9 +987,8 @@ class SlurmRuntime(RuntimeAdapter):
         )
 
         job_patch: dict[str, Any] = {"cpus_per_task": target_cpu}
-        if action.machine_type:
-            job_patch["features"] = action.machine_type
-            job_patch["constraints"] = action.machine_type
+        # The partition pins the machine type (see submit_job); a machine-type
+        # constraint is rejected by slurmctld as an invalid feature.
 
         for part_name, part_info in SUPPORTED_SLURM_PARTITIONS.items():
             if part_info["machine_type"] == target_machine_type:

@@ -260,7 +260,23 @@ class SimulatedRuntime(RuntimeAdapter):
             approved_by_operator=approved_by_operator,
         )
 
-        self.workload = _SimWorkload(id=name, allocated_cpu=allocated_cpu, allocated_gpu=gpu)
+        self.workload = _SimWorkload(
+            id=name,
+            allocated_cpu=allocated_cpu,
+            allocated_gpu=gpu,
+            # The snapshot reports these fields as the *observed* allocation.
+            # Leaving the dataclass defaults showed every submission as a
+            # verified n2-standard-32 / 100% Spot job, whatever the plan said.
+            machine_type=resolved_machine_type,
+            provisioning_mix=resolved_provisioning,
+            requested_cpu=allocated_cpu,
+            requested_machine_type=resolved_machine_type,
+            requested_provisioning_mix=resolved_provisioning,
+            verification_detail=(
+                f"Simulated allocation verified ({allocated_cpu} CPUs, "
+                f"{resolved_machine_type}, {resolved_provisioning})"
+            ),
+        )
         self.current_time_minutes = 0.0
         self.machine_type = resolved_machine_type
         self.provisioning_model = resolved_provisioning

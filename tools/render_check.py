@@ -59,9 +59,12 @@ out.outputText;
 HARNESS_PREFIX = r"""
 var __ACTIVE_TAB__ = "%(tab)s";
 var __errors = [];
+// Marks what createElement built, so a plain object reaching the tree can be
+// told apart from an element, as React does with $$typeof.
+var __ELEMENT = "agentgrid.render_check.element";
 
 function __mkEl(type, props, children) {
-  return { type: type, props: props || {}, children: children };
+  return { $$typeof: __ELEMENT, type: type, props: props || {}, children: children };
 }
 
 var React = {
@@ -81,8 +84,16 @@ var React = {
   createElement: function (type, props) {
     var children = Array.prototype.slice.call(arguments, 2);
     if (typeof type === "function") {
+      // React hands JSX children to a component as `props.children`; without
+      // this, everything inside <Tag> or <Fact> was never rendered or checked.
+      var merged = {};
+      if (props) {
+        for (var key in props) merged[key] = props[key];
+      }
+      if (children.length === 1) merged.children = children[0];
+      else if (children.length > 1) merged.children = children;
       try {
-        return type(props || {});
+        return type(merged);
       } catch (e) {
         __errors.push(String(e));
         return __mkEl("error", {}, []);
@@ -123,8 +134,20 @@ function __flatten(node, acc) {
     acc.push(String(node));
     return acc;
   }
+  // React renders nothing for a function child (it only warns).
+  if (typeof node === "function") return acc;
   if (Object.prototype.toString.call(node) === "[object Array]") {
     for (var i = 0; i < node.length; i++) __flatten(node[i], acc);
+    return acc;
+  }
+  if (node.$$typeof !== __ELEMENT) {
+    // React throws here (minified error #31) and unmounts the whole root, so
+    // a browser shows a blank page where this harness used to see nothing.
+    var keys = [];
+    for (var key in node) keys.push(key);
+    __errors.push(
+      "Objects are not valid as a React child (found: object with keys {" + keys.join(", ") + "})"
+    );
     return acc;
   }
   if (node.type) acc.push("<" + (typeof node.type === "string" ? node.type : "component") + ">");
@@ -137,7 +160,8 @@ function __flatten(node, acc) {
   return acc;
 }
 
-JSON.stringify({ errors: __errors, text: __flatten(__root, []).join(" ") });
+var __text = __flatten(__root, []).join(" ");
+JSON.stringify({ errors: __errors, text: __text });
 """
 
 
@@ -147,12 +171,21 @@ def _transpile(source: str) -> str:
 
 
 def _find_tab_state_index(source: str) -> int:
-    """Index of the ``useState`` call that holds the active tab."""
+    """Index of the ``useState`` call that holds the active tab.
+
+    The hook is found by its ``[activeTab, setActiveTab]`` binding, not by the
+    initial tab name, so renaming the landing tab cannot silently point the
+    harness at an unrelated piece of state. The index is textual, which equals
+    the runtime call order only while every ``useState`` lives in ``App``:
+    module-scope components must stay stateless.
+    """
     calls = [m.start() for m in re.finditer(r"useState\s*\(", source)]
-    marker = re.search(r'useState\s*\(\s*"mission"', source)
+    marker = re.search(
+        r"\[\s*activeTab\s*,\s*setActiveTab\s*\]\s*=\s*(useState)\s*\(", source
+    )
     if marker is None:
         raise RuntimeError('could not locate the useState call holding the active tab')
-    return calls.index(marker.start())
+    return calls.index(marker.start(1))
 
 
 def render_tab(source: str, tab: str) -> dict:
@@ -195,12 +228,14 @@ def seed_state(source: str, seeds: dict) -> str:
 
 
 TAB_MARKERS = {
-    "mission": ["Mission"],
-    "plans": ["Plan comparison"],
-    "capacity": ["Compatible capacity search"],
-    "diagnostics": ["Blocker diagnostics"],
-    "history": ["Actual costs"],
-    "finops": ["GreenOps portfolio"],
+    # The landing view must state the value before anything else.
+    "run": [
+        "Run batch jobs for less, without missing deadlines.",
+        "Describe the job",
+        "Every way to run this job, priced and timed",
+    ],
+    "ledger": ["Run ledger", "Deadlines met"],
+    "cluster": ["Live status", "Find capacity", "Why is my job waiting?"],
 }
 
 

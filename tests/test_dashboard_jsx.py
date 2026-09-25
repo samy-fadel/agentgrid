@@ -153,19 +153,75 @@ def test_render_harness_detects_a_tab_that_renders_nothing():
     assert "Mission" in mission["text"]
 
     plans = render_check.render_tab(source, "plans")
-    assert "Comparaison de plans" not in plans["text"]
+    assert "Mission" not in plans["text"]
+
+
+def test_render_harness_detects_an_object_rendered_as_a_child():
+    """Negative control: React refuses a plain object as a child (error #31).
+
+    The diagnosis panel rendered each `{action, consequences}` dict directly.
+    The fake React flattened it to nothing, while a browser threw and blanked
+    the whole page the moment the Cluster view opened.
+    """
+    import render_check
+
+    source = """
+      const { useState } = React;
+      function App() {
+        const [activeTab, setActiveTab] = useState("run");
+        const options = [{ action: "Wait", consequences: "No extra cost" }];
+        return <ul>{options.map((opt, i) => <li key={i}>{opt}</li>)}</ul>;
+      }
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    """
+    outcome = render_check.render_tab(source, "run")
+    assert any(
+        "Objects are not valid as a React child" in e and "action, consequences" in e
+        for e in outcome["errors"]
+    ), outcome
+
+
+def test_render_harness_hands_jsx_children_to_components():
+    """Children given to a component must be rendered, and checked, as React does.
+
+    Without this, whatever sat inside <Tag> or <Fact> was invisible to the
+    harness: no marker could be asserted there and no defect was caught there.
+    """
+    import render_check
+
+    source = """
+      const { useState } = React;
+      function Label({ children }) { return <b>{children}</b>; }
+      function App() {
+        const [activeTab, setActiveTab] = useState("run");
+        return (
+          <div>
+            <Label>visible text</Label>
+            <Label>{{ reason: "an object" }}</Label>
+          </div>
+        );
+      }
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    """
+    outcome = render_check.render_tab(source, "run")
+    assert "visible text" in outcome["text"]
+    assert any("found: object with keys {reason}" in e for e in outcome["errors"]), outcome
 
 
 def test_dashboard_exposes_a_panel_for_every_navigation_tab():
-    """Every tab button must have a matching conditional panel.
+    """Every tab button must have a matching conditional panel, and back.
 
     A visible tab with no panel behind it is exactly the "button with no
-    effect" the acceptance criteria forbid.
+    effect" the acceptance criteria forbid; a panel no button reaches is dead
+    code that still ships.
     """
     html = DEFAULT_TARGET.read_text(encoding="utf-8")
-    for tab in ("mission", "plans", "capacity", "diagnostics", "history", "finops"):
+    for tab in ("run", "ledger", "cluster"):
         assert f'setActiveTab("{tab}")' in html, f"no navigation button for tab {tab}"
         assert f"activeTab === '{tab}' &&" in html, f"no rendered panel for tab {tab}"
+    panels = set(re.findall(r"\{activeTab === '([a-z]+)' &&", html))
+    targets = set(re.findall(r'setActiveTab\("([a-z]+)"\)', html))
+    assert panels == targets, f"panels {sorted(panels)} vs navigation targets {sorted(targets)}"
 
 
 def test_dashboard_control_mode_selector_is_pushed_to_the_server():
@@ -210,77 +266,63 @@ def test_dashboard_reports_the_server_verdict_for_approval_and_execution():
 
 import re
 
-_PANEL_START = re.compile(r"\{activeTab === '([a-z]+)' &&")
+# Loop-variable convention the dashboard script follows, and this check relies
+# on: `plan` is always an ExecutionPlan, `r` an ExecutionHistoryRecord, `c` a
+# CapacityCandidate and `d` a DiagnosticItem. Scanning the whole script (not
+# one tab panel) is what covers the module-scope helpers (`planName`,
+# `ParetoScatter`) and the impact preview rendered outside every panel.
+_CONTRACT_BINDINGS = {
+    "plan": "ExecutionPlan",
+    "r": "ExecutionHistoryRecord",
+    "c": "CapacityCandidate",
+    "d": "DiagnosticItem",
+}
 
 
-def _panel_blocks(html: str) -> dict[str, str]:
-    """Split the render tree into one source slice per tab panel.
-
-    Scoping matters: the loop variable ``c`` is bound to a ``CandidateAllocation``
-    in the mission tab and to a ``CapacityCandidate`` in the capacity tab. A
-    whole-file scan therefore reports every mission field as missing from
-    ``CapacityCandidate`` and drowns the real defects in noise.
-    """
-    starts = [(m.group(1), m.start()) for m in _PANEL_START.finditer(html)]
-    blocks: dict[str, str] = {}
-    for index, (tab, start) in enumerate(starts):
-        end = starts[index + 1][1] if index + 1 < len(starts) else len(html)
-        blocks[tab] = html[start:end]
-    return blocks
+def _dashboard_script() -> str:
+    return extract_babel_blocks(DEFAULT_TARGET.read_text(encoding="utf-8"))[0]
 
 
-def _fields_read_on(html: str, variable: str) -> set[str]:
+def _fields_read_on(source: str, variable: str) -> set[str]:
     """Property names read from `variable` inside the dashboard source."""
-    return set(re.findall(rf"\b{re.escape(variable)}\.([A-Za-z_][A-Za-z0-9_]*)", html))
+    return set(re.findall(rf"\b{re.escape(variable)}\.([A-Za-z_][A-Za-z0-9_]*)", source))
 
 
-def _contract_problems(blocks: dict[str, str]) -> list[str]:
-    from agentic_compute.models import (
-        CapacityCandidate,
-        DiagnosticItem,
-        ExecutionHistoryRecord,
-        ExecutionPlan,
-    )
+def _contract_problems(script: str) -> list[str]:
+    from agentic_compute import models
 
-    # (tab, loop variable) -> the model the panel actually iterates over.
-    bindings = {
-        ("plans", "plan"): ExecutionPlan,
-        ("capacity", "c"): CapacityCandidate,
-        ("diagnostics", "d"): DiagnosticItem,
-        ("history", "r"): ExecutionHistoryRecord,
-    }
     # Names that are JS built-ins or local helpers rather than model fields.
     js_builtins = {"map", "length", "filter", "toFixed", "join", "slice", "props"}
 
     problems = []
-    for (tab, variable), model in bindings.items():
-        block = blocks.get(tab)
-        if block is None:
-            problems.append(f"the `{tab}` panel is missing from the render tree")
-            continue
+    for variable, model_name in _CONTRACT_BINDINGS.items():
+        model = getattr(models, model_name)
+        read = _fields_read_on(script, variable)
+        if not read:
+            # A renamed loop variable would otherwise turn this check off.
+            problems.append(
+                f"no field is read through `{variable}`: the naming convention "
+                f"this contract check relies on ({model_name}) was broken"
+            )
         allowed = set(model.model_fields) | js_builtins
-        for field in sorted(_fields_read_on(block, variable)):
-            if field not in allowed:
-                problems.append(
-                    f"the `{tab}` panel reads `{variable}.{field}` but "
-                    f"{model.__name__} has no such field"
-                )
+        for field in sorted(read - allowed):
+            problems.append(
+                f"the dashboard reads `{variable}.{field}` but {model_name} has no such field"
+            )
     return problems
 
 
 def test_panels_only_read_fields_the_api_actually_returns():
-    html = DEFAULT_TARGET.read_text(encoding="utf-8")
-    problems = _contract_problems(_panel_blocks(html))
+    problems = _contract_problems(_dashboard_script())
     assert not problems, "\n".join(problems)
 
 
-def test_the_contract_check_detects_a_field_that_does_not_exist():
+@pytest.mark.parametrize("variable", sorted(_CONTRACT_BINDINGS))
+def test_the_contract_check_detects_a_field_that_does_not_exist(variable):
     """Negative control: without this, the test above could pass while blind."""
-    html = DEFAULT_TARGET.read_text(encoding="utf-8")
-    blocks = _panel_blocks(html)
-    blocks["history"] = blocks["history"] + "\n{r.definitely_not_a_field}\n"
-    problems = _contract_problems(blocks)
-    assert any("definitely_not_a_field" in p for p in problems), problems
+    script = _dashboard_script() + f"\n{{{variable}.definitely_not_a_field}}\n"
+    problems = _contract_problems(script)
+    assert any(f"`{variable}.definitely_not_a_field`" in p for p in problems), problems
 
 
 def test_capacity_panel_shows_quota_and_provenance():
@@ -296,6 +338,43 @@ def test_diagnostics_panel_keeps_the_source_of_each_finding():
     html = DEFAULT_TARGET.read_text(encoding="utf-8")
     assert "d.source" in html
     assert "d.confirmed" in html
+
+
+def test_the_waiting_panel_only_diagnoses_the_job_the_runtime_reports():
+    """No job, or a running one, must not produce a diagnosis.
+
+    With no job the panel used to send a hard-coded `PENDING / ReqNodeNotAvail`
+    and showed the answer as a *confirmed* finding about a job that did not
+    exist; with a running job it showed an "unknown / hypothesis" card.
+    """
+    import render_check
+
+    source = _dashboard_script()
+    assert "ReqNodeNotAvail" not in source, "the dashboard must not invent a Slurm state reason"
+
+    def cluster_view(workload):
+        snapshot = {
+            "runtime": "simulator",
+            "execution_runtime": "simulator",
+            "snapshot_source": "local_runtime",
+            "snapshot": {"cluster": {"total_cpu": 64, "free_cpu": 48, "total_gpu": 0, "free_gpu": 0}},
+        }
+        if workload is not None:
+            snapshot["snapshot"]["workload"] = workload
+        seeded = render_check.seed_state(source, {"snapshotPayload": snapshot})
+        outcome = render_check.render_tab(seeded, "cluster")
+        assert not outcome["errors"], outcome["errors"]
+        return outcome["text"]
+
+    assert "No job on the runtime yet." in cluster_view(None)
+
+    running = cluster_view({"id": "job-7", "status": "RUNNING", "done": False, "failed": False})
+    assert "Job job-7 is running: nothing is holding it back." in running
+    assert "Check again" not in running
+
+    failed = cluster_view({"id": "job-8", "status": "FAILED", "done": True, "failed": True})
+    assert "Why did my job fail?" in failed
+    assert "Check again" in failed
 
 
 def test_history_panel_compares_estimated_and_observed_cost():
@@ -349,8 +428,8 @@ def test_finops_panel_reads_keys_the_analytics_payload_returns():
         assert tier in html, f"tier {tier} is not displayed"
 
 
-def test_mission_tab_monitors_live_drift_from_observed_telemetry():
-    """The health ribbon must report the observed run, not the form values."""
+def test_live_run_monitors_drift_from_observed_telemetry():
+    """The drift verdict must report the observed run, not the form values."""
     html = DEFAULT_TARGET.read_text(encoding="utf-8")
     assert "/api/workloads/${WORKLOAD_ID}/anomalies" in html
     # Elapsed time and spend come from the runtime snapshot.
@@ -471,52 +550,111 @@ _PROFILE = {
 
 
 def _live_seeds() -> dict:
-    """Collect the payloads the new panels consume, from the real endpoints."""
+    """Collect the payloads the panels consume, from the real endpoints.
+
+    The run is carried end to end -- delegated, submitted to the in-process
+    simulator, observed -- so the live-run card, the ledger table and the
+    cluster status render from payloads the app actually produced, not from
+    hand-written dictionaries that could drift from the API.
+    """
     from fastapi.testclient import TestClient
 
+    from agentic_compute.mcp_server import _runtime
     from compute_agent.app import app
 
     client = TestClient(app)
+    try:
+        # The server holds the mode. Delegation lets the plan run without an
+        # approval, within the ceiling.
+        client.post(
+            f"/api/workloads/{_WL}/control",
+            json={"control_mode": "delegation", "delegation_policy": {"max_budget_eur": 10.0}},
+        ).raise_for_status()
 
-    comparison = client.post(
-        "/api/plans/compare",
-        json={"workload_profile": _PROFILE, "cluster_total_cpu": 128},
-    ).json()
-    plans = comparison["plans"]
-    assert plans, "the comparison returned no plan to render"
+        comparison = client.post(
+            "/api/plans/compare",
+            json={"workload_profile": _PROFILE, "cluster_total_cpu": 128},
+        ).json()
+        plans = comparison["plans"]
+        assert plans, "the comparison returned no plan to render"
+        recommended = next(p for p in plans if p["plan_id"] == comparison["recommended_plan_id"])
 
-    what_if = client.post(
-        "/api/plans/what-if",
-        json={
-            "workload_id": _WL,
-            "plans": plans,
-            "workload_profile": _PROFILE,
-            # Deliberately not the defaults: the panel must show the operator's
-            # own scenario, not the one baked into the comparison payload.
-            "forced_preemptions": 5,
-            "budget_shock_pct": -60.0,
-            "deadline_compression_pct": -50.0,
-        },
-    ).json()
+        what_if = client.post(
+            "/api/plans/what-if",
+            json={
+                "workload_id": _WL,
+                "plans": plans,
+                "workload_profile": _PROFILE,
+                # Deliberately not the defaults: the panel must show the operator's
+                # own scenario, not the one baked into the comparison payload.
+                "forced_preemptions": 5,
+                "budget_shock_pct": -60.0,
+                "deadline_compression_pct": -50.0,
+            },
+        ).json()
 
-    # Telemetry chosen to trip every detector, so the ribbon renders its
-    # populated branch rather than the "no anomaly" one.
-    anomalies = client.post(
-        f"/api/workloads/{_WL}/anomalies",
-        json={
-            "workload_profile": _PROFILE,
-            "elapsed_minutes": 18.0,
-            "current_cost_eur": 4.4,
-            "progress_pct": 25.0,
-            "minutes_since_last_checkpoint": 18.0,
-        },
-    ).json()
-    assert anomalies["anomaly_count"] > 0, "expected the seeded run to be drifting"
+        # Telemetry chosen to trip every detector, so the drift panel renders
+        # its populated branch rather than the "no anomaly" one.
+        anomalies = client.post(
+            f"/api/workloads/{_WL}/anomalies",
+            json={
+                "workload_profile": _PROFILE,
+                "elapsed_minutes": 18.0,
+                "current_cost_eur": 4.4,
+                "progress_pct": 25.0,
+                "minutes_since_last_checkpoint": 18.0,
+            },
+        ).json()
+        assert anomalies["anomaly_count"] > 0, "expected the seeded run to be drifting"
 
-    control = client.post(
-        f"/api/workloads/{_WL}/control",
-        json={"control_mode": "delegation", "delegation_policy": {"max_budget_eur": 10.0}},
-    ).json()
+        execution = client.post(
+            "/api/execute-plan",
+            json={
+                "workload_profile": _PROFILE,
+                "plan": recommended,
+                "control_mode": "delegation",
+                "delegation_policy": {"max_budget_eur": 10.0},
+            },
+        ).json()
+        assert execution["status"] == "submitted", execution
+
+        snapshot = client.get("/api/snapshot").json()
+        # The live-run card only describes telemetry about *this* job.
+        assert str(snapshot["snapshot"]["workload"]["id"]) == str(execution["job_id"]), snapshot
+
+        history = client.get("/api/history").json()["records"]
+        assert any(r["workload_id"] == _WL for r in history), "the run is missing from the ledger"
+
+        # Read back after the submission, so the committed spend is non-zero.
+        control = client.get(f"/api/workloads/{_WL}/control").json()
+
+        diagnostics = client.get(
+            "/api/diagnose?job_state=PENDING&state_reason=ReqNodeNotAvail"
+        ).json()["diagnostics"]
+        assert diagnostics, "the diagnosis returned nothing to render"
+    finally:
+        # The simulator is a process-wide singleton: leave it as it was found.
+        _runtime.reset()
+
+    # The live capacity search reads the Compute Engine API, which a test must
+    # not depend on; the row is built through the model so it keeps its shape.
+    from agentic_compute.models import CapacityCandidate
+
+    candidates = [
+        CapacityCandidate(
+            machine_type="n2-standard-16",
+            cpu_count=16,
+            memory_gb=64.0,
+            region="us-central1",
+            zone="us-central1-a",
+            quota_status="QUOTA_AVAILABLE",
+            quota_limit=96,
+            quota_usage=16,
+            quota_project="agentgrid-test",
+            obtainability_score=0.8,
+            preemption_risk="LOW",
+        ).model_dump()
+    ]
 
     # An empty portfolio renders only the placeholder, so the board is fed a
     # populated aggregate built through the real aggregator.
@@ -565,23 +703,41 @@ def _live_seeds() -> dict:
         "whatIfResult": what_if,
         "anomalyReport": anomalies,
         "serverControl": control,
+        "executionResult": execution,
+        "snapshotPayload": snapshot,
+        "historyRecords": history,
         "finops": finops,
+        "capacityCandidates": candidates,
+        "diagnosticsList": diagnostics,
         # State-driven, not tab-driven: the modal must render on every tab.
         "pendingExecution": plans[0],
     }
 
 
 _POPULATED_MARKERS = {
-    "mission": ["Live workload health", "CRITICAL_DRIFT", "Young-Daly"],
-    "plans": ["4D Pareto frontier", "What-If stress simulator", "operator scenario"],
-    "capacity": ["Compatible capacity search"],
-    "diagnostics": ["Blocker diagnostics"],
-    "history": ["Actual costs"],
-    "finops": [
-        "GreenOps portfolio",
-        "3-tier financial reconciliation",
-        "Carbon balance and green routing",
-        "Governance mode distribution",
+    "run": [
+        "Recommended plan",
+        "Submitted to",
+        "Live run",
+        "CRITICAL_DRIFT",
+        "Young-Daly",
+        "Pareto frontier",
+        "operator scenario",
+    ],
+    "ledger": [
+        "Run ledger",
+        _PROFILE["name"],
+        # wl-a finished in 22 of 25 minutes, wl-b in 48 of 40.
+        "1 of 2",
+        "Cost reconciliation",
+        "Saved by Spot vs 100% Standard",
+        "Deadline compliance",
+    ],
+    "cluster": [
+        "Live status",
+        "agentgrid-test",
+        "resource waiting",
+        "Why is my job waiting?",
     ],
 }
 
@@ -610,6 +766,199 @@ def test_populated_panels_render_without_error():
     assert not problems, "\n".join(problems)
 
 
+def test_run_view_states_the_saving_against_the_fastest_plan():
+    """The headline saving must be the API's own numbers, not a marketing figure.
+
+    The landing view claims "N% less than the fastest plan". N has to be
+    (fastest - recommended) / fastest over the plans the comparison returned
+    for this very job: anything else is an invented baseline.
+    """
+    import math
+
+    import render_check
+    from fastapi.testclient import TestClient
+
+    from compute_agent.app import app
+
+    # The dashboard's own default job: 2 vCPU, one hour of single-vCPU work,
+    # one-hour deadline.
+    profile = {
+        "workload_id": "workload-value",
+        "name": "nightly-risk-batch",
+        "command": "sleep 30",
+        "cpu_requested": 2,
+        "memory_mb_requested": 4096,
+        "estimated_duration_minutes": 60,
+        "estimation_source": "user_specified",
+        "deadline_minutes_from_start": 60,
+        "budget_amount": 5.0,
+        "is_parallelizable": True,
+        "supports_checkpointing": True,
+        "checkpoint_location": "gs://agentgrid-checkpoints/workload-value",
+    }
+    comparison = TestClient(app).post(
+        "/api/plans/compare", json={"workload_profile": profile, "cluster_total_cpu": 128}
+    ).json()
+    plans = comparison["plans"]
+    recommended = next(p for p in plans if p["plan_id"] == comparison["recommended_plan_id"])
+    fastest = min(plans, key=lambda p: p["total_time_to_result_minutes"])
+    assert fastest["plan_id"] != recommended["plan_id"], "no trade-off left to show for this job"
+    saved = fastest["estimated_cost_eur"] - recommended["estimated_cost_eur"]
+    # Math.round, not Python's banker's rounding.
+    expected_pct = math.floor(saved / fastest["estimated_cost_eur"] * 100 + 0.5)
+
+    source = extract_babel_blocks(DEFAULT_TARGET.read_text(encoding="utf-8"))[0]
+    seeded = render_check.seed_state(source, {"planComparison": comparison})
+    outcome = render_check.render_tab(seeded, "run")
+
+    assert not outcome["errors"], outcome["errors"]
+    assert f"{expected_pct} % less" in outcome["text"], outcome["text"]
+    assert "than the fastest plan" in outcome["text"]
+    assert "saved on this run" in outcome["text"]
+
+
+def _proxied_slurm_snapshot(monkeypatch) -> dict:
+    """The production shape: the MCP server on Slurm, this service on the simulator.
+
+    The payload comes from the real ``/api/snapshot`` route; only the network
+    hop to the MCP server is replaced, by what its ``/snapshot`` route returns
+    when it runs on Slurm.
+    """
+    import compute_agent.app as agent_app
+    import compute_agent.auth as auth
+    from fastapi.testclient import TestClient
+
+    from agentic_compute.mcp_server import _runtime
+
+    class _McpResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "runtime": "slurm",
+                "snapshot": _runtime.snapshot().model_dump(),
+                "slurm_verification": None,
+            }
+
+    monkeypatch.delenv("COMPUTE_RUNTIME", raising=False)
+    monkeypatch.setenv("MCP_SERVER_URL", "https://mcp.example.run.app/sse")
+    monkeypatch.setattr(auth, "get_gcp_id_token", lambda audience: None)
+    monkeypatch.setattr(agent_app.requests, "get", lambda *args, **kwargs: _McpResponse())
+
+    payload = TestClient(agent_app.app).get("/api/snapshot").json()
+    assert payload.get("runtime_mismatch") is True, payload
+    return payload
+
+
+def test_every_view_says_when_runs_do_not_reach_the_cluster_it_shows(monkeypatch):
+    """The split-brain found in production must be on screen, not only in a payload.
+
+    The MCP server showed a live Slurm cluster while this service submitted to
+    its own simulator. Every tab must say so, name the cluster being shown,
+    repeat the server's explanation, and label the runtime as the simulator.
+    """
+    import render_check
+
+    snapshot = _proxied_slurm_snapshot(monkeypatch)
+    source = extract_babel_blocks(DEFAULT_TARGET.read_text(encoding="utf-8"))[0]
+    seeded = render_check.seed_state(source, {"snapshotPayload": snapshot})
+
+    markers = (
+        "Runs from this page do not reach",
+        "your Slurm cluster",
+        snapshot["runtime_warning"],
+        "COMPUTE_RUNTIME=slurm",
+        "Simulator",
+    )
+    problems: list[str] = []
+    for tab in ("run", "ledger", "cluster"):
+        outcome = render_check.render_tab(seeded, tab)
+        problems.extend(f"[{tab}] render error: {e}" for e in outcome["errors"])
+        problems.extend(
+            f"[{tab}] expected {marker!r} in the rendered output"
+            for marker in markers
+            if marker not in outcome["text"]
+        )
+    assert not problems, "\n".join(problems)
+
+
+def test_the_cluster_warning_stays_hidden_when_runs_reach_the_runtime_shown(monkeypatch):
+    """Control: a warning shown on every page is noise, and noise gets ignored."""
+    import render_check
+    from fastapi.testclient import TestClient
+
+    from compute_agent.app import app
+
+    monkeypatch.delenv("COMPUTE_RUNTIME", raising=False)
+    monkeypatch.delenv("MCP_SERVER_URL", raising=False)
+    snapshot = TestClient(app).get("/api/snapshot").json()
+    assert snapshot["snapshot_source"] == "local_runtime", snapshot
+    assert "runtime_mismatch" not in snapshot, snapshot
+
+    source = extract_babel_blocks(DEFAULT_TARGET.read_text(encoding="utf-8"))[0]
+    seeded = render_check.seed_state(source, {"snapshotPayload": snapshot})
+    outcome = render_check.render_tab(seeded, "run")
+    assert not outcome["errors"], outcome["errors"]
+    assert "Runs from this page do not reach" not in outcome["text"]
+
+
+def test_a_queued_run_is_never_shown_as_a_measured_zero():
+    """A run that has only been submitted has no measured cost yet.
+
+    The landing headline read "€0.00 from measured usage" right after the first
+    submission: the history record claimed its cost was calculated from usage
+    before anything had run, and the portfolio summed that zero as measured.
+    """
+    import render_check
+    from fastapi.testclient import TestClient
+
+    from agentic_compute.mcp_server import _runtime
+    from compute_agent.app import app
+
+    client = TestClient(app)
+    try:
+        client.post(
+            f"/api/workloads/{_WL}/control",
+            json={"control_mode": "delegation", "delegation_policy": {"max_budget_eur": 10.0}},
+        ).raise_for_status()
+        comparison = client.post(
+            "/api/plans/compare", json={"workload_profile": _PROFILE, "cluster_total_cpu": 128}
+        ).json()
+        recommended = next(p for p in comparison["plans"] if p["plan_id"] == comparison["recommended_plan_id"])
+        execution = client.post(
+            "/api/execute-plan",
+            json={
+                "workload_profile": _PROFILE,
+                "plan": recommended,
+                "control_mode": "delegation",
+                "delegation_policy": {"max_budget_eur": 10.0},
+            },
+        ).json()
+        assert execution["status"] == "submitted", execution
+        history = client.get("/api/history").json()["records"]
+        finops = client.get("/api/portfolio/finops").json()
+    finally:
+        _runtime.reset()
+
+    record = next(r for r in history if r["workload_id"] == _WL)
+    assert record["reconciliation_status"] == "estimated", record
+    assert finops["total_workloads"] == 1
+    assert finops["financial_tiers"]["measured_workloads"] == 0
+
+    source = extract_babel_blocks(DEFAULT_TARGET.read_text(encoding="utf-8"))[0]
+    seeded = render_check.seed_state(source, {"finops": finops, "historyRecords": history})
+    run = render_check.render_tab(seeded, "run")
+    ledger = render_check.render_tab(seeded, "ledger")
+    assert not run["errors"] and not ledger["errors"], (run["errors"], ledger["errors"])
+
+    assert "none measured yet" in run["text"], run["text"]
+    assert "measured spend" not in run["text"]
+    assert "no run measured yet" in ledger["text"]
+    assert "not measured yet" in ledger["text"]
+    assert "runs measured" not in ledger["text"]
+
+
 def test_seeding_fails_loudly_when_a_state_hook_is_renamed():
     """Negative control: a silent no-op seed would revert the test to empty state."""
     import render_check
@@ -625,12 +974,12 @@ def test_populated_render_detects_a_missing_nested_key():
 
     source = extract_babel_blocks(DEFAULT_TARGET.read_text(encoding="utf-8"))[0]
     # A FinOps payload missing `financial_tiers` is exactly the shape drift the
-    # board would hit if the aggregator renamed a group.
+    # ledger would hit if the aggregator renamed a group.
     broken = render_check.seed_state(
         source,
         {"finops": {"total_workloads": 2, "sustainability_metrics": {}}},
     )
-    outcome = render_check.render_tab(broken, "finops")
+    outcome = render_check.render_tab(broken, "ledger")
     assert outcome["errors"], "a missing payload group was not reported"
 
 

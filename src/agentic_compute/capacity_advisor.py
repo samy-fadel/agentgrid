@@ -689,10 +689,19 @@ def _check_quota_availability(
         live = _fetch_regional_quotas(project_id, region)
         if live["status"] == "ok":
             quotas = live["quotas"]
+            is_spot = str(provisioning_model).upper().startswith("SPOT")
+            preemptible = quotas.get(_PREEMPTIBLE_CPU_QUOTA_METRIC) if is_spot else None
+            # Compute Engine: "If your project does not have preemptible quota,
+            # and you have never requested preemptible quota, these resources
+            # consume standard quota."
+            # (https://cloud.google.com/compute/resource-usage#preemptible_quotas)
+            # A PREEMPTIBLE_CPUS limit of 0 is that case, not a ban on Spot:
+            # read as a ceiling, it flagged every Spot request "quota exceeded,
+            # 0 of 0 used" on a project with 200 standard vCPU free.
+            spot_on_standard = preemptible is not None and not preemptible.get("limit")
             metric = (
                 _PREEMPTIBLE_CPU_QUOTA_METRIC
-                if str(provisioning_model).upper().startswith("SPOT")
-                and _PREEMPTIBLE_CPU_QUOTA_METRIC in quotas
+                if preemptible is not None and not spot_on_standard
                 else _CPU_QUOTA_METRIC
             )
             cpu_q = quotas.get(metric)
@@ -742,6 +751,14 @@ def _check_quota_availability(
                 int(gpu_limit), int(gpu_usage),
                 cpu_needed, gpu_needed, provenance="gcp_live_api",
             )
+            verdict["quota_metric"] = metric
+            if spot_on_standard:
+                verdict["reason"] = (
+                    f"{verdict.get('reason', '')} Region '{region}' grants no preemptible "
+                    f"CPU quota ({_PREEMPTIBLE_CPU_QUOTA_METRIC} limit 0), so Spot VMs draw on "
+                    f"the standard {_CPU_QUOTA_METRIC} quota -- unless preemptible quota was "
+                    f"ever requested for this project, in which case Spot cannot start here."
+                ).strip()
             if live.get("warning"):
                 verdict["quota_status_warning"] = live["warning"]
             return verdict
@@ -1071,6 +1088,7 @@ def search_compatible_capacity(
                     quota_usage=quota_res.get("quota_usage"),
                     quota_project=quota_res.get("quota_project"),
                     quota_project_source=quota_res.get("quota_project_source"),
+                    quota_metric=quota_res.get("quota_metric"),
                     capacity_signal=capacity_signal,
                     obtainability_score=obtainability,
                     preemption_risk=preempt_risk,

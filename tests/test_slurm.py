@@ -246,8 +246,11 @@ def test_slurm_apply_payload_includes_machine_type_and_provisioning_mix(monkeypa
     assert len(captured_payloads) == 1
     job_payload = captured_payloads[0].get("job", {})
     assert job_payload.get("cpus_per_task") == 60
-    assert job_payload.get("features") == "c2-standard-60"
-    assert job_payload.get("constraints") == "c2-standard-60"
+    # The partition pins the machine type. A machine-type name sent as a
+    # feature/constraint was rejected by the real cluster (Slurm 25.11.8) with
+    # ESLURM_INVALID_FEATURE, so neither key may be sent.
+    assert "features" not in job_payload
+    assert "constraints" not in job_payload
     assert job_payload.get("partition") == "compute"
     assert "machine_type=c2-standard-60" in job_payload.get("comment", "")
     assert "provisioning_model=100% Standard" in job_payload.get("comment", "")

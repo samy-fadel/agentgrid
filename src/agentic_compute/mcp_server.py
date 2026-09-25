@@ -260,6 +260,9 @@ async def compare_plans_route(request):
             profile=profile,
             cluster_total_cpu=cluster_cpu,
             demo_mode=body.get("demo_mode"),
+            # Same runtime execute_plan_controlled submits to, so a plan the
+            # cluster would reject is never labelled executable.
+            runtime_kind=os.getenv("COMPUTE_RUNTIME", "simulator"),
         )
     except ValueError as exc:
         return JSONResponse({"error": f"Invalid workload profile: {exc}"}, status_code=400)
@@ -690,6 +693,7 @@ def compare_plans(
         profile=workload_profile,
         cluster_total_cpu=cluster_total_cpu,
         demo_mode=demo_mode,
+        runtime_kind=os.getenv("COMPUTE_RUNTIME", "simulator"),
     )
 
 

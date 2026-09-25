@@ -340,11 +340,17 @@ def evaluate_and_compare_plans(
         prep_time = 1.0
         wait_time = 0.5
 
-        executable_here = (
+        machine_runs_here = (
             runtime_kind != "slurm" or mtype in SLURM_EXECUTABLE_MACHINE_TYPES
         )
 
         for pmix in provisioning_options:
+            # The Slurm adapter rejects any Spot mix as well as any machine type
+            # that is not a partition, so both have to hold for the plan to be
+            # runnable there. Offering a Spot plan as executable produced a
+            # recommendation the real cluster refuses at submission.
+            mix_runs_here = runtime_kind != "slurm" or "Spot" not in pmix
+            executable_here = machine_runs_here and mix_runs_here
             rec_time = 2.0 if ("Spot" in pmix and workload.supports_checkpointing) else 0.0
             total_time = round(wait_time + prep_time + exec_time + rec_time, 2)
 
@@ -371,9 +377,14 @@ def evaluate_and_compare_plans(
                 "Actual cloud stockout cannot be guaranteed prior to allocation",
                 cost_basis_detail,
             ]
-            if not executable_here:
+            if not machine_runs_here:
                 unverified.append(
                     f"Machine type '{mtype}' is not executable by the active Slurm runtime"
+                )
+            if not mix_runs_here:
+                unverified.append(
+                    f"Provisioning mix '{pmix}' is not executable by the active Slurm runtime "
+                    "(its partitions are Standard only)"
                 )
 
             uncertainties: list[str] = [

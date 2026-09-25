@@ -242,3 +242,28 @@ def test_tracking_after_a_restart_does_not_erase_the_recorded_run(tmp_path):
     assert after.final_calculated_cost_eur == pytest.approx(7.5), (
         "a read-only tracking call must not destroy the recorded cost"
     )
+
+
+def test_a_queued_run_is_estimated_until_the_runtime_reports_usage(tmp_path):
+    """The record only claims a cost "calculated from usage" once usage was observed.
+
+    The model default stamped a run that had only been queued as
+    ``calculated_from_usage``, so the portfolio summed a measured 0.00 for it
+    and the dashboard announced "€0.00 from measured usage".
+    """
+    workload_id = "wl-cost-queued"
+    manager = LifecycleManager()
+    manager.register_workload(_profile(workload_id, str(tmp_path / "ckpt")))
+    manager.start_attempt(workload_id, plan=PLAN, job_id="job-q")
+
+    store = get_history_store()
+    assert store.get_history_record(workload_id).reconciliation_status == "estimated"
+
+    # A figure someone merely stated is still not a measurement.
+    manager.update_progress(
+        workload_id, elapsed_minutes=10, cost_incurred_eur=0.5, metrics_source="caller_declared",
+    )
+    assert store.get_history_record(workload_id).reconciliation_status == "estimated"
+
+    manager.update_progress(workload_id, job_state="RUNNING", elapsed_minutes=12, cost_incurred_eur=0.6)
+    assert store.get_history_record(workload_id).reconciliation_status == "calculated_from_usage"

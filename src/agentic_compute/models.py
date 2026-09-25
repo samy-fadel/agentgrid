@@ -195,6 +195,10 @@ class CapacityCandidate(BaseModel):
     # if it were the operator's own quota.
     quota_project: str | None = None
     quota_project_source: str | None = None
+    # Which quota the figures were read from (e.g. CPUS, PREEMPTIBLE_CPUS): a
+    # Spot row checked against the standard CPUS quota must not read as if it
+    # had been checked against a Spot quota.
+    quota_metric: str | None = None
     
     capacity_signal: Literal["HIGH", "MEDIUM", "LOW", "UNAVAILABLE", "SIMULATED", "UNKNOWN"] = "HIGH"
     obtainability_score: float | None = None

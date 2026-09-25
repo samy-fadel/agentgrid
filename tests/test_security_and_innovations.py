@@ -245,6 +245,78 @@ class TestAnomalyDetectorAndPortfolioFinOps:
         assert "SLA_DEADLINE_BREACH_IMMINENT" in codes
         assert "CHECKPOINT_CADENCE_EXPOSURE" in codes
 
+    def test_portfolio_deadline_compliance_counts_only_measured_runs(self):
+        """A queued run has no measured duration, so it proves no deadline held.
+
+        The rate used to fall back to the estimate, which always fits the
+        deadline because plans are only offered when it does, and it reported
+        100% on an empty ledger.
+        """
+        empty = compute_portfolio_finops_analytics(records=[])["reliability_and_governance"]
+        assert empty["sla_evaluated_workloads"] == 0
+        assert empty["sla_compliance_rate_pct"] is None
+
+        queued = {
+            "workload_id": "wl-queued",
+            "control_mode": "validation",
+            "initial_estimated_cost_eur": 0.2,
+            "initial_estimated_duration_minutes": 30.0,
+            "final_actual_duration_minutes": 0.0,
+            "approved_plan": {
+                "cpu": 2,
+                "gpu": 0,
+                "machine_type": "n2-standard-2",
+                "region": "us-central1",
+                "provisioning_model": "100% Standard",
+            },
+            "profile": {"deadline_minutes_from_start": 60.0},
+        }
+        late = dict(queued, workload_id="wl-late", final_actual_duration_minutes=75.0)
+
+        report = compute_portfolio_finops_analytics(records=[queued, late])[
+            "reliability_and_governance"
+        ]
+        assert report["sla_evaluated_workloads"] == 1
+        assert report["sla_compliant_workloads"] == 0
+        assert report["sla_compliance_rate_pct"] == 0.0
+
+    def test_portfolio_measured_spend_counts_only_runs_with_observed_usage(self):
+        """A queued run has no usage to calculate from, so it adds no measured 0.00."""
+        base = {
+            "control_mode": "validation",
+            "approved_plan": {
+                "cpu": 2,
+                "gpu": 0,
+                "machine_type": "n2-standard-2",
+                "region": "us-central1",
+                "provisioning_model": "100% Standard",
+            },
+            "profile": {"deadline_minutes_from_start": 60.0},
+        }
+        # Written before records distinguished "estimated": labelled as
+        # calculated from usage with nothing observed.
+        legacy_queued = dict(
+            base, workload_id="wl-legacy", reconciliation_status="calculated_from_usage",
+            initial_estimated_cost_eur=0.2, final_calculated_cost_eur=0.0, final_actual_duration_minutes=0.0,
+        )
+        queued = dict(
+            base, workload_id="wl-queued", reconciliation_status="estimated",
+            initial_estimated_cost_eur=0.3, final_calculated_cost_eur=0.0, final_actual_duration_minutes=0.0,
+        )
+        finished = dict(
+            base, workload_id="wl-finished", reconciliation_status="calculated_from_usage",
+            initial_estimated_cost_eur=0.4, final_calculated_cost_eur=0.5, final_actual_duration_minutes=20.0,
+        )
+
+        nothing_measured = compute_portfolio_finops_analytics(records=[legacy_queued, queued])["financial_tiers"]
+        assert nothing_measured["measured_workloads"] == 0
+        assert nothing_measured["tier2_verified_usage_total_eur"] == 0.0
+
+        tiers = compute_portfolio_finops_analytics(records=[legacy_queued, queued, finished])["financial_tiers"]
+        assert tiers["measured_workloads"] == 1
+        assert tiers["tier2_verified_usage_total_eur"] == 0.5
+        assert tiers["tier1_estimated_total_eur"] == 0.9
+
     def test_http_endpoints_pareto_what_if_anomalies_and_finops(self):
         client = TestClient(app)
         cmp_resp = client.post(

@@ -420,16 +420,25 @@ def diagnose_blockers(
         and job_state.upper() == "PENDING"
         and state_reason in ("Resources", "ReqNodeNotAvail", "None", "WaitingForScheduling", None)
     ):
+        # Only these two reasons are Slurm itself saying the job waits for
+        # nodes. "None", "WaitingForScheduling" or no reason at all mean the
+        # scheduler has not said why yet: capacity is then a hypothesis, and the
+        # reason must never be filled in on Slurm's behalf (it used to read
+        # "Resources", confirmed, when nobody had reported any reason).
+        capacity_confirmed = state_reason in ("Resources", "ReqNodeNotAvail")
+        if capacity_confirmed:
+            facts = f"Job is waiting for available cluster capacity. Slurm state reason: {state_reason}"
+        elif state_reason:
+            facts = f"Job is pending. Slurm state reason: {state_reason}"
+        else:
+            facts = "Job is pending. No Slurm state reason was reported."
         findings.append(
             DiagnosticItem(
                 category="resource_waiting",
-                observed_facts=(
-                    f"Job is waiting for available cluster capacity. "
-                    f"Slurm state reason: {state_reason or 'Resources'}"
-                ) + slurm_evidence,
+                observed_facts=facts + slurm_evidence,
                 source="slurm_controller",
                 timestamp=ts,
-                confirmed=True,
+                confirmed=capacity_confirmed,
                 hypothesis_details="Cluster nodes currently saturated by active jobs; may clear naturally as running jobs finish",
                 possible_actions=[
                     {

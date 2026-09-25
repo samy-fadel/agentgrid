@@ -540,6 +540,13 @@ class LifecycleManager:
         est_dur = (plan.total_time_to_result_minutes if plan else 0.0) or (
             prof.estimated_duration_minutes or 0.0
         )
+        # "calculated_from_usage" is a claim that the cost was computed from what
+        # the runtime observed. A run that is only queued has observed nothing:
+        # labelling it that way (the model default) put a measured 0.00 into the
+        # portfolio totals, which read as a free run. Declared figures do not
+        # count as observed either.
+        observed = [a for a in attempts if a.elapsed_minutes > 0]
+        measured = bool(observed) and all(a.cost_status != "estimated" for a in observed)
 
         hist_record = ExecutionHistoryRecord(
             workload_id=workload_id,
@@ -556,7 +563,7 @@ class LifecycleManager:
             initial_estimated_duration_minutes=est_dur,
             final_actual_duration_minutes=total_dur,
             duration_comparison_delta_minutes=round(total_dur - est_dur, 2),
-            reconciliation_status="calculated_from_usage",
+            reconciliation_status="calculated_from_usage" if measured else "estimated",
         )
         self.history_store.save_history_record(hist_record)
 

@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 INDEX_HTML_PATH = os.path.join(STATIC_DIR, "index.html")
@@ -42,6 +43,18 @@ def verify_agent_auth(request: Request) -> None:
         status_code=401,
         detail="Unauthorized: invalid or missing AgentGrid authentication token or API key",
     )
+
+
+def _execution_runtime_kind() -> str:
+    """Runtime that ``/api/execute-plan`` submits to in *this* process.
+
+    Execution always goes through the in-process runtime, never through the
+    MCP server, so this -- not the MCP server's runtime -- is what the operator
+    must be told. A deployment where the MCP server talks to Slurm while this
+    service runs the simulator used to show a live Slurm snapshot next to
+    submissions that never reached the cluster.
+    """
+    return os.getenv("COMPUTE_RUNTIME", "simulator").lower().strip() or "simulator"
 
 app = FastAPI(
     title="Agentic Compute Control Plane - Agent Service",
@@ -118,9 +131,17 @@ def get_dashboard_or_info(request: Request):
 
 @app.get("/api/snapshot")
 def get_snapshot() -> dict[str, Any]:
-    """Fetch current compute cluster and workload snapshot from MCP runtime."""
+    """Fetch the compute cluster and workload snapshot.
+
+    Execution (``/api/execute-plan``) always goes through this process's own
+    runtime. When that runtime is Slurm the snapshot is read from it too, so
+    the operator watches the jobs this dashboard submitted. Otherwise the MCP
+    server's view is proxied, and the payload says plainly that plans submitted
+    from here do not reach that runtime.
+    """
+    execution_runtime = _execution_runtime_kind()
     mcp_server_url = os.getenv("MCP_SERVER_URL")
-    if mcp_server_url:
+    if mcp_server_url and execution_runtime != "slurm":
         from urllib.parse import urlparse
         from .auth import get_gcp_id_token
 
@@ -133,21 +154,37 @@ def get_snapshot() -> dict[str, Any]:
         try:
             resp = requests.get(f"{base_audience}/snapshot", headers=headers, timeout=5.0)
             if resp.status_code == 200:
-                return resp.json()
+                payload = resp.json()
+                observed_runtime = str(payload.get("runtime", "")).lower()
+                payload["execution_runtime"] = execution_runtime
+                payload["snapshot_source"] = "mcp_server"
+                if observed_runtime and observed_runtime != execution_runtime:
+                    payload["runtime_mismatch"] = True
+                    payload["runtime_warning"] = (
+                        f"This snapshot comes from the MCP server ({observed_runtime}), but plans "
+                        f"submitted from this dashboard run on the {execution_runtime} runtime of "
+                        "the agent service and never reach it."
+                    )
+                return payload
         except Exception as exc:
             logger.warning("Failed to fetch snapshot from remote MCP: %s", exc)
 
-    # Local development fallback
     try:
         from agentic_compute.mcp_server import _runtime
         return {
-            "runtime": os.getenv("COMPUTE_RUNTIME", "simulator").lower(),
+            "runtime": execution_runtime,
+            "execution_runtime": execution_runtime,
+            "snapshot_source": "local_runtime",
             "snapshot": _runtime.snapshot().model_dump(),
             "slurm_verification": getattr(_runtime, "last_slurm_action", None),
         }
     except Exception as exc:
         logger.error("Error accessing local runtime: %s", exc)
-        return {"error": str(exc)}
+        return {
+            "error": str(exc),
+            "execution_runtime": execution_runtime,
+            "snapshot_source": "local_runtime",
+        }
 
 
 @app.post("/api/reset")
@@ -281,7 +318,11 @@ async def search_capacity_endpoint(request: Request) -> dict[str, Any]:
         profile["allowed_regions"] = allowed_regions
 
     try:
-        candidates = search_compatible_capacity(
+        # The live search makes blocking Compute Engine calls (about 20 s on a
+        # cold cache). Run on the event loop, it froze every other request of
+        # the instance: snapshot polling, the diagnosis, even a submission.
+        candidates = await run_in_threadpool(
+            search_compatible_capacity,
             profile=profile,
             target_region=target_region,
             demo_mode=demo_mode,
@@ -379,6 +420,10 @@ async def compare_plans_endpoint(request: Request) -> dict[str, Any]:
             profile=profile,
             cluster_total_cpu=cluster_cpu,
             demo_mode=body.get("demo_mode"),
+            # The runtime /api/execute-plan will submit to. Without it every
+            # machine type and every Spot mix is labelled executable, and the
+            # dashboard recommends plans the Slurm cluster rejects.
+            runtime_kind=_execution_runtime_kind(),
         )
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid workload profile: {exc}") from exc
